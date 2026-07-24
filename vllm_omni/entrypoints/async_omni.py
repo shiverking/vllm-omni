@@ -796,6 +796,14 @@ class AsyncOmni(EngineClient, OmniBase):
             }
         return {**preferred, "request_id": external_request_id}
 
+    async def get_audio_scheduling_metrics(self) -> dict[str, Any]:
+        """Return the Stage 1 LiveServe feedback and urgency counters."""
+        if len(self.stage_configs) <= 1:
+            return {"scheduling": {}, "feedback": {}, "status": "stage_1_missing"}
+        results = await self.collective_rpc(method="get_audio_scheduling_metrics", stage_ids=[1])
+        result = next((item for item in results if isinstance(item, dict)), None)
+        return result or {"scheduling": {}, "feedback": {}, "status": "unsupported"}
+
     @staticmethod
     def _coerce_stage_bool(result: Any) -> bool:
         """Reduce a stage RPC result to a boolean.

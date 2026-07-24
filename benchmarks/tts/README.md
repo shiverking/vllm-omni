@@ -1,5 +1,48 @@
 # TTS Universal Benchmark
 
+## 单张 910B4：LiveServe 音频调度复现
+
+该实验只使用 `Qwen/Qwen3-TTS-12Hz-1.7B-Base` 和 Seed-TTS English 128 条固定请求，
+依次比较 Legacy、Bounded-K=2 和 LiveServe-audio。三种策略共用同一个 manifest、模型
+revision、batch/显存/eager 参数；Poisson 负载也重放同一份预生成到达轨迹。
+
+准备条件：单张 Ascend 910B4、可用的 vLLM-Ascend/vLLM-Omni 环境、已下载并固定 revision
+的模型，以及包含 `en/meta.lst` 和 reference WAV 的 Seed-TTS 数据目录。完整实验会运行
+`3 strategies × (4 fixed-concurrency + 4 Poisson loads) × 3 repeats × 128 requests`，建议先
+执行 smoke test。
+
+```bash
+# 先检查全部命令，不启动服务
+python benchmarks/tts/run_liveserve_audio_sweep.py \
+  --dataset-path /data/seed-tts-eval \
+  --model-revision <QWEN_MODEL_COMMIT> \
+  --output-dir results/liveserve-audio \
+  --dry-run
+
+# 8 请求、1 次重复的快速闭环
+python benchmarks/tts/run_liveserve_audio_sweep.py \
+  --dataset-path /data/seed-tts-eval \
+  --model-revision <QWEN_MODEL_COMMIT> \
+  --output-dir results/liveserve-smoke \
+  --num-requests 8 --repeats 1
+
+# 完整实验（默认 128 请求、2 warmup、3 repeats）
+python benchmarks/tts/run_liveserve_audio_sweep.py \
+  --dataset-path /data/seed-tts-eval \
+  --model-revision <QWEN_MODEL_COMMIT> \
+  --output-dir results/liveserve-audio
+```
+
+脚本会分别重启三种部署配置，并自动启用实验性播放反馈。输出包括原始 JSON、固定
+workload manifest、Poisson arrival trace、服务日志、Markdown/JSON 汇总和七张图。
+运行结束会检查失败请求、manifest/revision/公共部署参数一致性，以及同一 cell 的输出
+音频总时长差异是否超过 3%。如果 Legacy 在 `c=8` 已满足 P90 RTF≤1 且连续率≥95%，
+报告会明确写出“未进入调度瓶颈区”。
+
+单卡 OOM 时只能让三种策略同时从 Stage0/Stage1 的 `8/4` 降为 `4/2`，不可分别调参。
+服务日志和每个请求的 feedback/scheduler counter 用于进一步判断瓶颈更接近 Talker、
+Code2Wav 还是调度策略；若后端本身失败，应作为独立的 vLLM-Ascend 问题处理。
+
 A model-agnostic serving benchmark for TTS models in vllm-omni. One CLI
 (`bench_tts.py`) + one YAML registry (`model_configs.yaml`) drive perf and
 quality runs for every registered checkpoint: **Qwen3-TTS** (Base / CustomVoice)

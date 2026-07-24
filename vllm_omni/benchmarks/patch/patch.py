@@ -1440,6 +1440,31 @@ def build_audio_request_results(
     ]
 
 
+def load_arrival_trace(path: str, expected_requests: int) -> list[float]:
+    """Load a non-decreasing sequence of absolute arrival offsets."""
+    with open(path, encoding="utf-8") as trace_file:
+        payload = json.load(trace_file)
+    offsets = payload.get("arrival_offsets_s") if isinstance(payload, dict) else payload
+    if not isinstance(offsets, list) or len(offsets) < expected_requests:
+        raise ValueError(f"Arrival trace must contain at least {expected_requests} offsets")
+    parsed = [float(value) for value in offsets[:expected_requests]]
+    if not parsed or parsed[0] != 0.0 or any(value < 0 for value in parsed):
+        raise ValueError("Arrival trace must start at 0 and contain non-negative offsets")
+    if any(current < previous for previous, current in zip(parsed, parsed[1:])):
+        raise ValueError("Arrival trace offsets must be non-decreasing")
+    return parsed
+
+
+async def replay_arrival_trace(input_requests: list[SampleRequest], offsets: list[float]):
+    """Yield requests according to an absolute, pre-generated arrival trace."""
+    started = time.perf_counter()
+    for request, offset in zip(input_requests, offsets):
+        delay = offset - (time.perf_counter() - started)
+        if delay > 0:
+            await asyncio.sleep(delay)
+        yield request, float("nan")
+
+
 async def benchmark(
     task_type: TaskType,
     endpoint_type: str,
@@ -1625,15 +1650,22 @@ async def benchmark(
             }
         )
 
-    async for request, current_request_rate in get_request(
-        input_requests,
-        request_rate,
-        burstiness,
-        ramp_up_strategy,
-        ramp_up_start_rps,
-        ramp_up_end_rps,
-        self_timed,
-    ):
+    arrival_trace_path = os.environ.get("VLLM_OMNI_BENCH_ARRIVAL_TRACE")
+    if arrival_trace_path:
+        offsets = load_arrival_trace(arrival_trace_path, len(input_requests))
+        request_iterator = replay_arrival_trace(input_requests, offsets)
+    else:
+        request_iterator = get_request(
+            input_requests,
+            request_rate,
+            burstiness,
+            ramp_up_strategy,
+            ramp_up_start_rps,
+            ramp_up_end_rps,
+            self_timed,
+        )
+
+    async for request, current_request_rate in request_iterator:
         if ramp_up_strategy is not None:
             current_int_rps = int(current_request_rate)
             if current_int_rps > last_int_rps:

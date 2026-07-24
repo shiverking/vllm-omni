@@ -269,6 +269,96 @@ def print_comparison_table(all_runs: list[list[dict]], labels: list[str]) -> Non
                         print(f"| {metric} | {c} | {pct:+.1f}% |")
 
 
+def plot_liveserve_report(report_path: str | Path, output_dir: str | Path) -> None:
+    """Generate the LiveServe fixed-concurrency, frontier, and urgency plots."""
+    report = json.loads(Path(report_path).read_text(encoding="utf-8"))
+    records = report["records"]
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    strategies = ("legacy", "bounded_k2", "liveserve_audio")
+    colors = {"legacy": "#777777", "bounded_k2": "#e69f00", "liveserve_audio": "#0072b2"}
+
+    def average(items: list[dict], key: str) -> float:
+        values = [float(item[key]) for item in items if item.get(key) is not None]
+        return float(np.mean(values)) if values else float("nan")
+
+    fixed = [item for item in records if item["experiment"]["mode"] == "fixed"]
+    fixed_plots = (
+        ("request_throughput", "Request throughput (req/s)", "request_throughput_concurrency.png"),
+        ("audio_throughput", "Audio throughput (audio-s/s)", "audio_throughput_concurrency.png"),
+        ("audio_continuity_ok_rate", "Continuity rate", "continuity_rate_concurrency.png"),
+        ("p90_audio_rtf", "P90 audio RTF", "p90_rtf_concurrency.png"),
+        ("p99_audio_underrun_s", "P99 underrun (s)", "p99_underrun_concurrency.png"),
+    )
+    for key, ylabel, filename in fixed_plots:
+        fig, ax = plt.subplots(figsize=(7, 4.5))
+        for strategy in strategies:
+            values = []
+            for concurrency in (1, 2, 4, 8):
+                cell = [
+                    item
+                    for item in fixed
+                    if item["experiment"]["strategy"] == strategy
+                    and item["experiment"]["concurrency"] == concurrency
+                ]
+                values.append(average(cell, key))
+            ax.plot((1, 2, 4, 8), values, marker="o", label=strategy, color=colors[strategy])
+        ax.set(xlabel="Concurrency", ylabel=ylabel)
+        ax.set_xticks((1, 2, 4, 8))
+        ax.grid(alpha=0.25)
+        ax.legend()
+        fig.tight_layout()
+        fig.savefig(output_dir / filename, dpi=160)
+        plt.close(fig)
+
+    poisson = [item for item in records if item["experiment"]["mode"] == "poisson"]
+    fig, ax = plt.subplots(figsize=(7, 4.5))
+    for strategy in strategies:
+        points = []
+        for factor in (0.5, 0.75, 1.0, 1.25):
+            cell = [
+                item
+                for item in poisson
+                if item["experiment"]["strategy"] == strategy
+                and item["experiment"]["load_factor"] == factor
+            ]
+            points.append((average(cell, "useful_request_throughput"), average(cell, "p90_audio_ttfp_ms")))
+        ax.plot(
+            [point[0] for point in points],
+            [point[1] for point in points],
+            marker="o",
+            label=strategy,
+            color=colors[strategy],
+        )
+    ax.set(xlabel="Useful throughput (req/s)", ylabel="P90 audio TTFP (ms)")
+    ax.grid(alpha=0.25)
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(output_dir / "p90_ttfp_useful_rps_frontier.png", dpi=160)
+    plt.close(fig)
+
+    urgency_keys = ("u0_scheduled_count", "u1_scheduled_count", "u2_scheduled_count", "fallback_scheduled_count")
+    fig, ax = plt.subplots(figsize=(8, 4.5))
+    x = np.arange(len(urgency_keys))
+    width = 0.25
+    for index, strategy in enumerate(strategies):
+        strategy_records = [item for item in records if item["experiment"]["strategy"] == strategy]
+        values = [
+            sum(
+                float(item.get("audio_scheduling_metrics", {}).get("scheduling", {}).get(key, 0))
+                for item in strategy_records
+            )
+            for key in urgency_keys
+        ]
+        ax.bar(x + (index - 1) * width, values, width, label=strategy, color=colors[strategy])
+    ax.set_xticks(x, ["U0", "U1", "U2", "fallback"])
+    ax.set_ylabel("Scheduled count")
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(output_dir / "urgency_scheduling_hits.png", dpi=160)
+    plt.close(fig)
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------

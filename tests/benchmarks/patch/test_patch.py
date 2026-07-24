@@ -17,9 +17,22 @@ from vllm_omni.benchmarks.patch.patch import (
     _played_audio_ms,
     async_request_openai_audio_speech,
     async_request_openai_chat_omni_completions,
+    load_arrival_trace,
+    replay_arrival_trace,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.benchmark, pytest.mark.cpu]
+
+
+def test_load_and_replay_arrival_trace(tmp_path):
+    trace = tmp_path / "trace.json"
+    trace.write_text(json.dumps({"arrival_offsets_s": [0, 0, 0]}), encoding="utf-8")
+    offsets = load_arrival_trace(str(trace), 3)
+
+    async def collect():
+        return [request async for request, _rate in replay_arrival_trace(["a", "b", "c"], offsets)]
+
+    assert asyncio.run(collect()) == ["a", "b", "c"]
 
 
 class MockResponse:

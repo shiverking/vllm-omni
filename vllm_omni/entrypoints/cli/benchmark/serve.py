@@ -182,6 +182,12 @@ def add_omni_benchmark_cli_args(parser: argparse.ArgumentParser) -> None:
         help="Simulate realtime PCM playback and publish coalesced playback feedback at no more than 20 Hz.",
     )
     group.add_argument(
+        "--arrival-trace-in",
+        type=str,
+        default=None,
+        help="Replay absolute request arrival offsets from a JSON file instead of sampling arrivals.",
+    )
+    group.add_argument(
         "--image-edits-bot-task",
         type=str,
         default="think",
@@ -305,6 +311,11 @@ class OmniBenchmarkServingSubcommand(OmniBenchmarkSubcommandBase):
             os.environ["SEED_TTS_WER_EVAL"] = "1"
         if getattr(args, "seed_tts_wer_save_items", False):
             os.environ["SEED_TTS_WER_SAVE_ITEMS"] = "1"
+        arrival_trace = getattr(args, "arrival_trace_in", None)
+        if arrival_trace:
+            os.environ["VLLM_OMNI_BENCH_ARRIVAL_TRACE"] = arrival_trace
+        else:
+            os.environ.pop("VLLM_OMNI_BENCH_ARRIVAL_TRACE", None)
         image_edits_bot_task = getattr(args, "image_edits_bot_task", None)
         if image_edits_bot_task is not None:
             extra_body = dict(getattr(args, "extra_body", None) or {})

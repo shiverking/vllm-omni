@@ -1279,6 +1279,24 @@ async def publish_speech_playback(request: PlaybackFeedbackRequest, raw_request:
     return JSONResponse(status_code=status_code, content=result)
 
 
+@router.get("/v1/audio/speech/scheduling")
+async def get_speech_scheduling_metrics(raw_request: Request):
+    """Return experimental Stage 1 audio scheduling counters."""
+    if not _playback_feedback_enabled():
+        return JSONResponse(
+            status_code=HTTPStatus.SERVICE_UNAVAILABLE.value,
+            content={"status": "disabled", "enabled": False},
+        )
+    engine_client = getattr(raw_request.app.state, "engine_client", None)
+    collect = getattr(engine_client, "get_audio_scheduling_metrics", None)
+    if collect is None:
+        raise HTTPException(
+            status_code=HTTPStatus.NOT_IMPLEMENTED.value,
+            detail="Audio scheduling metrics are not supported by this engine",
+        )
+    return JSONResponse(content=await collect())
+
+
 @router.post(
     "/v1/audio/speech/batch",
     dependencies=[Depends(validate_json_request)],

@@ -2228,6 +2228,31 @@ def test_playback_feedback_reaches_engine(monkeypatch, mocker: MockerFixture):
     engine.publish_playback_feedback.assert_awaited_once()
 
 
+def test_audio_scheduling_metrics_reach_engine(monkeypatch, mocker: MockerFixture):
+    monkeypatch.setenv("VLLM_OMNI_ENABLE_PLAYBACK_FEEDBACK", "1")
+    expected = {"scheduling": {"u0_scheduled_count": 2}, "feedback": {"accepted": 3}}
+    engine = SimpleNamespace(get_audio_scheduling_metrics=mocker.AsyncMock(return_value=expected))
+    app = FastAPI()
+    app.state.engine_client = engine
+    scope = {
+        "type": "http",
+        "app": app,
+        "method": "GET",
+        "path": "/v1/audio/speech/scheduling",
+        "headers": [],
+        "query_string": b"",
+        "client": ("127.0.0.1", 12345),
+        "server": ("testserver", 80),
+        "scheme": "http",
+    }
+
+    response = asyncio.run(api_server_module.get_speech_scheduling_metrics(Request(scope)))
+
+    assert response.status_code == 200
+    assert b'"u0_scheduled_count":2' in response.body
+    engine.get_audio_scheduling_metrics.assert_awaited_once()
+
+
 def test_speech_x_request_id_is_forwarded_when_feedback_enabled(monkeypatch, mocker: MockerFixture):
     monkeypatch.setenv("VLLM_OMNI_ENABLE_PLAYBACK_FEEDBACK", "1")
     handler = mocker.MagicMock()
