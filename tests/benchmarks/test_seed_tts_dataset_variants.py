@@ -6,9 +6,12 @@ vllm stubs are installed by tests/benchmarks/conftest.py before collection.
 
 from __future__ import annotations
 
+import hashlib
 import importlib.util
+import json
 import sys
 import types
+import wave
 from pathlib import Path
 
 import numpy as np
@@ -30,6 +33,7 @@ if _MODULE_NAME not in sys.modules:
 from vllm_omni.benchmarks.data_modules.seed_tts_dataset import (  # noqa: E402
     SeedTTSDesignDataset,
     SeedTTSDesignSampleRequest,
+    SeedTTSDataset,
     SeedTTSTextDataset,
     SeedTTSTextSampleRequest,
 )
@@ -37,6 +41,14 @@ from vllm_omni.benchmarks.data_modules.seed_tts_dataset import (  # noqa: E402
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
+
+
+def _write_wav(path: Path, *, sample_rate: int = 24000, frames: int = 2400) -> None:
+    with wave.open(str(path), "wb") as wav:
+        wav.setnchannels(1)
+        wav.setsampwidth(2)
+        wav.setframerate(sample_rate)
+        wav.writeframes(b"\x00\x00" * frames)
 
 
 @pytest.fixture()
@@ -47,7 +59,7 @@ def seed_tts_root(tmp_path: Path) -> Path:
     wav_dir = locale_dir / "prompt-wavs"
     wav_dir.mkdir()
     for i in range(5):
-        (wav_dir / f"utt{i:03d}.wav").write_bytes(b"RIFF\x00\x00\x00\x00WAVE")
+        _write_wav(wav_dir / f"utt{i:03d}.wav")
     meta = "\n".join(f"utt{i:03d}|ref text {i}|prompt-wavs/utt{i:03d}.wav|target text {i}" for i in range(5))
     (locale_dir / "meta.lst").write_text(meta, encoding="utf-8")
     return tmp_path
@@ -68,6 +80,103 @@ def mock_tokenizer(mocker):
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
+
+
+def test_seed_tts_manifest_is_deterministic(seed_tts_root, mock_tokenizer, tmp_path):
+    paths = [tmp_path / "first.json", tmp_path / "second.json"]
+    for path in paths:
+        ds = SeedTTSDataset(
+            dataset_path=str(seed_tts_root),
+            random_seed=0,
+            locale="en",
+            workload_manifest_out=str(path),
+        )
+        requests = ds.sample(mock_tokenizer, num_requests=5, request_id_prefix="seedtts-")
+        assert len(requests) == 5
+
+    first = paths[0].read_bytes()
+    second = paths[1].read_bytes()
+    assert first == second
+    assert hashlib.sha256(first).hexdigest() == hashlib.sha256(second).hexdigest()
+    manifest = json.loads(first)
+    assert manifest["random_seed"] == 0
+    assert len(manifest["requests"]) == 5
+    assert set(manifest["requests"][0]) == {
+        "request_id",
+        "utterance_id",
+        "target_text",
+        "reference_text",
+        "reference_wav_path",
+        "wav_sha256",
+        "wav_duration_seconds",
+        "wav_sample_rate",
+        "target_token_count",
+    }
+
+
+def test_seed_tts_manifest_replay_preserves_order(seed_tts_root, mock_tokenizer, tmp_path):
+    manifest_path = tmp_path / "workload.json"
+    generated = SeedTTSDataset(
+        dataset_path=str(seed_tts_root), random_seed=0, locale="en", workload_manifest_out=str(manifest_path)
+    ).sample(mock_tokenizer, num_requests=5, request_id_prefix="stable-")
+
+    replayed = SeedTTSDataset(
+        dataset_path=str(seed_tts_root),
+        random_seed=999,
+        locale="en",
+        workload_manifest_in=str(manifest_path),
+    ).sample(mock_tokenizer, num_requests=5, no_oversample=False)
+
+    assert [r.request_id for r in replayed] == [r.request_id for r in generated]
+    assert [r.seed_tts_utterance_id for r in replayed] == [r.seed_tts_utterance_id for r in generated]
+
+
+def test_seed_tts_manifest_replay_rejects_missing_wav(seed_tts_root, mock_tokenizer, tmp_path):
+    manifest_path = tmp_path / "workload.json"
+    SeedTTSDataset(
+        dataset_path=str(seed_tts_root), random_seed=0, locale="en", workload_manifest_out=str(manifest_path)
+    ).sample(mock_tokenizer, num_requests=5)
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    missing = seed_tts_root / "en" / manifest["requests"][0]["reference_wav_path"]
+    missing.unlink()
+
+    replay = SeedTTSDataset(
+        dataset_path=str(seed_tts_root), locale="en", workload_manifest_in=str(manifest_path)
+    )
+    with pytest.raises(FileNotFoundError, match="Manifest reference WAV is missing"):
+        replay.sample(mock_tokenizer, num_requests=5)
+
+
+def test_seed_tts_manifest_replay_rejects_checksum_change(seed_tts_root, mock_tokenizer, tmp_path):
+    manifest_path = tmp_path / "workload.json"
+    SeedTTSDataset(
+        dataset_path=str(seed_tts_root), random_seed=0, locale="en", workload_manifest_out=str(manifest_path)
+    ).sample(mock_tokenizer, num_requests=5)
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    changed = seed_tts_root / "en" / manifest["requests"][0]["reference_wav_path"]
+    with changed.open("ab") as f:
+        f.write(b"changed")
+
+    replay = SeedTTSDataset(
+        dataset_path=str(seed_tts_root), locale="en", workload_manifest_in=str(manifest_path)
+    )
+    with pytest.raises(ValueError, match="WAV SHA256 mismatch"):
+        replay.sample(mock_tokenizer, num_requests=5)
+
+
+def test_seed_tts_manifest_replay_rejects_meta_change(seed_tts_root, tmp_path):
+    manifest_path = tmp_path / "workload.json"
+    meta = seed_tts_root / "en" / "meta.lst"
+    manifest = {
+        "schema_version": 1,
+        "locale": "en",
+        "meta_sha256": "0" * 64,
+        "requests": [],
+    }
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    assert meta.is_file()
+    with pytest.raises(ValueError, match="meta.lst SHA256 mismatch"):
+        SeedTTSDataset(dataset_path=str(seed_tts_root), locale="en", workload_manifest_in=str(manifest_path))
 
 
 def test_seed_tts_text_dataset_omits_ref_audio(seed_tts_root, mock_tokenizer):

@@ -18,8 +18,11 @@ fields on the body plus a Qwen3-Omni-style ``system`` message and the target tex
 from __future__ import annotations
 
 import base64
+import hashlib
+import json
 import logging
 import random
+import wave
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -55,6 +58,7 @@ class SeedTTSSampleRequest(SampleRequest):
     seed_tts_system_prompt: str = ""
     #: Local path to reference prompt WAV (for SIM vs. synthesized PCM in ``seed_tts_eval``).
     seed_tts_ref_wav_path: str = ""
+    seed_tts_ref_text: str = ""
 
 
 @dataclass
@@ -92,6 +96,36 @@ def _load_meta_rows(meta_file: Path) -> list[_SeedTTSRow]:
         if r is not None:
             rows.append(r)
     return rows
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as f:
+        for block in iter(lambda: f.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _wav_metadata(path: Path) -> tuple[float, int]:
+    try:
+        with wave.open(str(path), "rb") as wav:
+            sample_rate = wav.getframerate()
+            frames = wav.getnframes()
+    except (EOFError, wave.Error) as exc:
+        raise ValueError(f"Invalid WAV in Seed-TTS workload: {path}: {exc}") from exc
+    if sample_rate <= 0:
+        raise ValueError(f"Invalid WAV sample rate in Seed-TTS workload: {path}: {sample_rate}")
+    return frames / sample_rate, sample_rate
+
+
+def _read_manifest(path: Path) -> dict[str, Any]:
+    try:
+        manifest = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"Cannot read Seed-TTS workload manifest {path}: {exc}") from exc
+    if manifest.get("schema_version") != 1 or not isinstance(manifest.get("requests"), list):
+        raise ValueError(f"Unsupported Seed-TTS workload manifest schema: {path}")
+    return manifest
 
 
 def resolve_seed_tts_root(dataset_path: str | None, *, explicit_root: str | None, locale: str = "en") -> Path:
@@ -164,6 +198,8 @@ class SeedTTSDataset(BenchmarkDataset):
         seed_tts_root: str | None = None,
         system_prompt: str | None = None,
         disable_shuffle: bool = False,
+        workload_manifest_in: str | None = None,
+        workload_manifest_out: str | None = None,
         **kwargs: Any,
     ) -> None:
         if locale not in ("en", "zh"):
@@ -173,6 +209,11 @@ class SeedTTSDataset(BenchmarkDataset):
         self._explicit_root = seed_tts_root
         sp = (system_prompt or "").strip()
         self._system_prompt = sp if sp else SEED_TTS_DEFAULT_OMNI_SYSTEM_PROMPT
+        if workload_manifest_in and workload_manifest_out:
+            raise ValueError("--workload-manifest-in and --workload-manifest-out are mutually exclusive")
+        self._manifest_in_path = Path(workload_manifest_in).expanduser().resolve() if workload_manifest_in else None
+        self._manifest_out_path = Path(workload_manifest_out).expanduser().resolve() if workload_manifest_out else None
+        self._manifest: dict[str, Any] | None = None
         super().__init__(
             dataset_path=dataset_path,
             random_seed=random_seed,
@@ -193,7 +234,32 @@ class SeedTTSDataset(BenchmarkDataset):
         self._rows = _load_meta_rows(meta)
         if not self._rows:
             raise ValueError(f"No valid rows in {meta}")
-        if not self.disable_shuffle:
+        if self._manifest_in_path is not None:
+            self._manifest = _read_manifest(self._manifest_in_path)
+            if self._manifest.get("locale") != self.locale:
+                raise ValueError(
+                    f"Manifest locale {self._manifest.get('locale')!r} does not match requested locale {self.locale!r}"
+                )
+            actual_meta_sha = _sha256(meta)
+            if self._manifest.get("meta_sha256") != actual_meta_sha:
+                raise ValueError(
+                    f"Seed-TTS meta.lst SHA256 mismatch: expected {self._manifest.get('meta_sha256')}, "
+                    f"got {actual_meta_sha}"
+                )
+            by_id = {row.utterance_id: row for row in self._rows}
+            ordered_rows: list[_SeedTTSRow] = []
+            for item in self._manifest["requests"]:
+                utterance_id = item.get("utterance_id")
+                row = by_id.get(utterance_id)
+                if row is None:
+                    raise ValueError(f"Manifest utterance is missing from meta.lst: {utterance_id!r}")
+                if row.ref_text != item.get("reference_text") or row.target_text != item.get("target_text"):
+                    raise ValueError(f"Manifest text differs from meta.lst for utterance {utterance_id!r}")
+                if row.prompt_wav_rel != item.get("reference_wav_path"):
+                    raise ValueError(f"Manifest WAV path differs from meta.lst for utterance {utterance_id!r}")
+                ordered_rows.append(row)
+            self._rows = ordered_rows
+        elif not self.disable_shuffle:
             rng = random.Random(self.random_seed)
             rng.shuffle(self._rows)
         self.data = self._rows
@@ -217,6 +283,12 @@ class SeedTTSDataset(BenchmarkDataset):
         if output_len is None:
             output_len = self.DEFAULT_OUTPUT_LEN
 
+        if self._manifest is not None and num_requests != len(self._manifest["requests"]):
+            raise ValueError(
+                "Manifest replay requires --num-prompts to equal the manifest request count "
+                f"({len(self._manifest['requests'])}), got {num_requests}"
+            )
+
         tok = get_cached_tokenizer(tokenizer)
         out: list[SampleRequest] = []
         for i, row in enumerate(self._rows):
@@ -224,11 +296,14 @@ class SeedTTSDataset(BenchmarkDataset):
                 break
             wav_path = (self._root / self.locale / row.prompt_wav_rel).resolve()
             if not wav_path.is_file():
+                if self._manifest is not None:
+                    raise FileNotFoundError(f"Manifest reference WAV is missing: {wav_path}")
                 logger.warning("Missing prompt wav for %s: %s", row.utterance_id, wav_path)
                 continue
 
             target = row.target_text
             prompt_len = len(tok.encode(f"{self._system_prompt}\n{target}"))
+            target_token_count = len(tok.encode(target))
             lang = "English" if self.locale == "en" else "Chinese"
             ref_uri = _ref_audio_payload(wav_path, inline=self.inline_ref_audio)
             speech_extra: dict[str, Any] = {
@@ -239,22 +314,84 @@ class SeedTTSDataset(BenchmarkDataset):
                 "max_new_tokens": output_len,
             }
 
+            request_id = f"{request_id_prefix}{i}"
+            if self._manifest is not None:
+                item = self._manifest["requests"][i]
+                request_id = str(item["request_id"])
+                actual_wav_sha = _sha256(wav_path)
+                if actual_wav_sha != item.get("wav_sha256"):
+                    raise ValueError(
+                        f"Seed-TTS WAV SHA256 mismatch for {row.utterance_id}: "
+                        f"expected {item.get('wav_sha256')}, got {actual_wav_sha}"
+                    )
+                duration, sample_rate = _wav_metadata(wav_path)
+                if sample_rate != item.get("wav_sample_rate") or abs(duration - item.get("wav_duration_seconds", -1)) > 1e-9:
+                    raise ValueError(f"Seed-TTS WAV metadata mismatch for {row.utterance_id}")
+                if target_token_count != item.get("target_token_count"):
+                    raise ValueError(
+                        f"Seed-TTS target token count mismatch for {row.utterance_id}: "
+                        f"expected {item.get('target_token_count')}, got {target_token_count}"
+                    )
+
             out.append(
                 SeedTTSSampleRequest(
                     prompt=target,
                     prompt_len=prompt_len,
                     expected_output_len=output_len,
                     multi_modal_data=None,
-                    request_id=f"{request_id_prefix}{i}",
+                    request_id=request_id,
                     seed_tts_speech_extra=speech_extra,
                     seed_tts_utterance_id=row.utterance_id,
                     seed_tts_locale=self.locale,
                     seed_tts_system_prompt=self._system_prompt,
                     seed_tts_ref_wav_path=str(wav_path),
+                    seed_tts_ref_text=row.ref_text,
                 )
             )
 
         logger.info("Seed-TTS: built %d requests (asked %d)", len(out), num_requests)
+        if self._manifest is not None and len(out) != len(self._manifest["requests"]):
+            raise ValueError("Manifest replay did not produce every recorded request")
+        if self._manifest_out_path is not None:
+            if len(out) != num_requests:
+                raise ValueError(
+                    f"Cannot export a {num_requests}-request manifest: only {len(out)} valid Seed-TTS rows were built"
+                )
+            meta = self._root / self.locale / "meta.lst"
+            requests: list[dict[str, Any]] = []
+            for request, row in zip(out, self._rows):
+                wav_path = Path(request.seed_tts_ref_wav_path)
+                duration, sample_rate = _wav_metadata(wav_path)
+                requests.append(
+                    {
+                        "request_id": request.request_id,
+                        "utterance_id": row.utterance_id,
+                        "target_text": row.target_text,
+                        "reference_text": row.ref_text,
+                        "reference_wav_path": row.prompt_wav_rel,
+                        "wav_sha256": _sha256(wav_path),
+                        "wav_duration_seconds": duration,
+                        "wav_sample_rate": sample_rate,
+                        "target_token_count": len(tok.encode(row.target_text)),
+                    }
+                )
+            manifest = {
+                "schema_version": 1,
+                "dataset": "seed-tts",
+                "locale": self.locale,
+                "random_seed": self.random_seed,
+                "meta_sha256": _sha256(meta),
+                "requests": requests,
+            }
+            self._manifest_out_path.parent.mkdir(parents=True, exist_ok=True)
+            self._manifest_out_path.write_text(
+                json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            logger.info("Wrote Seed-TTS workload manifest: %s", self._manifest_out_path)
+            return out
+        if self._manifest is not None:
+            return out
         self.maybe_oversample_requests(out, num_requests, request_id_prefix, no_oversample)
         return out
 

@@ -129,6 +129,18 @@ def add_seed_tts_cli_args(parser: argparse.ArgumentParser) -> None:
         help="Include per-utterance ASR rows in the saved JSON under key seed_tts_wer_eval_items. "
         "Or set SEED_TTS_WER_SAVE_ITEMS=1.",
     )
+    g.add_argument(
+        "--workload-manifest-out",
+        type=str,
+        default=None,
+        help="Write the exact Seed-TTS request selection, texts, token counts, and WAV checksums to JSON.",
+    )
+    g.add_argument(
+        "--workload-manifest-in",
+        type=str,
+        default=None,
+        help="Replay and strictly validate a previously exported Seed-TTS workload manifest.",
+    )
 
 
 def add_omni_benchmark_cli_args(parser: argparse.ArgumentParser) -> None:

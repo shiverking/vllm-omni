@@ -320,6 +320,13 @@ def get_samples(args, tokenizer):
                 "--hf-name for the Hub dataset id."
             )
 
+        manifest_in = getattr(args, "workload_manifest_in", None)
+        manifest_out = getattr(args, "workload_manifest_out", None)
+        if (manifest_in or manifest_out) and args.dataset_name != "seed-tts":
+            raise ValueError("Workload manifests currently require --dataset-name seed-tts")
+        if manifest_out and args.seed != 0:
+            raise ValueError("Reproducible Seed-TTS manifest export requires --seed 0")
+
         _cls_map = {
             "seed-tts": SeedTTSDataset,
             "seed-tts-text": SeedTTSTextDataset,
@@ -336,6 +343,8 @@ def get_samples(args, tokenizer):
             seed_tts_root=getattr(args, "seed_tts_root", None),
             system_prompt=getattr(args, "seed_tts_system_prompt", None),
             disable_shuffle=getattr(args, "disable_shuffle", False),
+            workload_manifest_in=manifest_in,
+            workload_manifest_out=manifest_out,
         )
         out_len = getattr(args, "output_len", None)
         if out_len is None:
