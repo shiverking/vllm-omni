@@ -1571,3 +1571,32 @@ class TestSamplingConstraintsPrecedence:
         assert stages[0].yaml_extras["default_sampling_params"]["detokenize"] is True
         # Pipeline says stop_token_ids=[2150] for talker
         assert stages[1].yaml_extras["default_sampling_params"]["stop_token_ids"] == [2150]
+
+
+class TestAudioSchedulingConfig:
+    def test_liveserve_fields_propagate_to_every_stage(self):
+        pipeline = _PIPELINE_REGISTRY["qwen3_tts"]
+        deploy = DeployConfig(
+            async_chunk=True,
+            audio_scheduling_policy="liveserve_audio",
+            playback_safe_buffer_ms=125.0,
+            interaction_state_ttl_ms=600.0,
+        )
+        stages = merge_pipeline_deploy(pipeline, deploy)
+        for stage in stages:
+            assert stage.yaml_engine_args["audio_scheduling_policy"] == "liveserve_audio"
+            assert stage.yaml_engine_args["playback_safe_buffer_ms"] == 125.0
+            assert stage.yaml_engine_args["interaction_state_ttl_ms"] == 600.0
+
+    @pytest.mark.parametrize("policy", ["unknown", "LIVE"])
+    def test_invalid_policy_is_rejected(self, tmp_path, policy):
+        path = tmp_path / "deploy.yaml"
+        path.write_text(f"audio_scheduling_policy: {policy}\nstages: []\n", encoding="utf-8")
+        with pytest.raises(ValueError, match="audio_scheduling_policy"):
+            load_deploy_config(path)
+
+    def test_bounded_k_requires_positive_window(self, tmp_path):
+        path = tmp_path / "deploy.yaml"
+        path.write_text("audio_scheduling_policy: bounded_k\nactive_stream_window: 0\nstages: []\n", encoding="utf-8")
+        with pytest.raises(ValueError, match="active_stream_window"):
+            load_deploy_config(path)

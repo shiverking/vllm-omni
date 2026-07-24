@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import importlib
+import time
 from collections import defaultdict, deque
 from collections.abc import Callable, Mapping
 from typing import Any
@@ -9,6 +10,11 @@ from typing import Any
 import torch
 from vllm.v1.request import Request, RequestStatus
 
+from vllm_omni.core.sched.audio_interaction import (
+    AudioInteractionState,
+    AudioUrgency,
+    rank_audio_requests,
+)
 from vllm_omni.data_entry_keys import MetaStruct, OmniPayloadStruct, unflatten_payload
 
 from ..adapter import construct_next_stage_streaming_input_prompt
@@ -42,10 +48,20 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         model_config = vllm_config.model_config
         self.scheduler_max_num_seqs = vllm_config.scheduler_config.max_num_seqs
         active_stream_window = int(getattr(model_config, "active_stream_window", 0) or 0)
+        configured_policy = getattr(model_config, "audio_scheduling_policy", None)
+        self._audio_scheduling_policy = configured_policy or ("bounded_k" if active_stream_window > 0 else "legacy")
+        if self._audio_scheduling_policy not in {"legacy", "bounded_k", "liveserve_audio"}:
+            raise ValueError(f"Unknown audio_scheduling_policy: {self._audio_scheduling_policy!r}")
+        self._playback_safe_buffer_ms = float(getattr(model_config, "playback_safe_buffer_ms", 100.0))
+        self._interaction_state_ttl_ms = float(getattr(model_config, "interaction_state_ttl_ms", 500.0))
         model_max_num_seqs = int(getattr(model_config, "max_num_seqs", self.scheduler_max_num_seqs) or 0)
         if model_max_num_seqs <= 0:
             model_max_num_seqs = self.scheduler_max_num_seqs
-        self._active_window = min(active_stream_window, model_max_num_seqs) if active_stream_window > 0 else 0
+        self._active_window = (
+            min(active_stream_window, model_max_num_seqs)
+            if self._audio_scheduling_policy == "bounded_k" and active_stream_window > 0
+            else 0
+        )
         if self._active_window > 0:
             logger.info(
                 "Bounded active-stream window enabled: K=%d. "
@@ -56,6 +72,9 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                 self._active_window,
             )
         self.connector = self.create_connector(model_config)
+        self._interaction_scheduling_enabled = (
+            self._audio_scheduling_policy == "liveserve_audio" and self.connector.stage_id == 1
+        )
         super().__init__(model_config)
         self.model_mode = getattr(model_config, "worker_type", None) or "ar"
         # State specific to Chunk management
@@ -88,6 +107,9 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self._held_non_active: deque[Any] = deque()
         self.requests_num_chunks_sent: dict[str, int] = defaultdict(int)
         self._pending_streaming_prefills: dict[str, dict] = {}
+        self.audio_scheduling_metrics: dict[str, float | int] = defaultdict(int)
+        self._last_ready_urgency: dict[str, AudioUrgency] = {}
+        self._u0_wait_rounds: dict[str, int] = defaultdict(int)
 
     @staticmethod
     def _is_truthy_scalar(value: Any) -> bool:
@@ -394,6 +416,8 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self.requests_with_ready_chunks.discard(request_id)
         self.request_ids_mapping.pop(request_id, None)
         self.requests_origin_status.pop(request_id, None)
+        self._last_ready_urgency.pop(request_id, None)
+        self._u0_wait_rounds.pop(request_id, None)
 
         self._cancelled_load_reqs.add(request_id)
         self._finished_load_reqs.discard(request_id)
@@ -446,6 +470,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         running_queue: list[Request],
         *,
         scheduler_requests: dict[str, Request] | None = None,
+        interaction_states: dict[str, AudioInteractionState] | None = None,
     ) -> None:
         """
         Process pending chunks for waiting and running queues.
@@ -485,6 +510,10 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                 RequestStatus.RUNNING,
                 self._finished_load_reqs,
             )
+            if self._interaction_scheduling_enabled:
+                self._prioritize_ready_requests(waiting_queue, interaction_states or {})
+                self._prioritize_ready_requests(running_queue, interaction_states or {})
+                self._preempt_for_liveserve(waiting_queue, running_queue, interaction_states or {})
             while len(running_queue) > self.scheduler_max_num_seqs:
                 request = running_queue.pop()
                 request.status = RequestStatus.PREEMPTED
@@ -501,6 +530,95 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         )
         self._promote_active_streams(waiting_queue)
         self._preempt_non_active_running(waiting_queue, running_queue)
+
+    @staticmethod
+    def _replace_queue(queue: Any, ordered: list[Request]) -> None:
+        if isinstance(queue, list):
+            queue[:] = ordered
+            return
+        for request in list(queue):
+            queue.remove(request)
+        add_request = getattr(queue, "add_request", None)
+        if add_request is not None:
+            for request in ordered:
+                add_request(request)
+        else:
+            queue.extend(ordered)
+
+    def _prioritize_ready_requests(
+        self,
+        queue: Any,
+        interaction_states: dict[str, AudioInteractionState],
+        *,
+        record_metrics: bool = True,
+    ) -> None:
+        queue_snapshot = list(queue)
+        ready = [request for request in queue_snapshot if request.request_id in self.requests_with_ready_chunks]
+        if not ready:
+            return
+        now = time.monotonic()
+        ranked_ids = rank_audio_requests(
+            [request.request_id for request in ready],
+            interaction_states,
+            now_monotonic_s=now,
+            safe_buffer_ms=self._playback_safe_buffer_ms,
+            ttl_ms=self._interaction_state_ttl_ms,
+        )
+        by_id = {request.request_id: request for request in ready}
+        ranked = [by_id[request_id] for request_id in ranked_ids]
+        non_ready = [request for request in queue_snapshot if request.request_id not in by_id]
+        self._replace_queue(queue, ranked + non_ready)
+
+        if not record_metrics:
+            return
+        for request_id in ranked_ids:
+            state = interaction_states.get(request_id)
+            urgency = (
+                state.urgency(
+                    now_monotonic_s=now,
+                    safe_buffer_ms=self._playback_safe_buffer_ms,
+                    ttl_ms=self._interaction_state_ttl_ms,
+                )
+                if state is not None
+                else AudioUrgency.FALLBACK
+            )
+            self._last_ready_urgency[request_id] = urgency
+            self.audio_scheduling_metrics[f"{urgency.name.lower()}_ready_count"] += 1
+            if urgency == AudioUrgency.U0:
+                self._u0_wait_rounds[request_id] += 1
+            elif urgency == AudioUrgency.FALLBACK and state is not None and state.is_stale(
+                now_monotonic_s=now, ttl_ms=self._interaction_state_ttl_ms
+            ):
+                self.audio_scheduling_metrics["stale_fallback_count"] += 1
+
+    def _preempt_for_liveserve(
+        self,
+        waiting_queue: Any,
+        running_queue: list[Request],
+        interaction_states: dict[str, AudioInteractionState],
+    ) -> None:
+        ready_requests = [
+            request
+            for request in [*running_queue, *list(waiting_queue)]
+            if request.request_id in self.requests_with_ready_chunks
+        ]
+        if len(ready_requests) <= self.scheduler_max_num_seqs:
+            return
+        ranked_ids = rank_audio_requests(
+            [request.request_id for request in ready_requests],
+            interaction_states,
+            now_monotonic_s=time.monotonic(),
+            safe_buffer_ms=self._playback_safe_buffer_ms,
+            ttl_ms=self._interaction_state_ttl_ms,
+        )
+        desired = set(ranked_ids[: self.scheduler_max_num_seqs])
+        for index in range(len(running_queue) - 1, -1, -1):
+            request = running_queue[index]
+            if request.request_id in self.requests_with_ready_chunks and request.request_id not in desired:
+                running_queue.pop(index)
+                request.status = RequestStatus.PREEMPTED
+                waiting_queue.prepend_requests([request])
+        self._prioritize_ready_requests(waiting_queue, interaction_states, record_metrics=False)
 
     def _evict_finished_active_streams(self, request_ids: set[str] | None = None) -> None:
         for request_id in list(self._active_streams):
@@ -654,6 +772,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self,
         scheduler_output: Any,
         requests: dict[str, Request] | None = None,
+        interaction_states: dict[str, AudioInteractionState] | None = None,
     ) -> None:
         """
         Add additional info for cached requests and
@@ -667,6 +786,26 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         if requests is not None:
             self.attach_cached_additional_information(scheduler_output, requests)
         scheduled_req_ids = self._scheduled_request_ids(scheduler_output)
+        if self._interaction_scheduling_enabled:
+            now = time.monotonic()
+            for request_id in scheduled_req_ids:
+                urgency = self._last_ready_urgency.pop(request_id, AudioUrgency.FALLBACK)
+                self.audio_scheduling_metrics[f"{urgency.name.lower()}_scheduled_count"] += 1
+                if urgency == AudioUrgency.U0:
+                    rounds = self._u0_wait_rounds.pop(request_id, 0)
+                    self.audio_scheduling_metrics["u0_max_wait_rounds"] = max(
+                        int(self.audio_scheduling_metrics["u0_max_wait_rounds"]), rounds
+                    )
+                elif urgency == AudioUrgency.U1 and interaction_states is not None:
+                    state = interaction_states.get(request_id)
+                    if state is not None and state.ready_since_monotonic_s is not None:
+                        wait_ms = (now - state.ready_since_monotonic_s) * 1000.0
+                        self.audio_scheduling_metrics["u1_max_first_schedule_wait_ms"] = max(
+                            float(self.audio_scheduling_metrics["u1_max_first_schedule_wait_ms"]), wait_ms
+                        )
+            for request_id, urgency in self._last_ready_urgency.items():
+                if urgency == AudioUrgency.U2 and request_id not in scheduled_req_ids:
+                    self.audio_scheduling_metrics["u2_deferred_count"] += 1
         self._clear_chunk_ready(scheduler_output)
         if scheduled_req_ids:
             # Terminal chunks must stay active until they are scheduled once.

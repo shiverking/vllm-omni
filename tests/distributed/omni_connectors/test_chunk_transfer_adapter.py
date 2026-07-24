@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import threading
+import time
 from collections import deque
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -12,6 +13,7 @@ from pytest_mock import MockerFixture
 from vllm.v1.core.sched.scheduler import Scheduler as VLLMScheduler
 from vllm.v1.request import RequestStatus
 
+from vllm_omni.core.sched.audio_interaction import AudioInteractionState
 from vllm_omni.data_entry_keys import CodesStruct, MetaStruct, OmniPayload, OmniPayloadStruct
 from vllm_omni.distributed.omni_connectors.transfer_adapter.base import OmniTransferAdapterBase
 from vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapter import (
@@ -51,6 +53,7 @@ def build_adapter(monkeypatch, mocker: MockerFixture):
         model_mode: str = "ar",
         max_num_seqs: int = 2,
         active_stream_window: int = 0,
+        audio_scheduling_policy: str | None = None,
         connector_extra: dict | None = None,
     ):
         connector = mocker.MagicMock()
@@ -81,6 +84,9 @@ def build_adapter(monkeypatch, mocker: MockerFixture):
             worker_type=model_mode,
             max_num_seqs=max_num_seqs,
             active_stream_window=active_stream_window,
+            audio_scheduling_policy=audio_scheduling_policy,
+            playback_safe_buffer_ms=100.0,
+            interaction_state_ttl_ms=500.0,
         )
         scheduler_config = SimpleNamespace(max_num_seqs=max_num_seqs)
         adapter = OmniChunkTransferAdapter(
@@ -446,6 +452,99 @@ def test_legacy_k0(build_adapter):
     assert waiting_queue == [running_req_2]
     assert running_req_2.status == RequestStatus.PREEMPTED
     assert adapter._active_streams == {}
+
+
+def test_liveserve_audio_orders_u0_u1_u2_then_fallback(build_adapter):
+    adapter, _ = build_adapter(
+        stage_id=1,
+        max_num_seqs=4,
+        audio_scheduling_policy="liveserve_audio",
+    )
+    now = time.monotonic()
+    reqs = {
+        request_id: _req(request_id, RequestStatus.WAITING)
+        for request_id in ("u2", "missing", "u1", "u0")
+    }
+    states = {
+        "u2": AudioInteractionState("u2", True, 300, 100, last_update_monotonic_s=now),
+        "u1": AudioInteractionState("u1", False, 0, 0, last_update_monotonic_s=now),
+        "u0": AudioInteractionState("u0", True, 150, 100, last_update_monotonic_s=now),
+    }
+    waiting_queue = DummyWaitingQueue(reqs.values())
+    adapter.requests_with_ready_chunks.update(reqs)
+
+    adapter.process_pending_chunks(waiting_queue, [], interaction_states=states)
+
+    assert [request.request_id for request in waiting_queue] == ["u0", "u1", "u2", "missing"]
+
+
+def test_liveserve_audio_orders_same_class_and_stale_falls_back(build_adapter):
+    adapter, _ = build_adapter(
+        stage_id=1,
+        max_num_seqs=5,
+        audio_scheduling_policy="liveserve_audio",
+    )
+    now = time.monotonic()
+    order = ["u0-large", "stale", "u1-new", "u0-small", "u1-old"]
+    reqs = {request_id: _req(request_id, RequestStatus.WAITING) for request_id in order}
+    states = {
+        "u0-large": AudioInteractionState("u0-large", True, 190, 100, last_update_monotonic_s=now),
+        "u0-small": AudioInteractionState("u0-small", True, 110, 100, last_update_monotonic_s=now),
+        "u1-new": AudioInteractionState(
+            "u1-new", False, last_update_monotonic_s=now, ready_since_monotonic_s=now - 1
+        ),
+        "u1-old": AudioInteractionState(
+            "u1-old", False, last_update_monotonic_s=now, ready_since_monotonic_s=now - 2
+        ),
+        "stale": AudioInteractionState("stale", True, 101, 100, last_update_monotonic_s=now - 1),
+    }
+    waiting_queue = DummyWaitingQueue(reqs.values())
+    adapter.requests_with_ready_chunks.update(reqs)
+
+    adapter.process_pending_chunks(waiting_queue, [], interaction_states=states)
+
+    assert [request.request_id for request in waiting_queue] == [
+        "u0-small",
+        "u0-large",
+        "u1-old",
+        "u1-new",
+        "stale",
+    ]
+    assert adapter.audio_scheduling_metrics["stale_fallback_count"] == 1
+
+
+def test_explicit_legacy_ignores_interaction_state(build_adapter):
+    adapter, _ = build_adapter(stage_id=1, max_num_seqs=2, audio_scheduling_policy="legacy")
+    first = _req("first", RequestStatus.WAITING)
+    urgent = _req("urgent", RequestStatus.WAITING)
+    waiting_queue = DummyWaitingQueue([first, urgent])
+    adapter.requests_with_ready_chunks.update({"first", "urgent"})
+    now = time.monotonic()
+    states = {"urgent": AudioInteractionState("urgent", True, 1, 0, last_update_monotonic_s=now)}
+
+    adapter.process_pending_chunks(waiting_queue, [], interaction_states=states)
+
+    assert waiting_queue == [first, urgent]
+
+
+def test_liveserve_u0_preempts_running_u2_for_next_round(build_adapter):
+    adapter, _ = build_adapter(stage_id=1, max_num_seqs=1, audio_scheduling_policy="liveserve_audio")
+    u2 = _req("u2", RequestStatus.RUNNING)
+    u0 = _req("u0", RequestStatus.WAITING)
+    waiting_queue = DummyWaitingQueue([u0])
+    running_queue = [u2]
+    adapter.requests_with_ready_chunks.update({"u0", "u2"})
+    now = time.monotonic()
+    states = {
+        "u2": AudioInteractionState("u2", True, 300, 100, last_update_monotonic_s=now),
+        "u0": AudioInteractionState("u0", True, 110, 100, last_update_monotonic_s=now),
+    }
+
+    adapter.process_pending_chunks(waiting_queue, running_queue, interaction_states=states)
+
+    assert running_queue == []
+    assert waiting_queue == [u0, u2]
+    assert u2.status == RequestStatus.PREEMPTED
 
 
 def test_finished_releases_slot(build_adapter):

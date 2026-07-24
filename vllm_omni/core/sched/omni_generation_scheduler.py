@@ -88,7 +88,10 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         self._process_pending_input_timeouts()
         if self.chunk_transfer_adapter:
             self.chunk_transfer_adapter.process_pending_chunks(
-                self.waiting, self.running, scheduler_requests=self.requests
+                self.waiting,
+                self.running,
+                scheduler_requests=self.requests,
+                interaction_states=getattr(self, "audio_interaction_states", None),
             )
 
         # OMNI: Track requests that are already finished (e.g., marked by connector)
@@ -330,7 +333,10 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
             scheduler_output.scheduled_new_reqs = new_list  # type: ignore[assignment]
 
             if self.chunk_transfer_adapter:
-                self.chunk_transfer_adapter.postprocess_scheduler_output(scheduler_output)
+                self.chunk_transfer_adapter.postprocess_scheduler_output(
+                    scheduler_output,
+                    interaction_states=getattr(self, "audio_interaction_states", None),
+                )
 
         except Exception:
             # If anything goes wrong, leave the original output unchanged

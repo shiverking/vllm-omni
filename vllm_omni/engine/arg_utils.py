@@ -147,6 +147,9 @@ class OmniEngineArgs(EngineArgs):
     # Must be declared here so engine_args dict propagation does not silently
     # drop the value when constructing OmniEngineArgs from kwargs.
     active_stream_window: int = 0
+    audio_scheduling_policy: str = "legacy"
+    playback_safe_buffer_ms: float = 100.0
+    interaction_state_ttl_ms: float = 500.0
     omni_kv_config: dict | None = None
     quantization_config: Any | None = None
     force_cutlass_fp8: bool | None = None
@@ -324,6 +327,9 @@ class OmniEngineArgs(EngineArgs):
             stage_id=self.stage_id,
             async_chunk=self.async_chunk,
             active_stream_window=self.active_stream_window,
+            audio_scheduling_policy=self.audio_scheduling_policy,
+            playback_safe_buffer_ms=self.playback_safe_buffer_ms,
+            interaction_state_ttl_ms=self.interaction_state_ttl_ms,
             model_stage=self.model_stage,
             model_arch=self.model_arch,
             worker_type=self.worker_type,

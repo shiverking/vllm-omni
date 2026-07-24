@@ -121,6 +121,9 @@ class OmniModelConfig(ModelConfig):
     async_chunk: bool = False
     # Stage-1 active stream slots; 0 keeps legacy chunk-level round-robin.
     active_stream_window: int = 0
+    audio_scheduling_policy: str = "legacy"
+    playback_safe_buffer_ms: float = 100.0
+    interaction_state_ttl_ms: float = 500.0
     model_stage: str = "thinker"
     model_arch: str | None = None
     worker_type: str | None = None
@@ -294,6 +297,14 @@ class OmniModelConfig(ModelConfig):
             field_type = cls.__dataclass_fields__[key].type
             if field_type is not Any:
                 TypeAdapter(field_type).validate_python(value)
+
+        policy = omni_kwargs.get("audio_scheduling_policy", "legacy")
+        if policy not in {"legacy", "bounded_k", "liveserve_audio"}:
+            raise ValueError(f"Unexpected audio_scheduling_policy: {policy!r}")
+        if omni_kwargs.get("playback_safe_buffer_ms", 0) < 0 or omni_kwargs.get("interaction_state_ttl_ms", 0) < 0:
+            raise ValueError("Audio scheduling buffer and TTL must be non-negative")
+        if policy == "bounded_k" and omni_kwargs.get("active_stream_window", 0) <= 0:
+            raise ValueError("bounded_k requires active_stream_window > 0")
 
         # We should not have any uninitialized keys
         uninitialized_fields = omni_fields - omni_kwargs.keys()

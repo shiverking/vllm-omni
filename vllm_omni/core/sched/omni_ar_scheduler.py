@@ -219,7 +219,10 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
         if self.chunk_transfer_adapter:
             self.chunk_transfer_adapter.process_pending_chunks(
-                self.waiting, self.running, scheduler_requests=self.requests
+                self.waiting,
+                self.running,
+                scheduler_requests=self.requests,
+                interaction_states=getattr(self, "audio_interaction_states", None),
             )
 
         try:
@@ -264,7 +267,11 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
             scheduler_output.scheduled_new_reqs = new_list  # type: ignore[assignment]
             if self.chunk_transfer_adapter:
-                self.chunk_transfer_adapter.postprocess_scheduler_output(scheduler_output, self.requests)
+                self.chunk_transfer_adapter.postprocess_scheduler_output(
+                    scheduler_output,
+                    self.requests,
+                    interaction_states=getattr(self, "audio_interaction_states", None),
+                )
             # Add information about requests needing KV cache transfer
             finished_reqs = self.get_finished_requests_needing_kv_transfer()
         except Exception:

@@ -1155,6 +1155,17 @@ class _PlaybackFeedbackPublisher:
                 )
                 if self._stopping and self._sent_version >= self._version:
                     break
+                if not self._stopping and not self._event.is_set():
+                    try:
+                        await asyncio.wait_for(self._event.wait(), timeout=0.05)
+                    except TimeoutError:
+                        self._version += 1
+                        heartbeat = {
+                            **payload,
+                            "client_timestamp_ms": time.monotonic() * 1000.0,
+                        }
+                        self._pending = heartbeat, time.perf_counter(), self._version
+                        self._event.set()
 
 
 async def async_request_openai_audio_speech(
@@ -1221,6 +1232,16 @@ async def async_request_openai_audio_speech(
     try:
         async with session.post(url=api_url, json=payload, headers=headers) as response:
             if response.status == 200:
+                if publisher is not None:
+                    publisher.publish(
+                        {
+                            "received_audio_ms": 0.0,
+                            "played_audio_ms": 0.0,
+                            "first_audio_received": False,
+                            "finished": False,
+                            "aborted": False,
+                        }
+                    )
                 async for chunk in response.content.iter_any():
                     if not chunk:
                         continue

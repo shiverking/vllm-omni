@@ -499,6 +499,9 @@ class DeployConfig:
     async_chunk: bool = True
     # Stage-1 active stream slots; 0 preserves legacy all-stream cycling.
     active_stream_window: int = 0
+    audio_scheduling_policy: str = "legacy"
+    playback_safe_buffer_ms: float = 100.0
+    interaction_state_ttl_ms: float = 500.0
     connectors: dict[str, Any] | None = None
     edges: list[dict[str, Any]] | None = None
     stages: list[StageDeployConfig] = field(default_factory=list)
@@ -674,9 +677,19 @@ def load_deploy_config(path: str | Path) -> DeployConfig:
 
     stages = [_parse_stage_deploy(s) for s in raw_dict.get("stages", [])]
 
+    active_stream_window = int(raw_dict.get("active_stream_window", 0) or 0)
+    configured_audio_policy = raw_dict.get("audio_scheduling_policy")
+    audio_scheduling_policy = (
+        str(configured_audio_policy)
+        if configured_audio_policy is not None
+        else ("bounded_k" if active_stream_window > 0 else "legacy")
+    )
     kwargs: dict[str, Any] = {
         "async_chunk": raw_dict.get("async_chunk", True),
-        "active_stream_window": int(raw_dict.get("active_stream_window", 0) or 0),
+        "active_stream_window": active_stream_window,
+        "audio_scheduling_policy": audio_scheduling_policy,
+        "playback_safe_buffer_ms": float(raw_dict.get("playback_safe_buffer_ms", 100.0)),
+        "interaction_state_ttl_ms": float(raw_dict.get("interaction_state_ttl_ms", 500.0)),
         "connectors": raw_dict.get("connectors", None),
         "edges": raw_dict.get("edges", None),
         "stages": stages,
@@ -698,7 +711,20 @@ def load_deploy_config(path: str | Path) -> DeployConfig:
     ):
         if name in raw_dict:
             kwargs[name] = raw_dict[name]
-    return DeployConfig(**kwargs)
+    deploy = DeployConfig(**kwargs)
+    valid_audio_policies = {"legacy", "bounded_k", "liveserve_audio"}
+    if deploy.audio_scheduling_policy not in valid_audio_policies:
+        raise ValueError(
+            f"audio_scheduling_policy must be one of {sorted(valid_audio_policies)}, "
+            f"got {deploy.audio_scheduling_policy!r}"
+        )
+    if deploy.playback_safe_buffer_ms < 0 or deploy.interaction_state_ttl_ms < 0:
+        raise ValueError("playback_safe_buffer_ms and interaction_state_ttl_ms must be non-negative")
+    if deploy.audio_scheduling_policy == "bounded_k" and deploy.active_stream_window <= 0:
+        raise ValueError("bounded_k requires active_stream_window > 0")
+    if deploy.audio_scheduling_policy == "liveserve_audio" and not deploy.async_chunk:
+        raise ValueError("liveserve_audio requires async_chunk: true")
+    return deploy
 
 
 class PlatformOverrides(NamedTuple):
@@ -817,6 +843,9 @@ _PIPELINE_WIDE_ENGINE_FIELDS: tuple[str, ...] = (
     "data_parallel_size",
     "pipeline_parallel_size",
     "active_stream_window",
+    "audio_scheduling_policy",
+    "playback_safe_buffer_ms",
+    "interaction_state_ttl_ms",
     "custom_voice_dir",
 )
 

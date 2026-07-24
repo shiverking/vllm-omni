@@ -78,6 +78,12 @@ class StageEngineCoreProc(EngineCoreProc):
             if update is None:
                 return {"status": "unsupported"}
             return update(args[0])
+        if method == "get_audio_scheduling_metrics":
+            adapter = getattr(self.scheduler, "chunk_transfer_adapter", None)
+            return {
+                "scheduling": dict(getattr(adapter, "audio_scheduling_metrics", {}) or {}),
+                "feedback": dict(getattr(self.scheduler, "audio_feedback_counters", {}) or {}),
+            }
         return super().collective_rpc(method, timeout, args, kwargs)
 
     @staticmethod
