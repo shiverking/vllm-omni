@@ -691,6 +691,12 @@ stages:
         deploy = load_deploy_config(overlay)
         assert deploy.stages[1].num_replicas == 2
 
+        # This test covers deploy inheritance and replica preservation, not
+        # platform-specific placement.  On an NPU host the base config's NPU
+        # overlay intentionally replaces stage 1 devices with "2" during
+        # merge_pipeline_deploy(), which would make the assertion below depend
+        # on the machine running pytest.
+        deploy.platforms = None
         stages = merge_pipeline_deploy(pipeline, deploy)
         assert stages[1].yaml_runtime["devices"] == "1,2"
         assert stages[1].yaml_runtime["num_replicas"] == 2

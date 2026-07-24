@@ -32,10 +32,10 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 @pytest.mark.asyncio
 async def test_publish_playback_feedback_maps_external_request_id():
     omni = AsyncOmni.__new__(AsyncOmni)
+    omni.engine = SimpleNamespace(stage_configs=[object(), object()])
     omni.request_states = {
         "internal-1": ClientRequestState("internal-1", external_request_id="seedtts-0001")
     }
-    omni.stage_configs = [object(), object()]
     omni.collective_rpc = AsyncMock(return_value=[{"status": "accepted", "counters": {"accepted": 1}}])
     result = await omni.publish_playback_feedback(
         {
@@ -56,14 +56,13 @@ async def test_publish_playback_feedback_maps_external_request_id():
 async def test_publish_playback_feedback_unknown_request():
     omni = AsyncOmni.__new__(AsyncOmni)
     omni.request_states = {}
-    omni.stage_configs = [object(), object()]
     assert (await omni.publish_playback_feedback({"request_id": "missing"}))["status"] == "unknown_request"
 
 
 @pytest.mark.asyncio
 async def test_get_audio_scheduling_metrics_reads_stage_one():
     omni = AsyncOmni.__new__(AsyncOmni)
-    omni.stage_configs = [object(), object()]
+    omni.engine = SimpleNamespace(stage_configs=[object(), object()])
     expected = {"scheduling": {"u0_scheduled_count": 3}, "feedback": {"accepted": 4}}
     omni.collective_rpc = AsyncMock(return_value=[expected])
 
