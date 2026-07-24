@@ -63,6 +63,23 @@ class StageEngineCoreProc(EngineCoreProc):
     ``EngineCoreProc.run_engine_core()``.
     """
 
+    def collective_rpc(
+        self,
+        method: str,
+        timeout: float | None = None,
+        args: tuple[Any, ...] = (),
+        kwargs: dict[str, Any] | None = None,
+    ) -> Any:
+        """Handle scheduler-local Omni control calls before worker fan-out."""
+        if method == "update_audio_interaction_state":
+            if not args or not isinstance(args[0], dict):
+                raise ValueError("update_audio_interaction_state requires one feedback dict")
+            update = getattr(self.scheduler, "update_audio_interaction_state", None)
+            if update is None:
+                return {"status": "unsupported"}
+            return update(args[0])
+        return super().collective_rpc(method, timeout, args, kwargs)
+
     @staticmethod
     def run_stage_core(
         *args: Any,

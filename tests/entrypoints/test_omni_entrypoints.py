@@ -4,7 +4,7 @@ import queue
 from collections.abc import Callable
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from vllm.entrypoints.openai.models.protocol import BaseModelPath
@@ -27,6 +27,37 @@ from vllm_omni.errors import (
 from vllm_omni.outputs import OmniRequestOutput
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+@pytest.mark.asyncio
+async def test_publish_playback_feedback_maps_external_request_id():
+    omni = AsyncOmni.__new__(AsyncOmni)
+    omni.request_states = {
+        "internal-1": ClientRequestState("internal-1", external_request_id="seedtts-0001")
+    }
+    omni.stage_configs = [object(), object()]
+    omni.collective_rpc = AsyncMock(return_value=[{"status": "accepted", "counters": {"accepted": 1}}])
+    result = await omni.publish_playback_feedback(
+        {
+            "request_id": "seedtts-0001",
+            "received_audio_ms": 100,
+            "played_audio_ms": 50,
+            "client_timestamp_ms": 1,
+        }
+    )
+    assert result["status"] == "accepted"
+    call = omni.collective_rpc.await_args
+    assert call.kwargs["method"] == "update_audio_interaction_state"
+    assert call.kwargs["stage_ids"] == [1]
+    assert call.kwargs["args"][0]["request_id"] == "internal-1"
+
+
+@pytest.mark.asyncio
+async def test_publish_playback_feedback_unknown_request():
+    omni = AsyncOmni.__new__(AsyncOmni)
+    omni.request_states = {}
+    omni.stage_configs = [object(), object()]
+    assert (await omni.publish_playback_feedback({"request_id": "missing"}))["status"] == "unknown_request"
 
 
 def _stage_meta(*, stage_type: str, final_output: bool, final_output_type: str | None) -> StageRuntimeInfo:

@@ -7,6 +7,25 @@ from pydantic import AliasChoices, BaseModel, Field, field_validator, model_vali
 _MAX_EMBEDDING_DIM = 8192
 
 
+class PlaybackFeedbackRequest(BaseModel):
+    request_id: str = Field(min_length=1, max_length=256)
+    received_audio_ms: float = Field(ge=0)
+    played_audio_ms: float = Field(ge=0)
+    first_audio_received: bool = False
+    finished: bool = False
+    aborted: bool = False
+    client_timestamp_ms: float = Field(ge=0)
+
+    @model_validator(mode="after")
+    def validate_audio_positions(self):
+        self.request_id = self.request_id.strip()
+        if not self.request_id:
+            raise ValueError("request_id must not be blank")
+        if self.played_audio_ms > self.received_audio_ms:
+            raise ValueError("played_audio_ms must not exceed received_audio_ms")
+        return self
+
+
 def _normalize_ref_audio_value(value):
     if value is None:
         return None

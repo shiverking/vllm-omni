@@ -376,6 +376,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         self._realign_request_status_to_queues(request_ids)
 
         finished = super().finish_requests(request_ids, finished_status)
+        self._cleanup_audio_interaction_states(request_id for request_id, _ in finished)
 
         # See ``OmniSchedulerMixin._purge_finished_from_running`` --
         # defensive belt-and-suspenders sweep paired with the realign

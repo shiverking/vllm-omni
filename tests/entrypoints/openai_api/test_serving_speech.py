@@ -17,7 +17,7 @@ import pytest
 import torch
 from fastapi import FastAPI, HTTPException, Request, UploadFile
 from fastapi.params import File, Form
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
 from pytest_mock import MockerFixture
@@ -2153,6 +2153,103 @@ def test_api_server_create_speech_wraps_error_response_status(mocker: MockerFixt
 
     assert isinstance(response, JSONResponse)
     assert response.status_code == 400
+
+
+def test_playback_feedback_request_validation():
+    from pydantic import ValidationError
+
+    from vllm_omni.entrypoints.openai.protocol.audio import PlaybackFeedbackRequest
+
+    with pytest.raises(ValidationError, match="played_audio_ms"):
+        PlaybackFeedbackRequest(
+            request_id="seedtts-0001",
+            received_audio_ms=100,
+            played_audio_ms=101,
+            client_timestamp_ms=1,
+        )
+
+
+def test_playback_feedback_disabled_by_default(monkeypatch):
+    from vllm_omni.entrypoints.openai.protocol.audio import PlaybackFeedbackRequest
+
+    monkeypatch.delenv("VLLM_OMNI_ENABLE_PLAYBACK_FEEDBACK", raising=False)
+    app = FastAPI()
+    scope = {
+        "type": "http",
+        "app": app,
+        "method": "POST",
+        "path": "/v1/audio/speech/playback",
+        "headers": [],
+        "query_string": b"",
+        "client": ("127.0.0.1", 12345),
+        "server": ("testserver", 80),
+        "scheme": "http",
+    }
+    request = PlaybackFeedbackRequest(
+        request_id="seedtts-0001",
+        received_audio_ms=100,
+        played_audio_ms=50,
+        client_timestamp_ms=1,
+    )
+    response = asyncio.run(api_server_module.publish_speech_playback(request, Request(scope)))
+    assert response.status_code == 503
+    assert b'"status":"disabled"' in response.body
+
+
+def test_playback_feedback_reaches_engine(monkeypatch, mocker: MockerFixture):
+    from vllm_omni.entrypoints.openai.protocol.audio import PlaybackFeedbackRequest
+
+    monkeypatch.setenv("VLLM_OMNI_ENABLE_PLAYBACK_FEEDBACK", "1")
+    engine = SimpleNamespace(
+        publish_playback_feedback=mocker.AsyncMock(return_value={"status": "accepted", "request_id": "seedtts-0001"})
+    )
+    app = FastAPI()
+    app.state.engine_client = engine
+    scope = {
+        "type": "http",
+        "app": app,
+        "method": "POST",
+        "path": "/v1/audio/speech/playback",
+        "headers": [],
+        "query_string": b"",
+        "client": ("127.0.0.1", 12345),
+        "server": ("testserver", 80),
+        "scheme": "http",
+    }
+    request = PlaybackFeedbackRequest(
+        request_id="seedtts-0001",
+        received_audio_ms=100,
+        played_audio_ms=50,
+        first_audio_received=True,
+        client_timestamp_ms=1,
+    )
+    response = asyncio.run(api_server_module.publish_speech_playback(request, Request(scope)))
+    assert response.status_code == 200
+    engine.publish_playback_feedback.assert_awaited_once()
+
+
+def test_speech_x_request_id_is_forwarded_when_feedback_enabled(monkeypatch, mocker: MockerFixture):
+    monkeypatch.setenv("VLLM_OMNI_ENABLE_PLAYBACK_FEEDBACK", "1")
+    handler = mocker.MagicMock()
+    handler.create_speech = mocker.AsyncMock(return_value=Response(content=b"pcm", media_type="audio/pcm"))
+    app = FastAPI()
+    app.state.openai_serving_speech = handler
+    scope = {
+        "type": "http",
+        "app": app,
+        "method": "POST",
+        "path": "/v1/audio/speech",
+        "headers": [(b"x-request-id", b"seedtts-0001")],
+        "query_string": b"",
+        "client": ("127.0.0.1", 12345),
+        "server": ("testserver", 80),
+        "scheme": "http",
+    }
+    raw_request = Request(scope)
+    request = OpenAICreateSpeechRequest(input="Hello")
+    response = asyncio.run(api_server_module.create_speech(request, raw_request))
+    assert response.status_code == 200
+    handler.create_speech.assert_awaited_once_with(request, raw_request, request_id="seedtts-0001")
 
 
 def test_api_server_create_speech_engine_error_response_includes_request_and_stage_id(mocker: MockerFixture):

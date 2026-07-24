@@ -105,6 +105,7 @@ from vllm_omni.entrypoints.openai.protocol.audio import (
     BatchSpeechRequest,
     OpenAICreateAudioGenerateRequest,
     OpenAICreateSpeechRequest,
+    PlaybackFeedbackRequest,
 )
 from vllm_omni.entrypoints.openai.protocol.images import (
     ImageData,
@@ -1187,6 +1188,22 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
 _remove_route_from_router(router, "/v1/audio/speech", {"POST"})
 
 
+def _playback_feedback_enabled() -> bool:
+    return os.environ.get("VLLM_OMNI_ENABLE_PLAYBACK_FEEDBACK", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _experimental_speech_request_id(raw_request: Request) -> str | None:
+    if not _playback_feedback_enabled():
+        return None
+    value = raw_request.headers.get("X-Request-ID")
+    if value is None:
+        return None
+    value = value.strip()
+    if not value or len(value) > 256 or not value.isprintable():
+        raise HTTPException(status_code=HTTPStatus.BAD_REQUEST.value, detail="Invalid X-Request-ID")
+    return value
+
+
 @router.post(
     "/v1/audio/speech",
     dependencies=[Depends(validate_json_request)],
@@ -1224,7 +1241,11 @@ async def create_speech(request: OpenAICreateSpeechRequest, raw_request: Request
             )
         return base_server.create_error_response(message="The model does not support Speech API")
     try:
-        result = await handler.create_speech(request, raw_request)
+        result = await handler.create_speech(
+            request,
+            raw_request,
+            request_id=_experimental_speech_request_id(raw_request),
+        )
         if isinstance(result, ErrorResponse):
             return JSONResponse(
                 content=result.model_dump(),
@@ -1235,6 +1256,27 @@ async def create_speech(request: OpenAICreateSpeechRequest, raw_request: Request
         return _create_engine_error_json_response(raw_request, exc)
     except Exception as e:
         raise HTTPException(status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value, detail=str(e)) from e
+
+
+@router.post("/v1/audio/speech/playback")
+async def publish_speech_playback(request: PlaybackFeedbackRequest, raw_request: Request):
+    """Publish experimental client playback state to the Stage 1 scheduler."""
+    if not _playback_feedback_enabled():
+        return JSONResponse(
+            status_code=HTTPStatus.SERVICE_UNAVAILABLE.value,
+            content={"status": "disabled", "enabled": False},
+        )
+    engine_client = getattr(raw_request.app.state, "engine_client", None)
+    publish = getattr(engine_client, "publish_playback_feedback", None)
+    if publish is None:
+        raise HTTPException(
+            status_code=HTTPStatus.NOT_IMPLEMENTED.value,
+            detail="Playback feedback is not supported by this engine",
+        )
+    result = await publish(request.model_dump())
+    status = result.get("status") if isinstance(result, dict) else None
+    status_code = HTTPStatus.NOT_FOUND.value if status == "unknown_request" else HTTPStatus.OK.value
+    return JSONResponse(status_code=status_code, content=result)
 
 
 @router.post(

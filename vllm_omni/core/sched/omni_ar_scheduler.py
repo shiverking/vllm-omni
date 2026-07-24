@@ -648,6 +648,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         self._realign_request_status_to_queues(request_ids)
 
         finished = super().finish_requests(request_ids, finished_status)
+        self._cleanup_audio_interaction_states(request_id for request_id, _ in finished)
 
         # Defensive post-finish purge: belt-and-suspenders to the
         # realignment above. Even after realign + ``super()``, corner

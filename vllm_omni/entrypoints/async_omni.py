@@ -760,6 +760,42 @@ class AsyncOmni(EngineClient, OmniBase):
 
         return results
 
+    async def publish_playback_feedback(self, feedback: dict[str, Any]) -> dict[str, Any]:
+        """Map an external speech request ID and update Stage 1 interaction state."""
+        external_request_id = str(feedback.get("request_id") or "")
+        internal_ids = [
+            state.request_id
+            for state in self.request_states.values()
+            if state.external_request_id == external_request_id
+        ]
+        if not internal_ids:
+            return {"status": "unknown_request", "request_id": external_request_id}
+        if len(self.stage_configs) <= 1:
+            return {"status": "unsupported", "request_id": external_request_id, "reason": "stage_1_missing"}
+
+        statuses: list[dict[str, Any]] = []
+        for internal_request_id in internal_ids:
+            payload = dict(feedback)
+            payload["request_id"] = internal_request_id
+            results = await self.collective_rpc(
+                method="update_audio_interaction_state",
+                args=(payload,),
+                stage_ids=[1],
+            )
+            statuses.extend(result for result in results if isinstance(result, dict))
+
+        preferred = next(
+            (item for item in statuses if item.get("status") in {"accepted", "coalesced", "stale"}),
+            None,
+        )
+        if preferred is None:
+            return {
+                "status": "unsupported",
+                "request_id": external_request_id,
+                "stage_results": statuses,
+            }
+        return {**preferred, "request_id": external_request_id}
+
     @staticmethod
     def _coerce_stage_bool(result: Any) -> bool:
         """Reduce a stage RPC result to a boolean.

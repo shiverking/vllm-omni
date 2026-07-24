@@ -10,6 +10,7 @@ from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.metrics.stats import SchedulerStats
 from vllm.v1.request import RequestStatus
 
+from vllm_omni.core.sched.audio_interaction import AudioInteractionState
 from vllm_omni.core.sched.output import OmniChunkRecvHandle, OmniSchedulerOutput
 
 logger = init_logger(__name__)
@@ -46,6 +47,98 @@ class OmniSchedulerMixin:
         if input_coordinator is not None:
             input_coordinator.free_finished_request(request_id)
 
+    def update_audio_interaction_state(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Update the scheduler-local playback side table without changing queues."""
+        request_id = str(payload.get("request_id") or "")
+        counters = getattr(self, "audio_feedback_counters", None)
+        if counters is None:
+            counters = self.audio_feedback_counters = {
+                "accepted": 0,
+                "coalesced": 0,
+                "stale": 0,
+                "unknown_request": 0,
+                "state_cleaned": 0,
+            }
+        if not request_id or request_id not in self.requests:
+            counters["unknown_request"] += 1
+            return {"status": "unknown_request", "counters": dict(counters)}
+
+        states = getattr(self, "audio_interaction_states", None)
+        if states is None:
+            states = self.audio_interaction_states = {}
+        timestamps = getattr(self, "audio_feedback_client_timestamps_ms", None)
+        if timestamps is None:
+            timestamps = self.audio_feedback_client_timestamps_ms = {}
+
+        client_timestamp_ms = float(payload.get("client_timestamp_ms", 0.0))
+        previous_timestamp = timestamps.get(request_id)
+        if previous_timestamp is not None and client_timestamp_ms < previous_timestamp:
+            counters["stale"] += 1
+            return {"status": "stale", "counters": dict(counters)}
+
+        received_audio_ms = float(payload.get("received_audio_ms", 0.0))
+        played_audio_ms = float(payload.get("played_audio_ms", 0.0))
+        first_audio_received = bool(payload.get("first_audio_received", False))
+        finished = bool(payload.get("finished", False))
+        aborted = bool(payload.get("aborted", False))
+        state = states.get(request_id)
+        if state is not None and previous_timestamp == client_timestamp_ms:
+            is_duplicate = (
+                received_audio_ms == state.received_audio_ms
+                and played_audio_ms == state.played_audio_ms
+                and first_audio_received == state.first_audio_received
+                and finished == state.finished
+                and aborted == state.aborted
+            )
+            if is_duplicate:
+                counters["coalesced"] += 1
+                return {"status": "coalesced", "counters": dict(counters)}
+            counters["stale"] += 1
+            return {"status": "stale", "counters": dict(counters)}
+
+        now = time.monotonic()
+        if state is None:
+            state = AudioInteractionState(request_id=request_id, last_update_monotonic_s=now)
+            states[request_id] = state
+        try:
+            state.apply_feedback(
+                received_audio_ms=received_audio_ms,
+                played_audio_ms=played_audio_ms,
+                first_audio_received=first_audio_received,
+                now_monotonic_s=now,
+                finished=finished,
+                aborted=aborted,
+            )
+        except ValueError as exc:
+            counters["stale"] += 1
+            return {"status": "stale", "error": str(exc), "counters": dict(counters)}
+        timestamps[request_id] = client_timestamp_ms
+        counters["accepted"] += 1
+        if finished or aborted:
+            self._cleanup_audio_interaction_states([request_id])
+        return {"status": "accepted", "counters": dict(counters)}
+
+    def _cleanup_audio_interaction_states(self, request_ids: Iterable[str]) -> None:
+        states = getattr(self, "audio_interaction_states", {})
+        timestamps = getattr(self, "audio_feedback_client_timestamps_ms", {})
+        counters = getattr(self, "audio_feedback_counters", None)
+        for request_id in request_ids:
+            removed = states.pop(request_id, None) is not None
+            timestamps.pop(request_id, None)
+            if removed and counters is not None:
+                counters["state_cleaned"] += 1
+
+    def cleanup_stale_audio_interaction_states(self, ttl_ms: float = 500.0) -> int:
+        states = getattr(self, "audio_interaction_states", {})
+        now = time.monotonic()
+        stale_ids = [
+            request_id
+            for request_id, state in states.items()
+            if state.is_stale(now_monotonic_s=now, ttl_ms=ttl_ms)
+        ]
+        self._cleanup_audio_interaction_states(stale_ids)
+        return len(stale_ids)
+
     # ------------------------------------------------------------------ #
     #  Shared scheduler/output helpers (lift the AR / generation duplicates)
     # ------------------------------------------------------------------ #
@@ -57,6 +150,7 @@ class OmniSchedulerMixin:
         AR and generation schedulers except for the ``model_mode`` argument
         forwarded to ``update_request_metadata``.
         """
+        self.cleanup_stale_audio_interaction_states()
         connector_output = getattr(self, "_latest_omni_connector_output", None)
         self._latest_omni_connector_output = None
         input_coordinator = getattr(self, "input_coordinator", None)
