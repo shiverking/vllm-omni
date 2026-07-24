@@ -1,0 +1,21 @@
+# Common single-Ascend-910B4 profile for Qwen3-TTS-12Hz-1.7B-Base.
+# Keep policy selection in the three thin overlays next to this file so every
+# comparison uses identical model, batching, memory, and execution settings.
+base_config: qwen3_tts.yaml
+
+async_chunk: true
+playback_safe_buffer_ms: 100
+interaction_state_ttl_ms: 500
+
+stages:
+  - stage_id: 0
+    max_num_seqs: 8
+    gpu_memory_utilization: 0.30
+    enforce_eager: true
+    devices: "0"
+
+  - stage_id: 1
+    max_num_seqs: 4
+    gpu_memory_utilization: 0.30
+    enforce_eager: true
+    devices: "0"
