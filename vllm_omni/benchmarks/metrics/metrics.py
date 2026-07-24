@@ -35,6 +35,9 @@ _MULTIMODAL_BENCHMARK_FIELDS = [
     (defs.STD_AUDIO_UNDERRUN_S, float, field(default=0.0)),
     (defs.PERCENTILES_AUDIO_UNDERRUN_S, _PERCENTILE_ROWS_TYPE, field(default=None)),
     (defs.AUDIO_CONTINUITY_OK_RATE, float, field(default=1.0)),
+    (defs.USEFUL_REQUEST_COUNT, int, field(default=0)),
+    (defs.USEFUL_REQUEST_THROUGHPUT, float, field(default=0.0)),
+    (defs.REALTIME_CAPACITY_PASS, bool, field(default=False)),
     (defs.TOTAL_IMAGES, int, field(default=0)),
     (defs.IMAGE_THROUGHPUT, float, field(default=0.0)),
     (defs.AVERAGE_PIXELS_PER_IMAGE, float, field(default=0.0)),
@@ -204,6 +207,12 @@ def print_metrics(
         print("{:<40} {:<10.2f}".format("Request goodput (req/s):", metrics.request_goodput))
     if isinstance(metrics, MultiModalsBenchmarkMetrics):
         print("{:<40} {:<10.2f}".format("Peak concurrent requests:", metrics.max_concurrent_requests))
+        if _has_audio_output(metrics):
+            print(
+                "{:<40} {:<10.2f}".format(
+                    "Useful request throughput (req/s):", getattr(metrics, defs.USEFUL_REQUEST_THROUGHPUT)
+                )
+            )
     if task_type != TaskType.GENERATION or "e2el" in selected_percentile_metrics:
         process_one_metric("e2el", metrics)
     print_text_metrics(task_type, selected_percentile_metrics, metrics)
@@ -716,6 +725,11 @@ def calculate_metrics(
     request_rate,
     benchmark_duration,
     print_stage: bool = False,
+    useful_audio_ttfp_s: float = 1.0,
+    useful_require_audio_rtf: bool = False,
+    useful_audio_rtf_max: float = 1.0,
+    realtime_min_continuity: float = 0.95,
+    realtime_max_p90_rtf: float = 1.0,
 ) -> tuple[BenchmarkMetrics, list[int]]:
     """Calculate the metrics for the benchmark.
 
@@ -750,6 +764,7 @@ def calculate_metrics(
     audio_underruns: list[float] = []
     audio_continuity_ok: list[bool] = []
     input_audio_duration = 0.0
+    useful_completed = 0
     for i in range(len(outputs)):
         if outputs[i].success:
             output_len = outputs[i].output_tokens
@@ -793,6 +808,15 @@ def calculate_metrics(
                 denoise_step_latencies_ms.append(denoise_step_latency_ms)
             audio_underruns.append(getattr(outputs[i], f"{defs.AUDIO_UNDERRUN}_s", 0.0))
             audio_continuity_ok.append(bool(getattr(outputs[i], defs.AUDIO_CONTINUITY_OK, True)))
+            is_useful = (
+                getattr(outputs[i], defs.AUDIO_DURATION, 0.0) > 0
+                and getattr(outputs[i], defs.AUDIO_TTFP, 0.0) <= useful_audio_ttfp_s
+                and bool(getattr(outputs[i], defs.AUDIO_CONTINUITY_OK, True))
+            )
+            if useful_require_audio_rtf:
+                is_useful = is_useful and getattr(outputs[i], defs.AUDIO_RTF, 0.0) <= useful_audio_rtf_max
+            if is_useful:
+                useful_completed += 1
             e2els.append(outputs[i].latency)
             input_audio_duration += outputs[i].input_audio_duration
             completed += 1
@@ -800,24 +824,28 @@ def calculate_metrics(
             actual_output_lens.append(0)
 
     if goodput_config_dict:
-        valid_metrics = []
-        slo_values = []
-
-        if "ttft" in goodput_config_dict:
-            valid_metrics.append(ttfts)
-            slo_values.append(goodput_config_dict["ttft"] / MILLISECONDS_TO_SECONDS_CONVERSION)
-        if "audio_ttft" in goodput_config_dict:
-            valid_metrics.append(audio_ttfps)
-            slo_values.append(goodput_config_dict["audio_ttft"] / MILLISECONDS_TO_SECONDS_CONVERSION)
-        if "tpot" in goodput_config_dict:
-            valid_metrics.append(all_tpots)
-            slo_values.append(goodput_config_dict["tpot"] / MILLISECONDS_TO_SECONDS_CONVERSION)
-        if "e2el" in goodput_config_dict:
-            valid_metrics.append(e2els)
-            slo_values.append(goodput_config_dict["e2el"] / MILLISECONDS_TO_SECONDS_CONVERSION)
-
-        for req_metric in zip(*valid_metrics):
-            is_good_req = all([s >= r for s, r in zip(slo_values, req_metric)])
+        successful = [output for output in outputs if output.success]
+        for output in successful:
+            is_good_req = True
+            if "ttft" in goodput_config_dict:
+                is_good_req &= output.ttft <= goodput_config_dict["ttft"] / MILLISECONDS_TO_SECONDS_CONVERSION
+            audio_ttfp_limit = goodput_config_dict.get("audio_ttfp", goodput_config_dict.get("audio_ttft"))
+            if audio_ttfp_limit is not None:
+                is_good_req &= getattr(output, defs.AUDIO_TTFP, 0.0) <= (
+                    audio_ttfp_limit / MILLISECONDS_TO_SECONDS_CONVERSION
+                )
+            if "tpot" in goodput_config_dict:
+                output_len = output.output_tokens or 1
+                text_latency = getattr(output, "text_latency", output.latency)
+                tpot = (text_latency - output.ttft) / (output_len - 1) if output_len > 1 else 0.0
+                is_good_req &= tpot <= goodput_config_dict["tpot"] / MILLISECONDS_TO_SECONDS_CONVERSION
+            if "e2el" in goodput_config_dict:
+                is_good_req &= output.latency <= goodput_config_dict["e2el"] / MILLISECONDS_TO_SECONDS_CONVERSION
+            if "audio_rtf" in goodput_config_dict:
+                is_good_req &= getattr(output, defs.AUDIO_RTF, 0.0) <= goodput_config_dict["audio_rtf"]
+            if "audio_continuity" in goodput_config_dict:
+                required = bool(goodput_config_dict["audio_continuity"])
+                is_good_req &= bool(getattr(output, defs.AUDIO_CONTINUITY_OK, True)) is required
             if is_good_req:
                 good_completed += 1
 
@@ -958,6 +986,16 @@ def calculate_metrics(
             ],
             defs.AUDIO_CONTINUITY_OK_RATE: (
                 (sum(audio_continuity_ok) / len(audio_continuity_ok)) if audio_continuity_ok else 1.0
+            ),
+            defs.USEFUL_REQUEST_COUNT: useful_completed,
+            defs.USEFUL_REQUEST_THROUGHPUT: useful_completed / dur_s,
+            defs.REALTIME_CAPACITY_PASS: bool(
+                any(duration > 0 for duration in audio_duration)
+                and np.percentile(
+                    [rtf for rtf, duration in zip(audio_rtfs, audio_duration) if duration > 0], 90
+                )
+                <= realtime_max_p90_rtf
+                and (sum(audio_continuity_ok) / len(audio_continuity_ok)) >= realtime_min_continuity
             ),
         },
     )

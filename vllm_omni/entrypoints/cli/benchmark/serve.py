@@ -158,6 +158,25 @@ def add_omni_benchmark_cli_args(parser: argparse.ArgumentParser) -> None:
         ),
     )
     group.add_argument(
+        "--save-audio-timeline",
+        action="store_true",
+        help="Save per-request PCM chunk arrival time, byte count, and audio duration in the result JSON.",
+    )
+    group.add_argument(
+        "--useful-audio-ttfp-ms",
+        type=float,
+        default=1000.0,
+        help="Maximum audio TTFP for a successful continuous request to count as useful (default: 1000 ms).",
+    )
+    group.add_argument(
+        "--useful-require-audio-rtf",
+        action="store_true",
+        help="Also require audio RTF to be within --useful-audio-rtf-max for a useful request.",
+    )
+    group.add_argument("--useful-audio-rtf-max", type=float, default=1.0)
+    group.add_argument("--realtime-min-continuity", type=float, default=0.95)
+    group.add_argument("--realtime-max-p90-rtf", type=float, default=1.0)
+    group.add_argument(
         "--image-edits-bot-task",
         type=str,
         default="think",
@@ -243,6 +262,11 @@ class OmniBenchmarkServingSubcommand(OmniBenchmarkSubcommandBase):
                     'stage metrics. "tpop" also requests text TPOT/TPOP globally and per stage, and internal '
                     'stream TPOP. "ttfc", "tpoc", and "icl" only affect internal stream stage metrics. '
                     'Audio metrics include "audio_ttfp", "audio_rtf", "audio_duration", and "audio_underrun".'
+                )
+            if action.dest == "goodput":
+                action.help = (
+                    'Specify SLOs as KEY:VALUE pairs. Supported keys: "ttft", "tpot", "e2el", '
+                    '"audio_ttfp" (milliseconds), "audio_rtf" (ratio), and "audio_continuity" (0 or 1).'
                 )
             if action.dest == "random_mm_limit_mm_per_prompt":
                 action.help = (

@@ -55,6 +55,12 @@ _AUDIO_CONTINUITY_THRESHOLD_ENV = "VLLM_OMNI_BENCH_AUDIO_CONTINUITY_THRESHOLD_S"
 RETURN_STAGE_METRICS_FIELD = "return_stage_metrics"
 _IMAGE_STAGE_METRICS_BACKENDS = frozenset({"openai-image-edits-omni"})
 _PRINT_STAGE = False
+_SAVE_AUDIO_TIMELINE = False
+_USEFUL_AUDIO_TTFP_S = 1.0
+_USEFUL_REQUIRE_AUDIO_RTF = False
+_USEFUL_AUDIO_RTF_MAX = 1.0
+_REALTIME_MIN_CONTINUITY = 0.95
+_REALTIME_MAX_P90_RTF = 1.0
 
 
 def maybe_enable_stage_metrics(extra_body: dict[str, Any] | None, *, enabled: bool) -> dict[str, Any] | None:
@@ -84,6 +90,34 @@ def set_print_stage(enabled: bool) -> None:
     """Set whether this benchmark run prints the stage benchmark section."""
     global _PRINT_STAGE
     _PRINT_STAGE = bool(enabled)
+
+
+def configure_audio_benchmark(
+    *,
+    save_audio_timeline: bool = False,
+    useful_audio_ttfp_ms: float = 1000.0,
+    useful_require_audio_rtf: bool = False,
+    useful_audio_rtf_max: float = 1.0,
+    realtime_min_continuity: float = 0.95,
+    realtime_max_p90_rtf: float = 1.0,
+) -> None:
+    """Configure client-only TTS result capture and useful-request SLOs."""
+    global _REALTIME_MAX_P90_RTF
+    global _REALTIME_MIN_CONTINUITY
+    global _SAVE_AUDIO_TIMELINE
+    global _USEFUL_AUDIO_RTF_MAX
+    global _USEFUL_AUDIO_TTFP_S
+    global _USEFUL_REQUIRE_AUDIO_RTF
+    if useful_audio_ttfp_ms < 0 or useful_audio_rtf_max < 0 or realtime_max_p90_rtf < 0:
+        raise ValueError("Audio benchmark latency and RTF thresholds must be non-negative")
+    if not 0 <= realtime_min_continuity <= 1:
+        raise ValueError("Realtime minimum continuity must be between 0 and 1")
+    _SAVE_AUDIO_TIMELINE = bool(save_audio_timeline)
+    _USEFUL_AUDIO_TTFP_S = useful_audio_ttfp_ms / 1000.0
+    _USEFUL_REQUIRE_AUDIO_RTF = bool(useful_require_audio_rtf)
+    _USEFUL_AUDIO_RTF_MAX = useful_audio_rtf_max
+    _REALTIME_MIN_CONTINUITY = realtime_min_continuity
+    _REALTIME_MAX_P90_RTF = realtime_max_p90_rtf
 
 
 def _audio_continuity_threshold_s() -> float:
@@ -409,6 +443,8 @@ class MixRequestFuncOutput(RequestFuncOutput):
     #: Number of inter-chunk intervals during which the player buffer went
     #: negative.
     audio_underrun_event_count: int = 0
+    audio_timeline: list[dict[str, float | int]] | None = None
+    request_id: str = ""
     #: Raw PCM s16le mono at 24 kHz for Seed-TTS WER: from ``/v1/audio/speech`` stream or
     #: resampled export after ``openai-chat-omni`` audio deltas.
     tts_output_pcm_bytes: bytes | None = None
@@ -656,6 +692,7 @@ async def async_request_openai_chat_omni_completions(
 
     output = MixRequestFuncOutput()
     output.prompt_len = request_func_input.prompt_len
+    output.request_id = request_func_input.request_id
     max_retries = 3
     retry_delay = 0.1
     for attempt in range(max_retries + 1):
@@ -1062,6 +1099,7 @@ async def async_request_openai_audio_speech(
 
     output = MixRequestFuncOutput()
     output.prompt_len = request_func_input.prompt_len
+    output.request_id = request_func_input.request_id
 
     # PCM format: 16-bit signed, 24 kHz, mono
     sample_rate = 24000
@@ -1089,6 +1127,16 @@ async def async_request_openai_audio_speech(
                     total_pcm_bytes += len(chunk)
                     chunk_arrival_times_s.append(timestamp - st)
                     chunk_sizes.append(len(chunk))
+                    if _SAVE_AUDIO_TIMELINE:
+                        if output.audio_timeline is None:
+                            output.audio_timeline = []
+                        output.audio_timeline.append(
+                            {
+                                "arrival_time_s": timestamp - st,
+                                "bytes": len(chunk),
+                                "audio_duration_s": len(chunk) / (sample_rate * sample_width * channels),
+                            }
+                        )
                     if pcm_capture is not None:
                         pcm_capture.extend(chunk)
 
@@ -1171,6 +1219,46 @@ from vllm_omni.benchmarks.metrics.metrics import (
 # ruff: noqa: E402
 
 benchmark_old = serve.benchmark
+
+
+def check_goodput_args(args: Any) -> dict[str, float]:
+    """Accept Omni audio SLO names in addition to upstream text SLOs."""
+    if not getattr(args, "goodput", None):
+        return {}
+    config = serve.parse_goodput(args.goodput)
+    valid_names = {"ttft", "tpot", "e2el", "audio_ttfp", "audio_rtf", "audio_continuity"}
+    for name, value in config.items():
+        if name not in valid_names:
+            raise ValueError(f"Invalid goodput metric {name!r}; expected one of {sorted(valid_names)}")
+        if value < 0:
+            raise ValueError(f"Goodput SLO values must be non-negative: {name}={value}")
+        if name == "audio_continuity" and value not in (0.0, 1.0):
+            raise ValueError("audio_continuity goodput value must be 0 or 1")
+    return config
+
+
+serve.check_goodput_args = check_goodput_args
+
+
+def build_audio_request_results(
+    outputs: list[MixRequestFuncOutput], *, save_timeline: bool, request_ids: list[str] | None = None
+) -> list[dict[str, Any]]:
+    """Return the stable request-level JSON schema for audio benchmarks."""
+    return [
+        {
+            "request_id": output.request_id or (request_ids[index] if request_ids is not None else ""),
+            "success": output.success,
+            "audio_ttfp_s": output.audio_ttfp,
+            "e2e_latency_s": output.latency,
+            "audio_duration_s": output.audio_duration,
+            "audio_rtf": output.audio_rtf,
+            "max_underrun_s": output.audio_underrun_s,
+            "underrun_event_count": output.audio_underrun_event_count,
+            "continuity_ok": output.audio_continuity_ok,
+            **({"audio_timeline": output.audio_timeline or []} if save_timeline else {}),
+        }
+        for index, output in enumerate(outputs)
+    ]
 
 
 async def benchmark(
@@ -1426,6 +1514,11 @@ async def benchmark(
             request_rate=request_rate,
             benchmark_duration=benchmark_duration,
             print_stage=_PRINT_STAGE,
+            useful_audio_ttfp_s=_USEFUL_AUDIO_TTFP_S,
+            useful_require_audio_rtf=_USEFUL_REQUIRE_AUDIO_RTF,
+            useful_audio_rtf_max=_USEFUL_AUDIO_RTF_MAX,
+            realtime_min_continuity=_REALTIME_MIN_CONTINUITY,
+            realtime_max_p90_rtf=_REALTIME_MAX_P90_RTF,
         )
     else:
         metrics = calculate_metrics_for_embeddings(
@@ -1449,6 +1542,10 @@ async def benchmark(
             defs.TOTAL_AUDIO_DURATION_S: getattr(metrics, defs.TOTAL_AUDIO_DURATION_S),
             defs.TOTAL_AUDIO_FRAMES: getattr(metrics, defs.TOTAL_AUDIO_FRAMES),
             defs.AUDIO_THROUGHPUT: getattr(metrics, defs.AUDIO_THROUGHPUT),
+            defs.AUDIO_CONTINUITY_OK_RATE: getattr(metrics, defs.AUDIO_CONTINUITY_OK_RATE),
+            defs.USEFUL_REQUEST_COUNT: getattr(metrics, defs.USEFUL_REQUEST_COUNT),
+            defs.USEFUL_REQUEST_THROUGHPUT: getattr(metrics, defs.USEFUL_REQUEST_THROUGHPUT),
+            defs.REALTIME_CAPACITY_PASS: getattr(metrics, defs.REALTIME_CAPACITY_PASS),
             defs.TOTAL_IMAGES: getattr(metrics, defs.TOTAL_IMAGES),
             defs.IMAGE_THROUGHPUT: getattr(metrics, defs.IMAGE_THROUGHPUT),
             defs.AVERAGE_PIXELS_PER_IMAGE: getattr(metrics, defs.AVERAGE_PIXELS_PER_IMAGE),
@@ -1463,6 +1560,11 @@ async def benchmark(
             "max_output_tokens_per_s": metrics.max_output_tokens_per_s,
             "max_concurrent_requests": metrics.max_concurrent_requests,
             "rtfx": metrics.rtfx,
+            "request_metrics": build_audio_request_results(
+                outputs,
+                save_timeline=_SAVE_AUDIO_TIMELINE,
+                request_ids=[request.request_id for request in input_requests],
+            ),
         }
     else:
         result = {

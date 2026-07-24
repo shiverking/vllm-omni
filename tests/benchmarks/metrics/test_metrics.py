@@ -5,11 +5,13 @@
 Unit tests for metrics.py
 """
 
+from types import SimpleNamespace
+
 import pytest
 from vllm.benchmarks.serve import TaskType
 
 from vllm_omni.benchmarks.metrics.metrics import calculate_metrics
-from vllm_omni.benchmarks.patch.patch import MixRequestFuncOutput
+from vllm_omni.benchmarks.patch.patch import MixRequestFuncOutput, build_audio_request_results, check_goodput_args
 
 pytestmark = [pytest.mark.core_model, pytest.mark.benchmark, pytest.mark.cpu]
 
@@ -93,6 +95,102 @@ def test_audio_continuity_aggregation():
     # p99 of [0.5, 0.02, 0.0] is dominated by the 0.5 outlier.
     p99 = dict(metrics.percentiles_audio_underrun_s).get(99.0)
     assert p99 is not None and p99 > 0.4
+
+
+def test_useful_audio_throughput_and_realtime_capacity():
+    useful = _make_tts_output(100)
+    useful.audio_ttfp = 0.2
+    useful.audio_rtf = 0.8
+    useful.audio_continuity_ok = True
+    late = _make_tts_output(100)
+    late.audio_ttfp = 1.2
+    late.audio_rtf = 0.9
+    late.audio_continuity_ok = True
+    underrun = _make_tts_output(100)
+    underrun.audio_ttfp = 0.1
+    underrun.audio_rtf = 0.7
+    underrun.audio_continuity_ok = False
+
+    metrics, _ = calculate_metrics(
+        input_requests=[],
+        outputs=[useful, late, underrun],
+        dur_s=2.0,
+        tokenizer=_EmptyAwareTokenizer(),
+        selected_percentiles=[90.0],
+        goodput_config_dict={},
+        task_type=TaskType.GENERATION,
+        selected_percentile_metrics=[],
+        max_concurrency=3,
+        request_rate=float("inf"),
+        benchmark_duration=2.0,
+        useful_audio_ttfp_s=1.0,
+    )
+
+    assert metrics.useful_request_count == 1
+    assert metrics.useful_request_throughput == pytest.approx(0.5)
+    assert metrics.audio_throughput == pytest.approx(7.5)
+    assert metrics.realtime_capacity_pass is False
+
+
+def test_audio_goodput_slos():
+    good = _make_tts_output(100)
+    good.audio_ttfp = 0.2
+    good.audio_rtf = 0.8
+    good.audio_continuity_ok = True
+    bad = _make_tts_output(100)
+    bad.audio_ttfp = 0.4
+    bad.audio_rtf = 1.2
+    bad.audio_continuity_ok = True
+
+    metrics, _ = calculate_metrics(
+        input_requests=[],
+        outputs=[good, bad],
+        dur_s=2.0,
+        tokenizer=_EmptyAwareTokenizer(),
+        selected_percentiles=[90.0],
+        goodput_config_dict={"audio_ttfp": 300.0, "audio_rtf": 1.0, "audio_continuity": 1.0},
+        task_type=TaskType.GENERATION,
+        selected_percentile_metrics=[],
+        max_concurrency=2,
+        request_rate=float("inf"),
+        benchmark_duration=2.0,
+    )
+
+    assert metrics.request_goodput == pytest.approx(0.5)
+
+
+def test_audio_goodput_cli_validation():
+    parsed = check_goodput_args(
+        SimpleNamespace(goodput=["audio_ttfp:300", "audio_rtf:1", "audio_continuity:1"])
+    )
+    assert parsed == {"audio_ttfp": 300.0, "audio_rtf": 1.0, "audio_continuity": 1.0}
+    with pytest.raises(ValueError, match="audio_continuity"):
+        check_goodput_args(SimpleNamespace(goodput=["audio_continuity:0.95"]))
+
+
+def test_audio_request_result_schema_timeline_is_opt_in():
+    output = _make_tts_output(100)
+    output.request_id = "seedtts-0001"
+    output.audio_underrun_s = 0.02
+    output.audio_underrun_event_count = 1
+    output.audio_continuity_ok = True
+    output.audio_timeline = [{"arrival_time_s": 0.1, "bytes": 4800, "audio_duration_s": 0.1}]
+
+    compact = build_audio_request_results([output], save_timeline=False)[0]
+    detailed = build_audio_request_results([output], save_timeline=True)[0]
+    assert set(compact) == {
+        "request_id",
+        "success",
+        "audio_ttfp_s",
+        "e2e_latency_s",
+        "audio_duration_s",
+        "audio_rtf",
+        "max_underrun_s",
+        "underrun_event_count",
+        "continuity_ok",
+    }
+    assert "audio_timeline" not in compact
+    assert detailed["audio_timeline"] == output.audio_timeline
 
 
 # ============================================================================
