@@ -188,6 +188,11 @@ def test_audio_request_result_schema_timeline_is_opt_in():
         "max_underrun_s",
         "underrun_event_count",
         "continuity_ok",
+        "feedback_sent_count",
+        "feedback_coalesced_count",
+        "feedback_failure_count",
+        "max_feedback_delay_s",
+        "playback_buffer_timeline",
     }
     assert "audio_timeline" not in compact
     assert detailed["audio_timeline"] == output.audio_timeline

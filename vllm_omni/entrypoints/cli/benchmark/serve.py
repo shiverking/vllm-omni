@@ -177,6 +177,11 @@ def add_omni_benchmark_cli_args(parser: argparse.ArgumentParser) -> None:
     group.add_argument("--realtime-min-continuity", type=float, default=0.95)
     group.add_argument("--realtime-max-p90-rtf", type=float, default=1.0)
     group.add_argument(
+        "--enable-playback-feedback",
+        action="store_true",
+        help="Simulate realtime PCM playback and publish coalesced playback feedback at no more than 20 Hz.",
+    )
+    group.add_argument(
         "--image-edits-bot-task",
         type=str,
         default="think",

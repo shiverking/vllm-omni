@@ -32,6 +32,7 @@ def main(args: argparse.Namespace) -> dict[str, Any]:
         useful_audio_rtf_max=getattr(args, "useful_audio_rtf_max", 1.0),
         realtime_min_continuity=getattr(args, "realtime_min_continuity", 0.95),
         realtime_max_p90_rtf=getattr(args, "realtime_max_p90_rtf", 1.0),
+        enable_playback_feedback=getattr(args, "enable_playback_feedback", False),
     )
     args.extra_body = maybe_enable_stage_metrics(
         getattr(args, "extra_body", None),

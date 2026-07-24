@@ -12,7 +12,12 @@ import pytest
 from pytest_mock import MockerFixture
 from vllm.benchmarks.lib.endpoint_request_func import RequestFuncInput
 
-from vllm_omni.benchmarks.patch.patch import MixRequestFuncOutput, async_request_openai_chat_omni_completions
+from vllm_omni.benchmarks.patch.patch import (
+    MixRequestFuncOutput,
+    _played_audio_ms,
+    async_request_openai_audio_speech,
+    async_request_openai_chat_omni_completions,
+)
 
 pytestmark = [pytest.mark.core_model, pytest.mark.benchmark, pytest.mark.cpu]
 
@@ -38,6 +43,72 @@ class MockResponse:
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         pass
+
+
+def test_played_audio_is_capped_by_received_audio():
+    assert _played_audio_ms(received_audio_ms=500, first_chunk_time_s=10, now_s=10.2) == pytest.approx(200)
+    assert _played_audio_ms(received_audio_ms=100, first_chunk_time_s=10, now_s=10.2) == 100
+
+
+@pytest.mark.asyncio
+async def test_playback_feedback_is_async_and_final_state_is_sent(monkeypatch):
+    import vllm_omni.benchmarks.patch.patch as patch_mod
+
+    feedback_payloads = []
+
+    class FeedbackResponse:
+        status = 200
+
+        async def read(self):
+            await asyncio.sleep(0.1)
+            return b"ok"
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+    class FeedbackSession:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        def post(self, url, json, headers):
+            feedback_payloads.append((url, json, headers))
+            return FeedbackResponse()
+
+    class StreamingResponse(MockResponse):
+        def __init__(self):
+            super().__init__(200, [b"\0" * 4800, b"\0" * 4800], delay_between_chunks=0.01)
+
+    primary_session = type("PrimarySession", (), {"post": lambda self, **kwargs: StreamingResponse()})()
+    monkeypatch.setattr(patch_mod.aiohttp, "ClientSession", FeedbackSession)
+    monkeypatch.setattr(patch_mod, "_ENABLE_PLAYBACK_FEEDBACK", True)
+    request_input = RequestFuncInput(
+        model="test-model",
+        model_name="test-model",
+        prompt="hello",
+        api_url="http://test/v1/audio/speech",
+        prompt_len=1,
+        output_len=10,
+        request_id="seedtts-0001",
+    )
+
+    output = await async_request_openai_audio_speech(request_input, primary_session)
+
+    assert output.success is True
+    assert output.latency < 0.1, "slow feedback response must not block audio stream consumption"
+    assert output.feedback_sent_count >= 1
+    assert output.feedback_failure_count == 0
+    assert feedback_payloads[-1][1]["finished"] is True
+    assert feedback_payloads[-1][1]["request_id"] == "seedtts-0001"
+    assert feedback_payloads[0][2]["X-Request-ID"] == "seedtts-0001"
 
 
 def create_sse_chunk(data_dict):
