@@ -139,6 +139,27 @@ def test_server_output_is_printed_and_saved(capsys):
     assert server_log.getvalue() == "model loading\nserver ready\n"
 
 
+def test_benchmark_subprocess_bypasses_local_proxy(monkeypatch):
+    monkeypatch.setenv("NO_PROXY", "existing.internal")
+    monkeypatch.setenv("no_proxy", "lower.internal")
+    args = Namespace(host="0.0.0.0")
+
+    env = sweep.benchmark_subprocess_env(args)
+
+    assert env["NO_PROXY"].split(",") == [
+        "existing.internal",
+        "127.0.0.1",
+        "localhost",
+        "0.0.0.0",
+    ]
+    assert env["no_proxy"].split(",") == [
+        "lower.internal",
+        "127.0.0.1",
+        "localhost",
+        "0.0.0.0",
+    ]
+
+
 def test_verify_results_rejects_audio_duration_drift():
     records = []
     for index, strategy in enumerate(sweep.STRATEGIES):

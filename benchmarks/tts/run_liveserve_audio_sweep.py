@@ -321,7 +321,11 @@ def run_with_fresh_server(
     """Restart the model, run one benchmark, and return scheduler counter deltas."""
     with running_server(args, strategy=strategy, config_path=config_path, run_label=run_label):
         before = fetch_scheduler_metrics(args) if not args.dry_run else {}
-        run_command(benchmark_command, dry_run=args.dry_run)
+        run_command(
+            benchmark_command,
+            dry_run=args.dry_run,
+            env=benchmark_subprocess_env(args),
+        )
         after = fetch_scheduler_metrics(args) if not args.dry_run else {}
     return counter_delta(before, after) if not args.dry_run else {}
 
@@ -335,10 +339,25 @@ def counter_delta(before: dict[str, Any], after: dict[str, Any]) -> dict[str, di
     return result
 
 
-def run_command(command: list[str], *, dry_run: bool) -> None:
+def benchmark_subprocess_env(args: argparse.Namespace) -> dict[str, str]:
+    """Keep loopback benchmark and feedback traffic out of HTTP proxies."""
+    env = os.environ.copy()
+    bypass_hosts = ("127.0.0.1", "localhost", _connect_host(args.host), args.host)
+    for key in ("NO_PROXY", "no_proxy"):
+        existing = [item.strip() for item in env.get(key, "").split(",") if item.strip()]
+        env[key] = ",".join(dict.fromkeys([*existing, *bypass_hosts]))
+    return env
+
+
+def run_command(
+    command: list[str],
+    *,
+    dry_run: bool,
+    env: dict[str, str] | None = None,
+) -> None:
     print("+", subprocess.list2cmdline(command), flush=True)
     if not dry_run:
-        subprocess.run(command, check=True)
+        subprocess.run(command, check=True, env=env)
 
 
 def annotate_result(

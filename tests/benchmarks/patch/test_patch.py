@@ -19,6 +19,7 @@ from vllm_omni.benchmarks.patch.patch import (
     async_request_openai_chat_omni_completions,
     load_arrival_trace,
     replay_arrival_trace,
+    validate_warmup_outputs,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.benchmark, pytest.mark.cpu]
@@ -38,12 +39,16 @@ def test_load_and_replay_arrival_trace(tmp_path):
 class MockResponse:
     """Mock aiohttp response for testing"""
 
-    def __init__(self, status, chunks, delay_between_chunks=0):
+    def __init__(self, status, chunks, delay_between_chunks=0, body=""):
         self.status = status
         self.reason = "OK" if status == 200 else "Error"
         self._chunks = chunks
         self._delay = delay_between_chunks
+        self._body = body
         self.content = self
+
+    async def text(self):
+        return self._body
 
     async def iter_any(self):
         for chunk in self._chunks:
@@ -61,6 +66,42 @@ class MockResponse:
 def test_played_audio_is_capped_by_received_audio():
     assert _played_audio_ms(received_audio_ms=500, first_chunk_time_s=10, now_s=10.2) == pytest.approx(200)
     assert _played_audio_ms(received_audio_ms=100, first_chunk_time_s=10, now_s=10.2) == 100
+
+
+def test_warmup_failure_is_not_reported_as_completed():
+    succeeded = MixRequestFuncOutput()
+    succeeded.success = True
+    failed = MixRequestFuncOutput()
+    failed.success = False
+    failed.error = "HTTP 502 proxy failure"
+
+    with pytest.raises(RuntimeError, match="HTTP 502 proxy failure"):
+        validate_warmup_outputs([succeeded, failed])
+
+
+@pytest.mark.asyncio
+async def test_audio_speech_http_error_includes_status_and_body(monkeypatch):
+    import vllm_omni.benchmarks.patch.patch as patch_mod
+
+    class PrimarySession:
+        def post(self, **kwargs):
+            return MockResponse(502, [], body="proxy connection refused")
+
+    monkeypatch.setattr(patch_mod, "_ENABLE_PLAYBACK_FEEDBACK", False)
+    request_input = RequestFuncInput(
+        model="test-model",
+        model_name="test-model",
+        prompt="hello",
+        api_url="http://127.0.0.1:8000/v1/audio/speech",
+        prompt_len=1,
+        output_len=10,
+    )
+
+    output = await async_request_openai_audio_speech(request_input, PrimarySession())
+
+    assert output.success is False
+    assert "HTTP 502" in output.error
+    assert "proxy connection refused" in output.error
 
 
 @pytest.mark.asyncio

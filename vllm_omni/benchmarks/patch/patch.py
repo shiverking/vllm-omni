@@ -463,6 +463,18 @@ class MixRequestFuncOutput(RequestFuncOutput):
     final_output_type: str | None = None
 
 
+def validate_warmup_outputs(outputs: Iterable[RequestFuncOutput]) -> None:
+    """Fail fast when warmup coroutines completed with request errors."""
+    failures = [output for output in outputs if not output.success]
+    if not failures:
+        return
+    details = "; ".join(
+        (output.error or "unknown error").strip()[:1000]
+        for output in failures[:3]
+    )
+    raise RuntimeError(f"{len(failures)} warmup request(s) failed: {details}")
+
+
 _IMAGE_EDITS_EXTRA_BODY_FORM_FIELDS = (
     "negative_prompt",
     "num_inference_steps",
@@ -1329,8 +1341,14 @@ async def async_request_openai_audio_speech(
                     )
                 output.success = True
             else:
-                output.error = response.reason or ""
+                try:
+                    response_body = (await response.text())[:2000]
+                except Exception as exc:
+                    response_body = f"<unable to read response body: {exc}>"
+                reason = response.reason or ""
+                output.error = f"HTTP {response.status} {reason}: {response_body}".strip()
                 output.success = False
+                logger.error("Audio speech request failed: %s", output.error)
     except Exception:
         output.success = False
         output.error = traceback.format_exc()
@@ -1581,10 +1599,12 @@ async def benchmark(
         for _ in range(num_warmups):
             request_task = asyncio.create_task(warmup_limited_request_func())
             warmup_tasks.append(request_task)
-        _ = await asyncio.gather(*warmup_tasks)
-
-        if warmup_pbar is not None:
-            warmup_pbar.close()
+        try:
+            warmup_outputs = await asyncio.gather(*warmup_tasks)
+        finally:
+            if warmup_pbar is not None:
+                warmup_pbar.close()
+        validate_warmup_outputs(warmup_outputs)
         print("Warmup run completed.")
 
     print("Starting main benchmark run...")
