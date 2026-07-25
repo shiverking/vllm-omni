@@ -5,6 +5,7 @@ from __future__ import annotations
 import sys
 from argparse import Namespace
 from pathlib import Path
+from unittest.mock import Mock
 
 import pytest
 
@@ -61,6 +62,60 @@ def test_local_model_server_command_omits_revision(tmp_path):
 
     assert command[:3] == ["vllm", "serve", args.model]
     assert "--revision" not in command
+
+
+def test_wait_for_server_health_retries_until_ready(monkeypatch, tmp_path):
+    args = Namespace(
+        host="127.0.0.1",
+        port=8000,
+        server_startup_timeout_s=30.0,
+        health_poll_interval_s=5.0,
+    )
+    server = Mock()
+    server.poll.return_value = None
+    attempts = iter([OSError("not ready"), Mock(status=200)])
+
+    class ResponseContext:
+        def __init__(self, response):
+            self.response = response
+
+        def __enter__(self):
+            return self.response
+
+        def __exit__(self, *args):
+            return None
+
+    def urlopen(*args, **kwargs):
+        result = next(attempts)
+        if isinstance(result, Exception):
+            raise result
+        return ResponseContext(result)
+
+    clock = iter([0.0, 0.0, 0.0, 5.0, 5.0])
+    monkeypatch.setattr(sweep.urllib.request, "urlopen", urlopen)
+    monkeypatch.setattr(sweep.time, "monotonic", lambda: next(clock))
+    sleep = Mock()
+    monkeypatch.setattr(sweep.time, "sleep", sleep)
+
+    sweep.wait_for_server_health(args, server, tmp_path / "server.log")
+
+    sleep.assert_called_once_with(5.0)
+
+
+def test_wait_for_server_health_reports_early_exit(tmp_path):
+    args = Namespace(
+        host="127.0.0.1",
+        port=8000,
+        server_startup_timeout_s=30.0,
+        health_poll_interval_s=5.0,
+    )
+    server = Mock()
+    server.poll.return_value = 2
+    log = tmp_path / "server.log"
+    log.write_text("fatal startup error\n", encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="fatal startup error"):
+        sweep.wait_for_server_health(args, server, log)
 
 
 def test_verify_results_rejects_audio_duration_drift():

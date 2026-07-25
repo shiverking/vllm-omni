@@ -9,6 +9,7 @@ import json
 import math
 import os
 import random
+import socket
 import subprocess
 import time
 import urllib.request
@@ -149,6 +150,71 @@ def fetch_scheduler_metrics(args: argparse.Namespace) -> dict[str, Any]:
             return json.loads(response.read())
     except Exception:
         return {"scheduling": {}, "feedback": {}}
+
+
+def _connect_host(host: str) -> str:
+    return "127.0.0.1" if host in {"0.0.0.0", "::", "[::]"} else host
+
+
+def ensure_server_port_available(args: argparse.Namespace) -> None:
+    """Reject a stale server instead of benchmarking the wrong process."""
+    host = _connect_host(args.host)
+    try:
+        connection = socket.create_connection((host, args.port), timeout=1.0)
+    except OSError:
+        return
+    connection.close()
+    raise RuntimeError(
+        f"{host}:{args.port} is already accepting connections. "
+        "Stop the existing server or choose another --port before running the sweep."
+    )
+
+
+def _log_tail(path: Path, lines: int = 40) -> str:
+    try:
+        return "\n".join(path.read_text(encoding="utf-8", errors="replace").splitlines()[-lines:])
+    except OSError:
+        return "<server log is not readable>"
+
+
+def wait_for_server_health(
+    args: argparse.Namespace,
+    server: subprocess.Popen,
+    server_log_path: Path,
+) -> None:
+    """Poll /health until the API server is ready or startup fails."""
+    host = _connect_host(args.host)
+    health_url = f"http://{host}:{args.port}/health"
+    started = time.monotonic()
+    deadline = started + args.server_startup_timeout_s
+    last_error = "not checked"
+    while time.monotonic() < deadline:
+        return_code = server.poll()
+        if return_code is not None:
+            raise RuntimeError(
+                f"Server exited before becoming healthy (exit code {return_code}).\n"
+                f"Last {server_log_path.name} lines:\n{_log_tail(server_log_path)}"
+            )
+        try:
+            with urllib.request.urlopen(health_url, timeout=2.0) as response:
+                if 200 <= response.status < 300:
+                    elapsed = time.monotonic() - started
+                    print(f"Server is healthy after {elapsed:.1f}s: {health_url}", flush=True)
+                    return
+                last_error = f"HTTP {response.status}"
+        except Exception as exc:
+            last_error = f"{type(exc).__name__}: {exc}"
+        elapsed = time.monotonic() - started
+        print(
+            f"Waiting for server health ({elapsed:.1f}s, last={last_error}); "
+            f"retrying in {args.health_poll_interval_s:g}s...",
+            flush=True,
+        )
+        time.sleep(args.health_poll_interval_s)
+    raise TimeoutError(
+        f"Server did not become healthy within {args.server_startup_timeout_s:g}s "
+        f"(last={last_error}).\nLast {server_log_path.name} lines:\n{_log_tail(server_log_path)}"
+    )
 
 
 def counter_delta(before: dict[str, Any], after: dict[str, Any]) -> dict[str, dict[str, float]]:
@@ -309,6 +375,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
+    parser.add_argument("--server-startup-timeout-s", type=float, default=900.0)
+    parser.add_argument("--health-poll-interval-s", type=float, default=5.0)
     parser.add_argument("--serve-bin", default="vllm")
     parser.add_argument("--bench-bin", default="vllm-omni")
     parser.add_argument("--num-requests", type=int, default=128)
@@ -324,6 +392,8 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    if args.server_startup_timeout_s <= 0 or args.health_poll_interval_s <= 0:
+        raise SystemExit("Server startup timeout and health poll interval must be positive")
     args.output_dir.mkdir(parents=True, exist_ok=True)
     manifest_path = args.output_dir / "seed_tts_en_128_manifest.json"
     common_config_sha256 = sha256_file(DEPLOY_DIR / "qwen3_tts_910b4_single.yaml")
@@ -334,15 +404,20 @@ def main() -> None:
 
     for strategy, config_name in STRATEGIES.items():
         config_path = DEPLOY_DIR / config_name
-        server_log = (args.output_dir / f"server_{strategy}.log").open("w", encoding="utf-8")
+        server_log_path = args.output_dir / f"server_{strategy}.log"
         server_command = build_server_command(args, config_path)
         print("+", subprocess.list2cmdline(server_command), flush=True)
-        server = None
         if not args.dry_run:
-            server_env = os.environ.copy()
-            server_env["VLLM_OMNI_ENABLE_PLAYBACK_FEEDBACK"] = "1"
-            server = subprocess.Popen(server_command, env=server_env, stdout=server_log, stderr=subprocess.STDOUT)
+            ensure_server_port_available(args)
+        server_log = server_log_path.open("w", encoding="utf-8")
+        server = None
         try:
+            if not args.dry_run:
+                server_env = os.environ.copy()
+                server_env["VLLM_OMNI_ENABLE_PLAYBACK_FEEDBACK"] = "1"
+                server = subprocess.Popen(server_command, env=server_env, stdout=server_log, stderr=subprocess.STDOUT)
+            if server is not None:
+                wait_for_server_health(args, server, server_log_path)
             for concurrency in CONCURRENCIES:
                 for repeat in range(args.repeats):
                     result_path = args.output_dir / f"fixed_{strategy}_c{concurrency}_r{repeat}.json"
