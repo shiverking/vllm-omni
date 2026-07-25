@@ -102,7 +102,7 @@ def test_wait_for_server_model_retries_until_target_is_listed(monkeypatch, tmp_p
         return ResponseContext(result)
 
     clock = iter([0.0, 0.0, 0.0, 5.0, 5.0])
-    monkeypatch.setattr(sweep.urllib.request, "urlopen", urlopen)
+    monkeypatch.setattr(sweep, "_open_control_url", urlopen)
     monkeypatch.setattr(sweep.time, "monotonic", lambda: next(clock))
     sleep = Mock()
     monkeypatch.setattr(sweep.time, "sleep", sleep)

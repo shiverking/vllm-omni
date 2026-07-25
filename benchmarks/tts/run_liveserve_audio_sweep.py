@@ -29,6 +29,7 @@ STRATEGIES = {
 }
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEPLOY_DIR = REPO_ROOT / "vllm_omni" / "deploy"
+_NO_PROXY_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 
 def sha256_file(path: Path) -> str:
@@ -145,10 +146,15 @@ def build_server_command(args: argparse.Namespace, config_path: Path) -> list[st
     return command
 
 
+def _open_control_url(url: str, *, timeout: float):
+    """Open a loopback control URL without consulting proxy environment variables."""
+    return _NO_PROXY_OPENER.open(url, timeout=timeout)
+
+
 def fetch_scheduler_metrics(args: argparse.Namespace) -> dict[str, Any]:
     url = f"http://{_connect_host(args.host)}:{args.port}/v1/audio/speech/scheduling"
     try:
-        with urllib.request.urlopen(url, timeout=10) as response:
+        with _open_control_url(url, timeout=10) as response:
             return json.loads(response.read())
     except Exception:
         return {"scheduling": {}, "feedback": {}}
@@ -217,7 +223,7 @@ def wait_for_server_model(
                 f"Last {server_log_path.name} lines:\n{_log_tail(server_log_path)}"
             )
         try:
-            with urllib.request.urlopen(models_url, timeout=5.0) as response:
+            with _open_control_url(models_url, timeout=5.0) as response:
                 if 200 <= response.status < 300:
                     payload = json.loads(response.read())
                     entries = payload.get("data", []) if isinstance(payload, dict) else []

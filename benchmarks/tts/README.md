@@ -37,6 +37,7 @@ python benchmarks/tts/run_liveserve_audio_sweep.py \
 workload manifest、Poisson arrival trace、服务日志、Markdown/JSON 汇总和七张图。
 服务启动日志会实时打印到终端并同时保存到对应日志文件。每个 benchmark run 前都会
 重新启动模型，默认每 10 秒轮询一次 `/v1/models`，确认目标模型已列出后才开始 benchmark；
+本地控制请求会显式绕过 `HTTP_PROXY/HTTPS_PROXY`，确保直连监听端口。
 默认启动超时为 900 秒，可通过 `--server-startup-timeout-s` 和
 `--health-poll-interval-s` 调整。若目标端口已有服务，脚本会直接拒绝运行，避免误测旧进程。
 运行结束会检查失败请求、manifest/revision/公共部署参数一致性，以及同一 cell 的输出
