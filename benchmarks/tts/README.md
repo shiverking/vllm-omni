@@ -14,22 +14,22 @@ revision、batch/显存/eager 参数；Poisson 负载也重放同一份预生成
 ```bash
 # 先检查全部命令，不启动服务
 python benchmarks/tts/run_liveserve_audio_sweep.py \
+  --model /models/Qwen3-TTS-12Hz-1.7B-Base \
   --dataset-path /data/seed-tts-eval \
-  --model-revision <QWEN_MODEL_COMMIT> \
   --output-dir results/liveserve-audio \
   --dry-run
 
 # 8 请求、1 次重复的快速闭环
 python benchmarks/tts/run_liveserve_audio_sweep.py \
+  --model /models/Qwen3-TTS-12Hz-1.7B-Base \
   --dataset-path /data/seed-tts-eval \
-  --model-revision <QWEN_MODEL_COMMIT> \
   --output-dir results/liveserve-smoke \
   --num-requests 8 --repeats 1
 
 # 完整实验（默认 128 请求、2 warmup、3 repeats）
 python benchmarks/tts/run_liveserve_audio_sweep.py \
+  --model /models/Qwen3-TTS-12Hz-1.7B-Base \
   --dataset-path /data/seed-tts-eval \
-  --model-revision <QWEN_MODEL_COMMIT> \
   --output-dir results/liveserve-audio
 ```
 

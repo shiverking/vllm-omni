@@ -16,7 +16,7 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
-MODEL = "Qwen/Qwen3-TTS-12Hz-1.7B-Base"
+DEFAULT_MODEL = "Qwen/Qwen3-TTS-12Hz-1.7B-Base"
 CONCURRENCIES = (1, 2, 4, 8)
 LOAD_FACTORS = (0.50, 0.75, 1.00, 1.25)
 STRATEGIES = {
@@ -77,7 +77,7 @@ def build_benchmark_command(
         "--port",
         str(args.port),
         "--model",
-        MODEL,
+        args.model,
         "--backend",
         "openai-audio-speech",
         "--endpoint",
@@ -122,12 +122,14 @@ def build_benchmark_command(
 
 
 def build_server_command(args: argparse.Namespace, config_path: Path) -> list[str]:
-    return [
+    command = [
         args.serve_bin,
         "serve",
-        MODEL,
-        "--revision",
-        args.model_revision,
+        args.model,
+    ]
+    if args.model_revision:
+        command += ["--revision", args.model_revision]
+    command += [
         "--omni",
         "--host",
         args.host,
@@ -137,6 +139,7 @@ def build_server_command(args: argparse.Namespace, config_path: Path) -> list[st
         str(config_path),
         *args.server_extra_arg,
     ]
+    return command
 
 
 def fetch_scheduler_metrics(args: argparse.Namespace) -> dict[str, Any]:
@@ -170,7 +173,8 @@ def annotate_result(
     mode: str,
     repeat: int,
     manifest_sha256: str,
-    model_revision: str,
+    model: str,
+    model_revision: str | None,
     config_sha256: str,
     scheduler_delta: dict[str, Any],
     concurrency: int | None = None,
@@ -186,7 +190,7 @@ def annotate_result(
         "load_factor": load_factor,
         "request_rate": request_rate,
         "manifest_sha256": manifest_sha256,
-        "model": MODEL,
+        "model": model,
         "model_revision": model_revision,
         "common_config_sha256": config_sha256,
     }
@@ -205,6 +209,7 @@ def verify_results(records: list[dict[str, Any]], expected_manifest_sha256: str)
     identities = {
         (
             record["experiment"]["manifest_sha256"],
+            record["experiment"]["model"],
             record["experiment"]["model_revision"],
             record["experiment"]["common_config_sha256"],
         )
@@ -245,9 +250,10 @@ def write_report(output_dir: Path, records: list[dict[str, Any]], errors: list[s
         and mean(legacy_c8, "audio_continuity_ok_rate") >= 0.95
     )
     conclusion = "未进入调度瓶颈区" if no_bottleneck else "已进入或接近调度瓶颈区，请比较 useful throughput 与连续性"
+    model = records[0]["experiment"]["model"] if records else DEFAULT_MODEL
     report = {
         "schema_version": 1,
-        "model": MODEL,
+        "model": model,
         "checks_passed": not errors,
         "check_errors": errors,
         "conclusion": conclusion,
@@ -259,7 +265,7 @@ def write_report(output_dir: Path, records: list[dict[str, Any]], errors: list[s
     lines = [
         "# 单卡 LiveServe 音频调度实验报告",
         "",
-        f"- 模型：`{MODEL}`",
+        f"- 模型：`{model}`",
         f"- 数据一致性检查：{'通过' if not errors else '失败'}",
         f"- 结论：**{conclusion}**",
         "",
@@ -291,7 +297,16 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dataset-path", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, default=Path("results/liveserve_audio"))
-    parser.add_argument("--model-revision", required=True, help="Pinned HF commit hash or local model revision")
+    parser.add_argument(
+        "--model",
+        default=DEFAULT_MODEL,
+        help="Hugging Face model ID or local model directory",
+    )
+    parser.add_argument(
+        "--model-revision",
+        default=None,
+        help="Optional Hugging Face commit, tag, or branch; do not use for a local model path",
+    )
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--serve-bin", default="vllm")
@@ -353,6 +368,7 @@ def main() -> None:
                             repeat=repeat,
                             concurrency=concurrency,
                             manifest_sha256=manifest_sha256,
+                            model=args.model,
                             model_revision=args.model_revision,
                             config_sha256=common_config_sha256,
                             scheduler_delta=counter_delta(before, after),
@@ -402,6 +418,7 @@ def main() -> None:
                                 load_factor=factor,
                                 request_rate=factor * r_sat,
                                 manifest_sha256=sha256_file(manifest_path),
+                                model=args.model,
                                 model_revision=args.model_revision,
                                 config_sha256=common_config_sha256,
                                 scheduler_delta=counter_delta(before, after),

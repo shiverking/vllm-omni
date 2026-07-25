@@ -25,6 +25,7 @@ def test_arrival_trace_is_deterministic_and_monotonic():
 def test_benchmark_command_replays_manifest_and_trace(tmp_path):
     args = Namespace(
         bench_bin="vllm-omni",
+        model="/models/Qwen3-TTS-12Hz-1.7B-Base",
         host="127.0.0.1",
         port=8000,
         dataset_path=tmp_path / "dataset",
@@ -39,11 +40,27 @@ def test_benchmark_command_replays_manifest_and_trace(tmp_path):
         manifest_path=tmp_path / "manifest.json",
         arrival_trace=tmp_path / "trace.json",
     )
-    assert command[command.index("--model") + 1] == sweep.MODEL
+    assert command[command.index("--model") + 1] == args.model
     assert "--workload-manifest-in" in command
     assert "--arrival-trace-in" in command
     assert "--enable-playback-feedback" in command
     assert command[command.index("--num-prompts") + 1] == "128"
+
+
+def test_local_model_server_command_omits_revision(tmp_path):
+    args = Namespace(
+        serve_bin="vllm",
+        model="/models/Qwen3-TTS-12Hz-1.7B-Base",
+        model_revision=None,
+        host="127.0.0.1",
+        port=8000,
+        server_extra_arg=[],
+    )
+
+    command = sweep.build_server_command(args, tmp_path / "deploy.yaml")
+
+    assert command[:3] == ["vllm", "serve", args.model]
+    assert "--revision" not in command
 
 
 def test_verify_results_rejects_audio_duration_drift():
@@ -61,6 +78,7 @@ def test_verify_results_rejects_audio_duration_drift():
                     "load_factor": None,
                     "repeat": 0,
                     "manifest_sha256": "same",
+                    "model": "/models/Qwen3-TTS-12Hz-1.7B-Base",
                     "model_revision": "revision",
                     "common_config_sha256": "config",
                 },
