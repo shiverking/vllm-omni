@@ -1,21 +1,91 @@
-# Common single-Ascend-910B4 profile for Qwen3-TTS-12Hz-1.7B-Base.
-# Keep policy selection in the three thin overlays next to this file so every
-# comparison uses identical model, batching, memory, and execution settings.
-base_config: qwen3_tts.yaml
-
+# Qwen3-TTS-12Hz-1.7B-Base profile for a single Ascend 910B4.
+#
+# Both stages intentionally share device 0.  Keep policy selection in the
+# three thin overlays next to this file so Legacy, bounded-K=2, and LiveServe
+# use identical model, batching, connector, and execution settings.
+#
+# The qwen3_tts pipeline registry supplies structural fields such as
+# model_stage, model_arch, worker_type, scheduler_cls, and stage processors.
 async_chunk: true
 playback_safe_buffer_ms: 100
 interaction_state_ttl_ms: 500
 
-stages:
-  - stage_id: 0
-    max_num_seqs: 8
-    gpu_memory_utilization: 0.30
-    enforce_eager: true
-    devices: "0"
+trust_remote_code: true
+distributed_executor_backend: "mp"
+enable_prefix_caching: false
 
+connectors:
+  connector_of_shared_memory:
+    name: SharedMemoryConnector
+    extra:
+      shm_threshold_bytes: 65536
+      # Stage 0 publishes frame-aligned codec windows while Stage 1 decodes
+      # them incrementally.
+      codec_streaming: true
+      connector_get_sleep_s: 0.01
+      connector_get_max_wait_first_chunk: 3000
+      connector_get_max_wait: 300
+      # Match the validated 910B4 codec-streaming setup.  Four new frames and
+      # two left-context frames keep chunks small enough for interactive TTS.
+      codec_chunk_frames: 4
+      codec_left_context_frames: 2
+
+edges:
+  - from: 0
+    to: 1
+    # Do not bound the connector edge; audio scheduling controls which ready
+    # Stage 1 streams enter each scheduler round.
+    window_size: -1
+
+stages:
+  # Talker / autoregressive codec-token generation.
+  - stage_id: 0
+    devices: "0"
+    max_num_seqs: 10
+    gpu_memory_utilization: 0.30
+    enforce_eager: false
+    async_scheduling: true
+    max_num_batched_tokens: 512
+    max_model_len: 4096
+    compilation_config:
+      cudagraph_mode: PIECEWISE
+      cudagraph_capture_sizes: [1, 2, 4, 8, 16, 20, 32, 64, 128]
+    output_connectors:
+      to_stage_1: connector_of_shared_memory
+    default_sampling_params:
+      temperature: 0.9
+      top_k: 50
+      max_tokens: 4096
+      seed: 42
+      detokenize: false
+      repetition_penalty: 1.05
+      stop_token_ids: [2150]
+
+  # Code2Wav / streaming codec decoding.
   - stage_id: 1
-    max_num_seqs: 4
+    devices: "0"
+    max_num_seqs: 10
     gpu_memory_utilization: 0.30
     enforce_eager: true
-    devices: "0"
+    async_scheduling: true
+    # Must be divisible by the codec code-group count and cover one complete
+    # (left context + chunk) decode window.
+    max_num_batched_tokens: 8192
+    # async_chunk appends windows over time, so leave headroom for the
+    # accumulated flat codec stream.
+    max_model_len: 32768
+    compilation_config:
+      cudagraph_mode: PIECEWISE
+      cudagraph_capture_sizes: [16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192]
+    input_connectors:
+      from_stage_0: connector_of_shared_memory
+    tts_args:
+      max_instructions_length: 500
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 65536
+      seed: 42
+      detokenize: true
+      repetition_penalty: 1.0

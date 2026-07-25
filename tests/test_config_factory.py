@@ -1593,15 +1593,63 @@ class TestAudioSchedulingConfig:
         assert profiles["liveserve_audio"].audio_scheduling_policy == "liveserve_audio"
 
         reference_stages = profiles["legacy"].stages
+        reference_connectors = profiles["legacy"].connectors
+        reference_edges = profiles["legacy"].edges
         for profile in profiles.values():
             assert profile.async_chunk is True
             assert profile.playback_safe_buffer_ms == 100
             assert profile.interaction_state_ttl_ms == 500
             assert profile.stages == reference_stages
+            assert profile.connectors == reference_connectors
+            assert profile.edges == reference_edges
             assert [stage.devices for stage in profile.stages] == ["0", "0"]
-            assert [stage.max_num_seqs for stage in profile.stages] == [8, 4]
+            assert [stage.max_num_seqs for stage in profile.stages] == [10, 10]
             assert [stage.gpu_memory_utilization for stage in profile.stages] == [0.3, 0.3]
-            assert [stage.enforce_eager for stage in profile.stages] == [True, True]
+            assert [stage.enforce_eager for stage in profile.stages] == [False, True]
+
+    def test_single_910b4_profile_contains_complete_runtime_tuning(self):
+        deploy_path = (
+            Path(__file__).parent.parent
+            / "vllm_omni"
+            / "deploy"
+            / "qwen3_tts_910b4_single.yaml"
+        )
+        deploy = load_deploy_config(deploy_path)
+
+        assert deploy.trust_remote_code is True
+        assert deploy.distributed_executor_backend == "mp"
+        assert deploy.enable_prefix_caching is False
+        assert deploy.edges == [{"from": 0, "to": 1, "window_size": -1}]
+
+        connector = deploy.connectors["connector_of_shared_memory"]
+        assert connector["name"] == "SharedMemoryConnector"
+        assert connector["extra"] == {
+            "shm_threshold_bytes": 65536,
+            "codec_streaming": True,
+            "connector_get_sleep_s": 0.01,
+            "connector_get_max_wait_first_chunk": 3000,
+            "connector_get_max_wait": 300,
+            "codec_chunk_frames": 4,
+            "codec_left_context_frames": 2,
+        }
+
+        talker, code2wav = deploy.stages
+        assert [talker.max_num_batched_tokens, code2wav.max_num_batched_tokens] == [512, 8192]
+        assert [talker.max_model_len, code2wav.max_model_len] == [4096, 32768]
+        assert talker.compilation_config == {
+            "cudagraph_mode": "PIECEWISE",
+            "cudagraph_capture_sizes": [1, 2, 4, 8, 16, 20, 32, 64, 128],
+        }
+        assert code2wav.compilation_config == {
+            "cudagraph_mode": "PIECEWISE",
+            "cudagraph_capture_sizes": [16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192],
+        }
+        assert talker.output_connectors == {"to_stage_1": "connector_of_shared_memory"}
+        assert code2wav.input_connectors == {"from_stage_0": "connector_of_shared_memory"}
+        assert talker.default_sampling_params["stop_token_ids"] == [2150]
+        assert talker.default_sampling_params["detokenize"] is False
+        assert code2wav.default_sampling_params["detokenize"] is True
+        assert code2wav.engine_extras["tts_args"] == {"max_instructions_length": 500}
 
     def test_liveserve_fields_propagate_to_every_stage(self):
         pipeline = _PIPELINE_REGISTRY["qwen3_tts"]
