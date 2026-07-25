@@ -45,7 +45,11 @@ from vllm_omni.data_entry_keys import flatten_payload
 from vllm_omni.distributed.omni_connectors.kv_transfer_manager import OmniKVTransferManager
 from vllm_omni.outputs import OmniModelRunnerOutput
 from vllm_omni.platforms.npu.worker.npu_model_runner import OmniNPUModelRunner
-from vllm_omni.utils.mm_outputs import build_mm_cpu, to_payload_element
+from vllm_omni.utils.mm_outputs import (
+    build_mm_cpu,
+    ensure_tensor_values,
+    to_payload_element,
+)
 
 
 class ExecuteModelState(NamedTuple):
@@ -1087,13 +1091,24 @@ class NPUARModelRunner(OmniNPUModelRunner):
                     payload.update(mm_payload)
                 pooler_output.append(flatten_payload(payload))
 
+        wire_multimodal_outputs = (
+            [
+                ensure_tensor_values(payload) if payload else {}
+                for payload in pooler_output
+            ]
+            if engine_output_type != "text" and pooler_output is not None
+            else None
+        )
         model_runner_output = OmniModelRunnerOutput(
             req_ids=req_ids_output_copy,
             req_id_to_index=req_id_to_index_output_copy,
             sampled_token_ids=valid_sampled_token_ids,
             logprobs=logprobs_lists,
             prompt_logprobs_dict=prompt_logprobs_dict,
-            pooler_output=(pooler_output if engine_output_type != "text" and needs_pooler_payload else None),
+            # vLLM 0.23 reserves pooler_output for list[Tensor | None].
+            # Omni payload dictionaries travel on the dedicated wire channel.
+            pooler_output=None,
+            multimodal_outputs=wire_multimodal_outputs,
             kv_connector_output=kv_connector_output,
             ec_connector_output=ec_connector_output if self.supports_mm_inputs else None,
             cudagraph_stats=cudagraph_stats,

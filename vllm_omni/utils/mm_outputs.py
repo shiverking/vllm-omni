@@ -10,6 +10,32 @@ from vllm.logger import init_logger
 logger = init_logger(__name__)
 
 
+def ensure_tensor_values(payload: dict[str, object]) -> dict[str, torch.Tensor]:
+    """Convert a flattened multimodal wire payload to tensor-only values."""
+    result: dict[str, torch.Tensor] = {}
+    for key, value in payload.items():
+        if isinstance(value, torch.Tensor):
+            result[key] = value
+        elif isinstance(value, (int, float, bool)):
+            result[key] = torch.tensor(value)
+        elif isinstance(value, (list, tuple)):
+            try:
+                result[key] = torch.tensor(value)
+            except (ValueError, TypeError, RuntimeError):
+                logger.warning(
+                    "Dropping non-tensorizable multimodal output key '%s' (type=%s) from wire payload.",
+                    key,
+                    type(value).__name__,
+                )
+        else:
+            logger.warning(
+                "Dropping non-tensor multimodal output key '%s' (type=%s) from wire payload.",
+                key,
+                type(value).__name__,
+            )
+    return result
+
+
 def build_mm_cpu(multimodal_outputs: dict) -> dict[str, object]:
     """Pre-copies multimodal tensor to CPU once (not per-request) to avoid
     redundant D2H transfers when gpu_resident_buffer_keys keeps them on GPU.

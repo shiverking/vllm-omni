@@ -41,44 +41,15 @@ from vllm.v1.worker.utils import is_residual_scattered_for_sp
 from vllm_omni.data_entry_keys import flatten_payload
 from vllm_omni.distributed.omni_connectors.kv_transfer_manager import OmniKVTransferManager
 from vllm_omni.outputs import OmniModelRunnerOutput
-from vllm_omni.utils.mm_outputs import build_mm_cpu, to_payload_element
+from vllm_omni.utils.mm_outputs import (
+    build_mm_cpu,
+    ensure_tensor_values as _ensure_tensor_values,
+    to_payload_element,
+)
 from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
 from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorModelRunnerMixin
 
 logger = init_logger(__name__)
-
-
-def _ensure_tensor_values(payload: dict[str, object]) -> dict[str, torch.Tensor]:
-    """Convert a flattened payload to strictly ``dict[str, torch.Tensor]``.
-
-    Non-tensor scalars (int, float) are wrapped with ``torch.tensor()``.
-    Values that cannot be safely converted are dropped with a warning.
-    This enforces the tensor-only invariant required by the
-    ``OmniEngineCoreOutput.multimodal_output`` wire field and msgspec
-    serialization.
-    """
-    result: dict[str, torch.Tensor] = {}
-    for key, val in payload.items():
-        if isinstance(val, torch.Tensor):
-            result[key] = val
-        elif isinstance(val, (int, float, bool)):
-            result[key] = torch.tensor(val)
-        elif isinstance(val, (list, tuple)):
-            try:
-                result[key] = torch.tensor(val)
-            except (ValueError, TypeError, RuntimeError):
-                logger.warning(
-                    "Dropping non-tensorizable multimodal output key '%s' (type=%s) from wire payload.",
-                    key,
-                    type(val).__name__,
-                )
-        else:
-            logger.warning(
-                "Dropping non-tensor multimodal output key '%s' (type=%s) from wire payload.",
-                key,
-                type(val).__name__,
-            )
-    return result
 
 
 class ExecuteModelState(NamedTuple):

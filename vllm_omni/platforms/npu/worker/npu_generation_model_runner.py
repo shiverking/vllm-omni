@@ -35,6 +35,7 @@ from vllm_ascend.worker.model_runner_v1 import SEQ_LEN_WITH_MAX_PA_WORKSPACE
 from vllm_omni.outputs import OmniModelRunnerOutput
 from vllm_omni.platforms.npu.worker.npu_ar_model_runner import ExecuteModelState
 from vllm_omni.platforms.npu.worker.npu_model_runner import OmniNPUModelRunner
+from vllm_omni.utils.mm_outputs import ensure_tensor_values
 
 
 class NPUGenerationModelRunner(OmniNPUModelRunner):
@@ -476,13 +477,20 @@ class NPUGenerationModelRunner(OmniNPUModelRunner):
             self.input_batch, "num_tokens_no_spec"
         ):
             routed_experts_lists = self._omni_extract_routed_experts(scheduler_output)
+        wire_multimodal_outputs = [
+            ensure_tensor_values(payload) if payload else {}
+            for payload in pooler_output
+        ]
         output = OmniModelRunnerOutput(
             req_ids=req_ids_output_copy,
             req_id_to_index=req_id_to_index_output_copy,
             sampled_token_ids=[],
             logprobs=None,
             prompt_logprobs_dict={},
-            pooler_output=pooler_output,
+            # Keep multimodal dictionaries out of vLLM's tensor-only
+            # pooling_output field so rc1/rc2 share the same wire schema.
+            pooler_output=None,
+            multimodal_outputs=wire_multimodal_outputs,
             kv_connector_output=kv_connector_output,
             ec_connector_output=ec_connector_output if self.supports_mm_inputs else None,
             cudagraph_stats=cudagraph_stats,
