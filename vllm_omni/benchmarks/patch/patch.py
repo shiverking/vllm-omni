@@ -1197,12 +1197,14 @@ async def async_request_openai_audio_speech(
         "Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}",
     }
     _update_headers_common(headers, request_func_input)
-    if _ENABLE_PLAYBACK_FEEDBACK:
-        headers["X-Request-ID"] = request_func_input.request_id
+    request_id = str(request_func_input.request_id or "").strip()
+    feedback_enabled = _ENABLE_PLAYBACK_FEEDBACK and bool(request_id)
+    if feedback_enabled:
+        headers["X-Request-ID"] = request_id
 
     output = MixRequestFuncOutput()
     output.prompt_len = request_func_input.prompt_len
-    output.request_id = request_func_input.request_id
+    output.request_id = request_id
 
     # PCM format: 16-bit signed, 24 kHz, mono
     sample_rate = 24000
@@ -1220,11 +1222,11 @@ async def async_request_openai_audio_speech(
     publisher = (
         _PlaybackFeedbackPublisher(
             api_url=api_url,
-            request_id=request_func_input.request_id,
+            request_id=request_id,
             headers=headers,
             output=output,
         )
-        if _ENABLE_PLAYBACK_FEEDBACK
+        if feedback_enabled
         else None
     )
     if publisher is not None:

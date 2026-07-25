@@ -124,6 +124,40 @@ async def test_playback_feedback_is_async_and_final_state_is_sent(monkeypatch):
     assert feedback_payloads[0][2]["X-Request-ID"] == "seedtts-0001"
 
 
+@pytest.mark.asyncio
+async def test_playback_feedback_is_skipped_without_request_id(monkeypatch):
+    import vllm_omni.benchmarks.patch.patch as patch_mod
+
+    captured_headers = []
+
+    class PrimarySession:
+        def post(self, **kwargs):
+            captured_headers.append(kwargs["headers"])
+            return MockResponse(200, [b"\0" * 4800])
+
+    class UnexpectedFeedbackSession:
+        def __init__(self, *args, **kwargs):
+            raise AssertionError("feedback session must not be created without a request ID")
+
+    monkeypatch.setattr(patch_mod.aiohttp, "ClientSession", UnexpectedFeedbackSession)
+    monkeypatch.setattr(patch_mod, "_ENABLE_PLAYBACK_FEEDBACK", True)
+    request_input = RequestFuncInput(
+        model="test-model",
+        model_name="test-model",
+        prompt="warmup",
+        api_url="http://test/v1/audio/speech",
+        prompt_len=1,
+        output_len=10,
+    )
+
+    output = await async_request_openai_audio_speech(request_input, PrimarySession())
+
+    assert output.success is True
+    assert output.feedback_sent_count == 0
+    assert output.request_id == ""
+    assert "X-Request-ID" not in captured_headers[0]
+
+
 def create_sse_chunk(data_dict):
     """Helper to create SSE formatted chunk"""
     return f"data: {json.dumps(data_dict)}\n\n".encode()
