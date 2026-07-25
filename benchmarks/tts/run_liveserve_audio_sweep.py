@@ -15,6 +15,7 @@ import threading
 import time
 import urllib.request
 from collections import defaultdict
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -145,7 +146,7 @@ def build_server_command(args: argparse.Namespace, config_path: Path) -> list[st
 
 
 def fetch_scheduler_metrics(args: argparse.Namespace) -> dict[str, Any]:
-    url = f"http://{args.host}:{args.port}/v1/audio/speech/scheduling"
+    url = f"http://{_connect_host(args.host)}:{args.port}/v1/audio/speech/scheduling"
     try:
         with urllib.request.urlopen(url, timeout=10) as response:
             return json.loads(response.read())
@@ -186,14 +187,25 @@ def _tee_server_output(stream, server_log) -> None:
         server_log.flush()
 
 
-def wait_for_server_health(
+def _model_entry_matches(configured_model: str, entry: dict[str, Any]) -> bool:
+    candidates = {str(entry.get("id") or ""), str(entry.get("root") or "")}
+    if configured_model in candidates:
+        return True
+    configured_path = Path(configured_model).expanduser()
+    if not configured_path.exists():
+        return False
+    resolved = str(configured_path.resolve())
+    return any(candidate and str(Path(candidate).expanduser().resolve()) == resolved for candidate in candidates)
+
+
+def wait_for_server_model(
     args: argparse.Namespace,
     server: subprocess.Popen,
     server_log_path: Path,
 ) -> None:
-    """Poll /health until the API server is ready or startup fails."""
+    """Poll /v1/models until the requested model is ready or startup fails."""
     host = _connect_host(args.host)
-    health_url = f"http://{host}:{args.port}/health"
+    models_url = f"http://{host}:{args.port}/v1/models"
     started = time.monotonic()
     deadline = started + args.server_startup_timeout_s
     last_error = "not checked"
@@ -201,29 +213,111 @@ def wait_for_server_health(
         return_code = server.poll()
         if return_code is not None:
             raise RuntimeError(
-                f"Server exited before becoming healthy (exit code {return_code}).\n"
+                f"Server exited before the model became ready (exit code {return_code}).\n"
                 f"Last {server_log_path.name} lines:\n{_log_tail(server_log_path)}"
             )
         try:
-            with urllib.request.urlopen(health_url, timeout=2.0) as response:
+            with urllib.request.urlopen(models_url, timeout=5.0) as response:
                 if 200 <= response.status < 300:
-                    elapsed = time.monotonic() - started
-                    print(f"Server is healthy after {elapsed:.1f}s: {health_url}", flush=True)
-                    return
-                last_error = f"HTTP {response.status}"
+                    payload = json.loads(response.read())
+                    entries = payload.get("data", []) if isinstance(payload, dict) else []
+                    if any(
+                        isinstance(entry, dict) and _model_entry_matches(args.model, entry)
+                        for entry in entries
+                    ):
+                        elapsed = time.monotonic() - started
+                        print(f"Model is ready after {elapsed:.1f}s: {args.model}", flush=True)
+                        return
+                    available = [entry.get("id") for entry in entries if isinstance(entry, dict)]
+                    last_error = f"target model not listed; available={available}"
+                else:
+                    last_error = f"HTTP {response.status}"
         except Exception as exc:
             last_error = f"{type(exc).__name__}: {exc}"
         elapsed = time.monotonic() - started
         print(
-            f"Waiting for server health ({elapsed:.1f}s, last={last_error}); "
+            f"Waiting for model readiness ({elapsed:.1f}s, last={last_error}); "
             f"retrying in {args.health_poll_interval_s:g}s...",
             flush=True,
         )
         time.sleep(args.health_poll_interval_s)
     raise TimeoutError(
-        f"Server did not become healthy within {args.server_startup_timeout_s:g}s "
+        f"Model did not become ready within {args.server_startup_timeout_s:g}s "
         f"(last={last_error}).\nLast {server_log_path.name} lines:\n{_log_tail(server_log_path)}"
     )
+
+
+@contextmanager
+def running_server(
+    args: argparse.Namespace,
+    *,
+    strategy: str,
+    config_path: Path,
+    run_label: str,
+):
+    """Start a fresh model server for exactly one benchmark run."""
+    server_command = build_server_command(args, config_path)
+    print("+", subprocess.list2cmdline(server_command), flush=True)
+    if args.dry_run:
+        yield
+        return
+
+    ensure_server_port_available(args)
+    server_log_path = args.output_dir / f"server_{strategy}_{run_label}.log"
+    server_log = server_log_path.open("w", encoding="utf-8")
+    server = None
+    server_log_thread = None
+    try:
+        server_env = os.environ.copy()
+        server_env["VLLM_OMNI_ENABLE_PLAYBACK_FEEDBACK"] = "1"
+        server_env["PYTHONUNBUFFERED"] = "1"
+        server = subprocess.Popen(
+            server_command,
+            env=server_env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
+        )
+        assert server.stdout is not None
+        server_log_thread = threading.Thread(
+            target=_tee_server_output,
+            args=(server.stdout, server_log),
+            name=f"server-log-{strategy}-{run_label}",
+            daemon=True,
+        )
+        server_log_thread.start()
+        wait_for_server_model(args, server, server_log_path)
+        yield
+    finally:
+        if server is not None:
+            server.terminate()
+            try:
+                server.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                server.kill()
+                server.wait()
+        if server_log_thread is not None:
+            server_log_thread.join(timeout=10)
+        server_log.close()
+
+
+def run_with_fresh_server(
+    args: argparse.Namespace,
+    *,
+    strategy: str,
+    config_path: Path,
+    run_label: str,
+    benchmark_command: list[str],
+) -> dict[str, dict[str, float]]:
+    """Restart the model, run one benchmark, and return scheduler counter deltas."""
+    with running_server(args, strategy=strategy, config_path=config_path, run_label=run_label):
+        before = fetch_scheduler_metrics(args) if not args.dry_run else {}
+        run_command(benchmark_command, dry_run=args.dry_run)
+        after = fetch_scheduler_metrics(args) if not args.dry_run else {}
+    return counter_delta(before, after) if not args.dry_run else {}
 
 
 def counter_delta(before: dict[str, Any], after: dict[str, Any]) -> dict[str, dict[str, float]]:
@@ -413,131 +507,94 @@ def main() -> None:
 
     for strategy, config_name in STRATEGIES.items():
         config_path = DEPLOY_DIR / config_name
-        server_log_path = args.output_dir / f"server_{strategy}.log"
-        server_command = build_server_command(args, config_path)
-        print("+", subprocess.list2cmdline(server_command), flush=True)
-        if not args.dry_run:
-            ensure_server_port_available(args)
-        server_log = server_log_path.open("w", encoding="utf-8")
-        server = None
-        server_log_thread = None
-        try:
-            if not args.dry_run:
-                server_env = os.environ.copy()
-                server_env["VLLM_OMNI_ENABLE_PLAYBACK_FEEDBACK"] = "1"
-                server_env["PYTHONUNBUFFERED"] = "1"
-                server = subprocess.Popen(
-                    server_command,
-                    env=server_env,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                    bufsize=1,
+        for concurrency in CONCURRENCIES:
+            for repeat in range(args.repeats):
+                run_label = f"fixed_c{concurrency}_r{repeat}"
+                result_path = args.output_dir / f"fixed_{strategy}_c{concurrency}_r{repeat}.json"
+                command = build_benchmark_command(
+                    args,
+                    result_path=result_path,
+                    manifest_path=manifest_path,
+                    concurrency=concurrency,
+                    export_manifest=export_manifest,
                 )
-                assert server.stdout is not None
-                server_log_thread = threading.Thread(
-                    target=_tee_server_output,
-                    args=(server.stdout, server_log),
-                    name=f"server-log-{strategy}",
-                    daemon=True,
+                scheduler_delta = run_with_fresh_server(
+                    args,
+                    strategy=strategy,
+                    config_path=config_path,
+                    run_label=run_label,
+                    benchmark_command=command,
                 )
-                server_log_thread.start()
-            if server is not None:
-                wait_for_server_health(args, server, server_log_path)
-            for concurrency in CONCURRENCIES:
-                for repeat in range(args.repeats):
-                    result_path = args.output_dir / f"fixed_{strategy}_c{concurrency}_r{repeat}.json"
-                    command = build_benchmark_command(
-                        args,
-                        result_path=result_path,
-                        manifest_path=manifest_path,
+                if args.dry_run:
+                    continue
+                export_manifest = False
+                records.append(
+                    annotate_result(
+                        result_path,
+                        strategy=strategy,
+                        mode="fixed",
+                        repeat=repeat,
                         concurrency=concurrency,
-                        export_manifest=export_manifest,
+                        manifest_sha256=sha256_file(manifest_path),
+                        model=args.model,
+                        model_revision=args.model_revision,
+                        config_sha256=common_config_sha256,
+                        scheduler_delta=scheduler_delta,
                     )
-                    before = fetch_scheduler_metrics(args) if not args.dry_run else {}
-                    run_command(command, dry_run=args.dry_run)
-                    if args.dry_run:
-                        continue
-                    export_manifest = False
-                    manifest_sha256 = sha256_file(manifest_path)
-                    after = fetch_scheduler_metrics(args)
+                )
+
+        if strategy == "legacy" and not args.dry_run:
+            c8 = [
+                record
+                for record in records
+                if record["experiment"]["strategy"] == "legacy"
+                and record["experiment"]["concurrency"] == 8
+            ]
+            r_sat = mean(c8, "request_throughput")
+            for factor in LOAD_FACTORS:
+                for repeat in range(args.repeats):
+                    trace_path = args.output_dir / f"arrival_f{factor:.2f}_r{repeat}.json"
+                    write_arrival_trace(
+                        trace_path,
+                        num_requests=args.num_requests,
+                        request_rate=factor * r_sat,
+                        seed=1000 + repeat,
+                    )
+                    traces[(factor, repeat)] = trace_path
+
+        if not args.dry_run:
+            assert r_sat is not None
+            for factor in LOAD_FACTORS:
+                for repeat in range(args.repeats):
+                    run_label = f"poisson_f{factor:.2f}_r{repeat}".replace(".", "p")
+                    result_path = args.output_dir / f"poisson_{strategy}_f{factor:.2f}_r{repeat}.json"
+                    scheduler_delta = run_with_fresh_server(
+                        args,
+                        strategy=strategy,
+                        config_path=config_path,
+                        run_label=run_label,
+                        benchmark_command=build_benchmark_command(
+                            args,
+                            result_path=result_path,
+                            manifest_path=manifest_path,
+                            arrival_trace=traces[(factor, repeat)],
+                        ),
+                    )
                     records.append(
                         annotate_result(
                             result_path,
                             strategy=strategy,
-                            mode="fixed",
+                            mode="poisson",
                             repeat=repeat,
-                            concurrency=concurrency,
-                            manifest_sha256=manifest_sha256,
+                            load_factor=factor,
+                            request_rate=factor * r_sat,
+                            manifest_sha256=sha256_file(manifest_path),
                             model=args.model,
                             model_revision=args.model_revision,
                             config_sha256=common_config_sha256,
-                            scheduler_delta=counter_delta(before, after),
+                            scheduler_delta=scheduler_delta,
                         )
                     )
-            if strategy == "legacy" and not args.dry_run:
-                c8 = [
-                    record
-                    for record in records
-                    if record["experiment"]["strategy"] == "legacy"
-                    and record["experiment"]["concurrency"] == 8
-                ]
-                r_sat = mean(c8, "request_throughput")
-                for factor in LOAD_FACTORS:
-                    for repeat in range(args.repeats):
-                        trace_path = args.output_dir / f"arrival_f{factor:.2f}_r{repeat}.json"
-                        write_arrival_trace(
-                            trace_path,
-                            num_requests=args.num_requests,
-                            request_rate=factor * r_sat,
-                            seed=1000 + repeat,
-                        )
-                        traces[(factor, repeat)] = trace_path
-
-            if not args.dry_run:
-                assert r_sat is not None
-                for factor in LOAD_FACTORS:
-                    for repeat in range(args.repeats):
-                        result_path = args.output_dir / f"poisson_{strategy}_f{factor:.2f}_r{repeat}.json"
-                        before = fetch_scheduler_metrics(args)
-                        run_command(
-                            build_benchmark_command(
-                                args,
-                                result_path=result_path,
-                                manifest_path=manifest_path,
-                                arrival_trace=traces[(factor, repeat)],
-                            ),
-                            dry_run=False,
-                        )
-                        after = fetch_scheduler_metrics(args)
-                        records.append(
-                            annotate_result(
-                                result_path,
-                                strategy=strategy,
-                                mode="poisson",
-                                repeat=repeat,
-                                load_factor=factor,
-                                request_rate=factor * r_sat,
-                                manifest_sha256=sha256_file(manifest_path),
-                                model=args.model,
-                                model_revision=args.model_revision,
-                                config_sha256=common_config_sha256,
-                                scheduler_delta=counter_delta(before, after),
-                            )
-                        )
-        finally:
-            if server is not None:
-                server.terminate()
-                try:
-                    server.wait(timeout=30)
-                except subprocess.TimeoutExpired:
-                    server.kill()
-                    server.wait()
-            if server_log_thread is not None:
-                server_log_thread.join(timeout=10)
-            server_log.close()
 
     if args.dry_run:
         print("Dry run complete; no server or benchmark process was started.")

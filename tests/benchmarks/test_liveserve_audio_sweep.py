@@ -65,8 +65,9 @@ def test_local_model_server_command_omits_revision(tmp_path):
     assert "--revision" not in command
 
 
-def test_wait_for_server_health_retries_until_ready(monkeypatch, tmp_path):
+def test_wait_for_server_model_retries_until_target_is_listed(monkeypatch, tmp_path):
     args = Namespace(
+        model="/models/Qwen3-TTS-12Hz-1.7B-Base",
         host="127.0.0.1",
         port=8000,
         server_startup_timeout_s=30.0,
@@ -74,7 +75,15 @@ def test_wait_for_server_health_retries_until_ready(monkeypatch, tmp_path):
     )
     server = Mock()
     server.poll.return_value = None
-    attempts = iter([OSError("not ready"), Mock(status=200)])
+
+    class ModelResponse:
+        status = 200
+
+        @staticmethod
+        def read():
+            return b'{"data":[{"id":"/models/Qwen3-TTS-12Hz-1.7B-Base"}]}'
+
+    attempts = iter([OSError("not ready"), ModelResponse()])
 
     class ResponseContext:
         def __init__(self, response):
@@ -98,13 +107,14 @@ def test_wait_for_server_health_retries_until_ready(monkeypatch, tmp_path):
     sleep = Mock()
     monkeypatch.setattr(sweep.time, "sleep", sleep)
 
-    sweep.wait_for_server_health(args, server, tmp_path / "server.log")
+    sweep.wait_for_server_model(args, server, tmp_path / "server.log")
 
     sleep.assert_called_once_with(5.0)
 
 
-def test_wait_for_server_health_reports_early_exit(tmp_path):
+def test_wait_for_server_model_reports_early_exit(tmp_path):
     args = Namespace(
+        model="/models/Qwen3-TTS-12Hz-1.7B-Base",
         host="127.0.0.1",
         port=8000,
         server_startup_timeout_s=30.0,
@@ -116,7 +126,7 @@ def test_wait_for_server_health_reports_early_exit(tmp_path):
     log.write_text("fatal startup error\n", encoding="utf-8")
 
     with pytest.raises(RuntimeError, match="fatal startup error"):
-        sweep.wait_for_server_health(args, server, log)
+        sweep.wait_for_server_model(args, server, log)
 
 
 def test_server_output_is_printed_and_saved(capsys):
