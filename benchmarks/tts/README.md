@@ -35,7 +35,8 @@ python benchmarks/tts/run_liveserve_audio_sweep.py \
 
 脚本会分别重启三种部署配置，并自动启用实验性播放反馈。输出包括原始 JSON、固定
 workload manifest、Poisson arrival trace、服务日志、Markdown/JSON 汇总和七张图。
-每次启动服务后默认每 5 秒轮询一次 `/health`，健康检查成功后才开始 benchmark；
+服务启动日志会实时打印到终端并同时保存到对应日志文件。每次启动服务后默认每 10 秒
+轮询一次 `/health`，健康检查成功后才开始 benchmark；
 默认启动超时为 900 秒，可通过 `--server-startup-timeout-s` 和
 `--health-poll-interval-s` 调整。若目标端口已有服务，脚本会直接拒绝运行，避免误测旧进程。
 运行结束会检查失败请求、manifest/revision/公共部署参数一致性，以及同一 cell 的输出

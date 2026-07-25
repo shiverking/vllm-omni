@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import sys
 from argparse import Namespace
+from io import StringIO
 from pathlib import Path
 from unittest.mock import Mock
 
@@ -116,6 +117,16 @@ def test_wait_for_server_health_reports_early_exit(tmp_path):
 
     with pytest.raises(RuntimeError, match="fatal startup error"):
         sweep.wait_for_server_health(args, server, log)
+
+
+def test_server_output_is_printed_and_saved(capsys):
+    stream = StringIO("model loading\nserver ready\n")
+    server_log = StringIO()
+
+    sweep._tee_server_output(stream, server_log)
+
+    assert capsys.readouterr().out == "model loading\nserver ready\n"
+    assert server_log.getvalue() == "model loading\nserver ready\n"
 
 
 def test_verify_results_rejects_audio_duration_drift():

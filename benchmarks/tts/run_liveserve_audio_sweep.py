@@ -11,6 +11,7 @@ import os
 import random
 import socket
 import subprocess
+import threading
 import time
 import urllib.request
 from collections import defaultdict
@@ -175,6 +176,14 @@ def _log_tail(path: Path, lines: int = 40) -> str:
         return "\n".join(path.read_text(encoding="utf-8", errors="replace").splitlines()[-lines:])
     except OSError:
         return "<server log is not readable>"
+
+
+def _tee_server_output(stream, server_log) -> None:
+    """Mirror server output to the terminal and the per-strategy log."""
+    for line in stream:
+        print(line, end="", flush=True)
+        server_log.write(line)
+        server_log.flush()
 
 
 def wait_for_server_health(
@@ -376,7 +385,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--server-startup-timeout-s", type=float, default=900.0)
-    parser.add_argument("--health-poll-interval-s", type=float, default=5.0)
+    parser.add_argument("--health-poll-interval-s", type=float, default=10.0)
     parser.add_argument("--serve-bin", default="vllm")
     parser.add_argument("--bench-bin", default="vllm-omni")
     parser.add_argument("--num-requests", type=int, default=128)
@@ -411,11 +420,30 @@ def main() -> None:
             ensure_server_port_available(args)
         server_log = server_log_path.open("w", encoding="utf-8")
         server = None
+        server_log_thread = None
         try:
             if not args.dry_run:
                 server_env = os.environ.copy()
                 server_env["VLLM_OMNI_ENABLE_PLAYBACK_FEEDBACK"] = "1"
-                server = subprocess.Popen(server_command, env=server_env, stdout=server_log, stderr=subprocess.STDOUT)
+                server_env["PYTHONUNBUFFERED"] = "1"
+                server = subprocess.Popen(
+                    server_command,
+                    env=server_env,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    bufsize=1,
+                )
+                assert server.stdout is not None
+                server_log_thread = threading.Thread(
+                    target=_tee_server_output,
+                    args=(server.stdout, server_log),
+                    name=f"server-log-{strategy}",
+                    daemon=True,
+                )
+                server_log_thread.start()
             if server is not None:
                 wait_for_server_health(args, server, server_log_path)
             for concurrency in CONCURRENCIES:
@@ -507,6 +535,8 @@ def main() -> None:
                 except subprocess.TimeoutExpired:
                     server.kill()
                     server.wait()
+            if server_log_thread is not None:
+                server_log_thread.join(timeout=10)
             server_log.close()
 
     if args.dry_run:
