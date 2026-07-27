@@ -2228,6 +2228,43 @@ def test_playback_feedback_reaches_engine(monkeypatch, mocker: MockerFixture):
     engine.publish_playback_feedback.assert_awaited_once()
 
 
+def test_late_terminal_playback_feedback_returns_ok(monkeypatch, mocker: MockerFixture):
+    from vllm_omni.entrypoints.openai.protocol.audio import PlaybackFeedbackRequest
+
+    monkeypatch.setenv("VLLM_OMNI_ENABLE_PLAYBACK_FEEDBACK", "1")
+    engine = SimpleNamespace(
+        publish_playback_feedback=mocker.AsyncMock(
+            return_value={"status": "already_finished", "request_id": "seedtts-0001"}
+        )
+    )
+    app = FastAPI()
+    app.state.engine_client = engine
+    scope = {
+        "type": "http",
+        "app": app,
+        "method": "POST",
+        "path": "/v1/audio/speech/playback",
+        "headers": [],
+        "query_string": b"",
+        "client": ("127.0.0.1", 12345),
+        "server": ("testserver", 80),
+        "scheme": "http",
+    }
+    request = PlaybackFeedbackRequest(
+        request_id="seedtts-0001",
+        received_audio_ms=100,
+        played_audio_ms=100,
+        first_audio_received=True,
+        finished=True,
+        client_timestamp_ms=2,
+    )
+
+    response = asyncio.run(api_server_module.publish_speech_playback(request, Request(scope)))
+
+    assert response.status_code == 200
+    assert b'"status":"already_finished"' in response.body
+
+
 def test_audio_scheduling_metrics_reach_engine(monkeypatch, mocker: MockerFixture):
     monkeypatch.setenv("VLLM_OMNI_ENABLE_PLAYBACK_FEEDBACK", "1")
     expected = {"scheduling": {"u0_scheduled_count": 2}, "feedback": {"accepted": 3}}

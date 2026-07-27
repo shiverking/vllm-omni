@@ -50,6 +50,7 @@ class OmniSchedulerMixin:
     def update_audio_interaction_state(self, payload: dict[str, Any]) -> dict[str, Any]:
         """Update the scheduler-local playback side table without changing queues."""
         request_id = str(payload.get("request_id") or "")
+        terminal = bool(payload.get("finished", False) or payload.get("aborted", False))
         counters = getattr(self, "audio_feedback_counters", None)
         if counters is None:
             counters = self.audio_feedback_counters = {
@@ -59,6 +60,12 @@ class OmniSchedulerMixin:
                 "unknown_request": 0,
                 "state_cleaned": 0,
             }
+        if request_id and request_id not in self.requests and terminal:
+            # The HTTP audio stream closes only after the scheduler has
+            # normally completed and removed the request.  Treat the client's
+            # final acknowledgement as idempotent instead of reporting a
+            # spurious unknown-request failure.
+            return {"status": "already_finished", "counters": dict(counters)}
         if not request_id or request_id not in self.requests:
             counters["unknown_request"] += 1
             return {"status": "unknown_request", "counters": dict(counters)}

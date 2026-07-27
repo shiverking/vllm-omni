@@ -60,6 +60,16 @@ async def test_publish_playback_feedback_unknown_request():
 
 
 @pytest.mark.asyncio
+async def test_publish_late_terminal_feedback_is_idempotent():
+    omni = AsyncOmni.__new__(AsyncOmni)
+    omni.request_states = {}
+
+    result = await omni.publish_playback_feedback({"request_id": "finished", "finished": True})
+
+    assert result == {"status": "already_finished", "request_id": "finished"}
+
+
+@pytest.mark.asyncio
 async def test_get_audio_scheduling_metrics_reads_stage_one():
     omni = AsyncOmni.__new__(AsyncOmni)
     omni.engine = SimpleNamespace(stage_configs=[object(), object()])

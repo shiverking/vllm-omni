@@ -769,6 +769,12 @@ class AsyncOmni(EngineClient, OmniBase):
             if state.external_request_id == external_request_id
         ]
         if not internal_ids:
+            if feedback.get("finished", False) or feedback.get("aborted", False):
+                # Normal completion removes ClientRequestState before the
+                # streaming benchmark can acknowledge EOF.  Terminal feedback
+                # is therefore an idempotent acknowledgement, not an unknown
+                # live request.
+                return {"status": "already_finished", "request_id": external_request_id}
             return {"status": "unknown_request", "request_id": external_request_id}
         if len(self.stage_configs) <= 1:
             return {"status": "unsupported", "request_id": external_request_id, "reason": "stage_1_missing"}
@@ -785,7 +791,11 @@ class AsyncOmni(EngineClient, OmniBase):
             statuses.extend(result for result in results if isinstance(result, dict))
 
         preferred = next(
-            (item for item in statuses if item.get("status") in {"accepted", "coalesced", "stale"}),
+            (
+                item
+                for item in statuses
+                if item.get("status") in {"accepted", "coalesced", "stale", "already_finished"}
+            ),
             None,
         )
         if preferred is None:

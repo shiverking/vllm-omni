@@ -64,6 +64,16 @@ def test_terminal_feedback_and_finish_cleanup():
     assert "internal-1" not in scheduler.audio_feedback_client_timestamps_ms
 
 
+def test_late_terminal_feedback_is_idempotent():
+    scheduler = _FakeScheduler()
+    scheduler.requests.clear()
+
+    result = scheduler.update_audio_interaction_state(_payload(finished=True))
+
+    assert result["status"] == "already_finished"
+    assert result["counters"]["unknown_request"] == 0
+
+
 def test_reset_clears_metrics_without_removing_interaction_state():
     scheduler = _FakeScheduler()
     scheduler.update_audio_interaction_state(_payload())
