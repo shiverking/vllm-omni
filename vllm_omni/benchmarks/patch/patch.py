@@ -1468,6 +1468,81 @@ async def replay_arrival_trace(input_requests: list[SampleRequest], offsets: lis
         yield request, float("nan")
 
 
+def _audio_scheduling_url(api_url: str, *, reset: bool = False) -> str:
+    base, separator, _suffix = api_url.partition("/v1/audio/speech")
+    if not separator:
+        raise ValueError(f"Cannot derive scheduling metrics URL from {api_url!r}")
+    return f"{base}/v1/audio/speech/scheduling" + ("/reset" if reset else "")
+
+
+async def _fetch_audio_scheduling_metrics(
+    session: aiohttp.ClientSession, api_url: str, *, reset: bool = False
+) -> dict[str, Any]:
+    url = _audio_scheduling_url(api_url, reset=reset)
+    request = session.post(url) if reset else session.get(url)
+    async with request as response:
+        body = await response.text()
+        if response.status != 200:
+            operation = "reset" if reset else "GET"
+            raise RuntimeError(f"Audio scheduling metrics {operation} failed: HTTP {response.status}: {body}")
+        try:
+            result = json.loads(body)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(f"Invalid audio scheduling metrics response: {body[:500]}") from exc
+    if reset and result.get("status") != "reset":
+        raise RuntimeError(f"Audio scheduling metrics reset was not accepted: {result}")
+    if not reset and not isinstance(result.get("scheduling"), dict):
+        raise RuntimeError(f"Audio scheduling metrics are unavailable: {result}")
+    return result
+
+
+def print_audio_scheduling_metrics(result: dict[str, Any]) -> None:
+    scheduling = result.get("scheduling") or {}
+    feedback = result.get("feedback") or {}
+
+    def number(section: dict[str, Any], key: str) -> float:
+        return float(section.get(key, 0) or 0)
+
+    def rate(numerator: float, denominator: float) -> float:
+        return numerator / denominator if denominator > 0 else 0.0
+
+    u0_ready = number(scheduling, "u0_ready_count")
+    u0_scheduled = number(scheduling, "u0_scheduled_count")
+    u1_ready = number(scheduling, "u1_ready_count")
+    u1_scheduled = number(scheduling, "u1_scheduled_count")
+    u2_ready = number(scheduling, "u2_ready_count")
+    u2_scheduled = number(scheduling, "u2_scheduled_count")
+    u2_deferred = number(scheduling, "u2_deferred_count")
+    rows = (
+        ("U0 ready:", u0_ready, "count"),
+        ("U0 scheduled:", u0_scheduled, "count"),
+        ("U0 schedule rate:", rate(u0_scheduled, u0_ready), "rate"),
+        ("U0 max wait rounds:", number(scheduling, "u0_max_wait_rounds"), "count"),
+        ("U1 ready:", u1_ready, "count"),
+        ("U1 scheduled:", u1_scheduled, "count"),
+        ("U1 schedule rate:", rate(u1_scheduled, u1_ready), "rate"),
+        ("U1 max first-schedule wait (ms):", number(scheduling, "u1_max_first_schedule_wait_ms"), "float"),
+        ("U2 ready:", u2_ready, "count"),
+        ("U2 scheduled:", u2_scheduled, "count"),
+        ("U2 schedule rate:", rate(u2_scheduled, u2_ready), "rate"),
+        ("U2 deferred:", u2_deferred, "count"),
+        ("U2 defer rate:", rate(u2_deferred, u2_ready), "rate"),
+        ("Fallback ready:", number(scheduling, "fallback_ready_count"), "count"),
+        ("Fallback scheduled:", number(scheduling, "fallback_scheduled_count"), "count"),
+        ("Stale fallback:", number(scheduling, "stale_fallback_count"), "count"),
+        ("Feedback accepted:", number(feedback, "accepted"), "count"),
+        ("Feedback coalesced:", number(feedback, "coalesced"), "count"),
+        ("Feedback stale:", number(feedback, "stale"), "count"),
+        ("Feedback unknown request:", number(feedback, "unknown_request"), "count"),
+        ("States cleaned:", number(feedback, "state_cleaned"), "count"),
+    )
+    print("{s:{c}^{n}}".format(s=" LiveServe Scheduling Result ", n=56, c="="))
+    for label, value, kind in rows:
+        rendered = f"{value:.2%}" if kind == "rate" else (f"{value:.2f}" if kind == "float" else f"{int(value)}")
+        print(f"{label:<42} {rendered:<12}")
+    print("=" * 56)
+
+
 async def benchmark(
     task_type: TaskType,
     endpoint_type: str,
@@ -1590,6 +1665,10 @@ async def benchmark(
         validate_warmup_outputs(warmup_outputs)
         print("Warmup run completed.")
 
+    collect_audio_scheduling = endpoint_type == "openai-audio-speech" and _ENABLE_PLAYBACK_FEEDBACK
+    if collect_audio_scheduling:
+        await _fetch_audio_scheduling_metrics(session, api_url, reset=True)
+
     print("Starting main benchmark run...")
 
     if lora_modules:
@@ -1711,6 +1790,18 @@ async def benchmark(
         )
     outputs: list[MixRequestFuncOutput] = await asyncio.gather(*tasks)
 
+    audio_scheduling_metrics: dict[str, Any] | None = None
+    if collect_audio_scheduling:
+        audio_scheduling_metrics = await _fetch_audio_scheduling_metrics(session, api_url)
+        scheduling = audio_scheduling_metrics.setdefault("scheduling", {})
+        for urgency in ("u0", "u1", "u2"):
+            ready = float(scheduling.get(f"{urgency}_ready_count", 0) or 0)
+            scheduled = float(scheduling.get(f"{urgency}_scheduled_count", 0) or 0)
+            scheduling[f"{urgency}_schedule_rate"] = scheduled / ready if ready > 0 else 0.0
+        u2_ready = float(scheduling.get("u2_ready_count", 0) or 0)
+        u2_deferred = float(scheduling.get("u2_deferred_count", 0) or 0)
+        scheduling["u2_defer_rate"] = u2_deferred / u2_ready if u2_ready > 0 else 0.0
+
     if pbar is not None:
         pbar.close()
 
@@ -1794,6 +1885,8 @@ async def benchmark(
                 request_ids=[request.request_id for request in input_requests],
             ),
         }
+        if audio_scheduling_metrics is not None:
+            result["audio_scheduling_metrics"] = audio_scheduling_metrics
     else:
         result = {
             "duration": benchmark_duration,
@@ -1905,6 +1998,8 @@ async def benchmark(
         if profile_output.success:
             print("Profiler stopped")
 
+    if audio_scheduling_metrics is not None:
+        print_audio_scheduling_metrics(audio_scheduling_metrics)
     await session.close()
     return result
 

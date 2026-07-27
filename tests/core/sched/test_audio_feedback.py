@@ -8,6 +8,7 @@ from vllm_omni.core.sched.omni_scheduler_mixin import OmniSchedulerMixin
 class _FakeScheduler(OmniSchedulerMixin):
     def __init__(self):
         self.requests = {"internal-1": SimpleNamespace(request_id="internal-1")}
+        self.chunk_transfer_adapter = SimpleNamespace(audio_scheduling_metrics={"u0_ready_count": 3})
 
 
 def _payload(**overrides):
@@ -61,3 +62,19 @@ def test_terminal_feedback_and_finish_cleanup():
     scheduler._cleanup_audio_interaction_states(["internal-1"])
     assert "internal-1" not in scheduler.audio_interaction_states
     assert "internal-1" not in scheduler.audio_feedback_client_timestamps_ms
+
+
+def test_reset_clears_metrics_without_removing_interaction_state():
+    scheduler = _FakeScheduler()
+    scheduler.update_audio_interaction_state(_payload())
+    result = scheduler.reset_audio_scheduling_metrics()
+    assert result["status"] == "reset"
+    assert scheduler.chunk_transfer_adapter.audio_scheduling_metrics == {}
+    assert scheduler.audio_feedback_counters == {
+        "accepted": 0,
+        "coalesced": 0,
+        "stale": 0,
+        "unknown_request": 0,
+        "state_cleaned": 0,
+    }
+    assert "internal-1" in scheduler.audio_interaction_states

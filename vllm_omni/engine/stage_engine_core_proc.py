@@ -84,6 +84,9 @@ class StageEngineCoreProc(EngineCoreProc):
                 "scheduling": dict(getattr(adapter, "audio_scheduling_metrics", {}) or {}),
                 "feedback": dict(getattr(self.scheduler, "audio_feedback_counters", {}) or {}),
             }
+        if method == "reset_audio_scheduling_metrics":
+            reset = getattr(self.scheduler, "reset_audio_scheduling_metrics", None)
+            return reset() if reset is not None else {"status": "unsupported"}
         return super().collective_rpc(method, timeout, args, kwargs)
 
     @staticmethod

@@ -17,6 +17,7 @@ from vllm_omni.benchmarks.patch.patch import (
     async_request_openai_audio_speech,
     async_request_openai_chat_omni_completions,
     load_arrival_trace,
+    print_audio_scheduling_metrics,
     replay_arrival_trace,
     validate_warmup_outputs,
 )
@@ -98,6 +99,24 @@ def test_warmup_failure_is_not_reported_as_completed():
 
     with pytest.raises(RuntimeError, match="HTTP 502 proxy failure"):
         validate_warmup_outputs([succeeded, failed])
+
+
+def test_audio_scheduling_metrics_are_printed(capsys):
+    print_audio_scheduling_metrics(
+        {
+            "scheduling": {
+                "u0_ready_count": 4,
+                "u0_scheduled_count": 3,
+                "u2_ready_count": 10,
+                "u2_deferred_count": 5,
+            },
+            "feedback": {"accepted": 20, "unknown_request": 1},
+        }
+    )
+    output = capsys.readouterr().out
+    assert "U0 schedule rate:" in output and "75.00%" in output
+    assert "U2 defer rate:" in output and "50.00%" in output
+    assert "Feedback accepted:" in output and "20" in output
 
 
 @pytest.mark.asyncio

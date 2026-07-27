@@ -7,7 +7,8 @@ from vllm_omni.benchmarks.patch import patch
 # isort: on
 
 from vllm_omni.entrypoints.cli.benchmark.serve import OmniBenchmarkServingSubcommand
+from vllm_omni.entrypoints.cli.benchmark.liveserve_audio import LiveServeAudioBenchmarkSubcommand
 
 from .serve import OmniServeCommand
 
-__all__ = ["OmniServeCommand", "OmniBenchmarkServingSubcommand"]
+__all__ = ["OmniServeCommand", "OmniBenchmarkServingSubcommand", "LiveServeAudioBenchmarkSubcommand"]

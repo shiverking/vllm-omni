@@ -118,6 +118,21 @@ class OmniSchedulerMixin:
             self._cleanup_audio_interaction_states([request_id])
         return {"status": "accepted", "counters": dict(counters)}
 
+    def reset_audio_scheduling_metrics(self) -> dict[str, Any]:
+        """Reset experiment counters without disturbing live request state."""
+        self.audio_feedback_counters = {
+            "accepted": 0,
+            "coalesced": 0,
+            "stale": 0,
+            "unknown_request": 0,
+            "state_cleaned": 0,
+        }
+        adapter = getattr(self, "chunk_transfer_adapter", None)
+        metrics = getattr(adapter, "audio_scheduling_metrics", None)
+        if metrics is not None:
+            metrics.clear()
+        return {"status": "reset", "scheduling": {}, "feedback": dict(self.audio_feedback_counters)}
+
     def _cleanup_audio_interaction_states(self, request_ids: Iterable[str]) -> None:
         states = getattr(self, "audio_interaction_states", {})
         timestamps = getattr(self, "audio_feedback_client_timestamps_ms", {})

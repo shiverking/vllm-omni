@@ -8,8 +8,10 @@ import sys
 
 def main():
     """Main CLI entry point that intercepts vLLM commands."""
-    # Check if --omni flag is present
-    if "--omni" not in sys.argv:
+    is_compact_liveserve_bench = len(sys.argv) >= 3 and sys.argv[1:3] == ["bench", "liveserve-audio"]
+    # The compact LiveServe command is Omni-only and intentionally does not
+    # expose the redundant --omni flag.
+    if "--omni" not in sys.argv and not is_compact_liveserve_bench:
         from vllm.entrypoints.cli.main import main as vllm_main
 
         vllm_main()

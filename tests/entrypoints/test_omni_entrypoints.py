@@ -70,6 +70,15 @@ async def test_get_audio_scheduling_metrics_reads_stage_one():
     omni.collective_rpc.assert_awaited_once_with(method="get_audio_scheduling_metrics", stage_ids=[1])
 
 
+@pytest.mark.asyncio
+async def test_reset_audio_scheduling_metrics_reaches_stage_one():
+    omni = AsyncOmni.__new__(AsyncOmni)
+    omni.engine = SimpleNamespace(stage_configs=[object(), object()])
+    omni.collective_rpc = AsyncMock(return_value=[{"status": "reset"}])
+    assert await omni.reset_audio_scheduling_metrics() == {"status": "reset"}
+    omni.collective_rpc.assert_awaited_once_with(method="reset_audio_scheduling_metrics", stage_ids=[1])
+
+
 def _stage_meta(*, stage_type: str, final_output: bool, final_output_type: str | None) -> StageRuntimeInfo:
     return StageRuntimeInfo(
         stage_type=stage_type,

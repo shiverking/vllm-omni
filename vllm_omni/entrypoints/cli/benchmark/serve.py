@@ -277,7 +277,8 @@ class OmniBenchmarkServingSubcommand(OmniBenchmarkSubcommandBase):
             if action.dest == "goodput":
                 action.help = (
                     'Specify SLOs as KEY:VALUE pairs. Supported keys: "ttft", "tpot", "e2el", '
-                    '"audio_ttfp" (milliseconds), "audio_rtf" (ratio), and "audio_continuity" (0 or 1).'
+                    '"audio_ttfp" (milliseconds), "audio_rtf" and "streaming_audio_rtf" (ratios), '
+                    'and "audio_continuity" (0 or 1).'
                 )
             if action.dest == "random_mm_limit_mm_per_prompt":
                 action.help = (

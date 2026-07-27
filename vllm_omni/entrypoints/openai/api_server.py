@@ -1297,6 +1297,26 @@ async def get_speech_scheduling_metrics(raw_request: Request):
     return JSONResponse(content=await collect())
 
 
+@router.post("/v1/audio/speech/scheduling/reset")
+async def reset_speech_scheduling_metrics(raw_request: Request):
+    """Reset Stage 1 audio counters after benchmark warmup."""
+    if not _playback_feedback_enabled():
+        return JSONResponse(
+            status_code=HTTPStatus.SERVICE_UNAVAILABLE.value,
+            content={"status": "disabled", "enabled": False},
+        )
+    engine_client = getattr(raw_request.app.state, "engine_client", None)
+    reset = getattr(engine_client, "reset_audio_scheduling_metrics", None)
+    if reset is None:
+        raise HTTPException(
+            status_code=HTTPStatus.NOT_IMPLEMENTED.value,
+            detail="Audio scheduling metrics reset is not supported by this engine",
+        )
+    result = await reset()
+    status_code = HTTPStatus.OK.value if result.get("status") == "reset" else HTTPStatus.NOT_IMPLEMENTED.value
+    return JSONResponse(status_code=status_code, content=result)
+
+
 @router.post(
     "/v1/audio/speech/batch",
     dependencies=[Depends(validate_json_request)],
