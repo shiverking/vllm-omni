@@ -248,6 +248,18 @@ class OmniServeCommand(CLISubcommand):
             help="Override the deploy YAML's ``async_chunk:`` bool. Unset leaves the YAML value in force.",
         )
         omni_config_group.add_argument(
+            "--audio-scheduling-policy",
+            choices=("legacy", "bounded_k", "liveserve_audio"),
+            default=None,
+            help="Override the audio chunk scheduling policy for every stage.",
+        )
+        omni_config_group.add_argument(
+            "--active-stream-window",
+            type=int,
+            default=None,
+            help="Active stream window used by bounded_k; use 0 for legacy or LiveServe.",
+        )
+        omni_config_group.add_argument(
             "--stage-id",
             type=int,
             default=None,

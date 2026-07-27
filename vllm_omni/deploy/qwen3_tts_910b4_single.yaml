@@ -1,8 +1,8 @@
 # Qwen3-TTS-12Hz-1.7B-Base profile for a single Ascend 910B4.
 #
-# Both stages intentionally share device 0.  Keep policy selection in the
-# three thin overlays next to this file so Legacy, bounded-K=2, and LiveServe
-# use identical model, batching, connector, and execution settings.
+# Both stages intentionally share device 0.  Select Legacy, bounded-K, or
+# LiveServe with the --audio-scheduling-policy and --active-stream-window
+# serve arguments so every policy uses this identical runtime profile.
 #
 # The qwen3_tts pipeline registry supplies structural fields such as
 # model_stage, model_arch, worker_type, scheduler_cls, and stage processors.

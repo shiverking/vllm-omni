@@ -425,6 +425,8 @@ class OrchestratorArgs:
 
     # === Mode Switches (orchestrator reads, DeployConfig redistributes) ===
     async_chunk: bool | None = None
+    audio_scheduling_policy: str | None = None
+    active_stream_window: int | None = None
 
     # === Observability ===
     log_stats: bool = False

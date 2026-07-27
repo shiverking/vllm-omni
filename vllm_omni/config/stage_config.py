@@ -1215,6 +1215,12 @@ class StageConfigFactory:
         cli_async_chunk = cli_overrides.get("async_chunk")
         if cli_async_chunk is not None:
             deploy_cfg.async_chunk = bool(cli_async_chunk)
+        cli_audio_policy = cli_overrides.get("audio_scheduling_policy")
+        if cli_audio_policy is not None:
+            deploy_cfg.audio_scheduling_policy = str(cli_audio_policy)
+        cli_active_window = cli_overrides.get("active_stream_window")
+        if cli_active_window is not None:
+            deploy_cfg.active_stream_window = int(cli_active_window)
 
         pipeline_key = deploy_cfg.pipeline or model_type
         if pipeline_key not in _PIPELINE_REGISTRY:

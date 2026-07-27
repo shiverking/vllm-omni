@@ -1,4 +1,0 @@
-base_config: qwen3_tts_910b4_single.yaml
-
-audio_scheduling_policy: bounded_k
-active_stream_window: 2

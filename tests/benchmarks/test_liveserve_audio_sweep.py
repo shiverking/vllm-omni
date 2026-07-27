@@ -59,10 +59,12 @@ def test_local_model_server_command_omits_revision(tmp_path):
         server_extra_arg=[],
     )
 
-    command = sweep.build_server_command(args, tmp_path / "deploy.yaml")
+    command = sweep.build_server_command(args, tmp_path / "deploy.yaml", strategy="liveserve_audio")
 
     assert command[:3] == ["vllm", "serve", args.model]
     assert "--revision" not in command
+    assert command[command.index("--audio-scheduling-policy") + 1] == "liveserve_audio"
+    assert command[command.index("--active-stream-window") + 1] == "0"
 
 
 def test_wait_for_server_model_retries_until_target_is_listed(monkeypatch, tmp_path):

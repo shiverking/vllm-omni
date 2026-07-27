@@ -23,9 +23,9 @@ DEFAULT_MODEL = "Qwen/Qwen3-TTS-12Hz-1.7B-Base"
 CONCURRENCIES = (1, 2, 4, 8)
 LOAD_FACTORS = (0.50, 0.75, 1.00, 1.25)
 STRATEGIES = {
-    "legacy": "qwen3_tts_910b4_single_legacy.yaml",
-    "bounded_k2": "qwen3_tts_910b4_single_bounded_k2.yaml",
-    "liveserve_audio": "qwen3_tts_910b4_single_liveserve_audio.yaml",
+    "legacy": ("legacy", 0),
+    "bounded_k2": ("bounded_k", 2),
+    "liveserve_audio": ("liveserve_audio", 0),
 }
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEPLOY_DIR = REPO_ROOT / "vllm_omni" / "deploy"
@@ -125,7 +125,8 @@ def build_benchmark_command(
     return command
 
 
-def build_server_command(args: argparse.Namespace, config_path: Path) -> list[str]:
+def build_server_command(args: argparse.Namespace, config_path: Path, *, strategy: str) -> list[str]:
+    policy, active_stream_window = STRATEGIES[strategy]
     command = [
         args.serve_bin,
         "serve",
@@ -141,6 +142,10 @@ def build_server_command(args: argparse.Namespace, config_path: Path) -> list[st
         str(args.port),
         "--deploy-config",
         str(config_path),
+        "--audio-scheduling-policy",
+        policy,
+        "--active-stream-window",
+        str(active_stream_window),
         *args.server_extra_arg,
     ]
     return command
@@ -262,7 +267,7 @@ def running_server(
     run_label: str,
 ):
     """Start a fresh model server for exactly one benchmark run."""
-    server_command = build_server_command(args, config_path)
+    server_command = build_server_command(args, config_path, strategy=strategy)
     print("+", subprocess.list2cmdline(server_command), flush=True)
     if args.dry_run:
         yield
@@ -530,8 +535,8 @@ def main() -> None:
     r_sat: float | None = None
     export_manifest = not manifest_path.exists()
 
-    for strategy, config_name in STRATEGIES.items():
-        config_path = DEPLOY_DIR / config_name
+    for strategy in STRATEGIES:
+        config_path = DEPLOY_DIR / "qwen3_tts_910b4_single.yaml"
         for concurrency in CONCURRENCIES:
             for repeat in range(args.repeats):
                 run_label = f"fixed_c{concurrency}_r{repeat}"

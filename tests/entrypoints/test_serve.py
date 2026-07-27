@@ -31,6 +31,30 @@ def test_serve_parser_accepts_no_async_chunk_and_marks_it_explicit() -> None:
     assert not explicit["async_chunk"]
 
 
+def test_serve_parser_accepts_audio_scheduling_overrides() -> None:
+    parser = TrackingArgumentParser()
+    subparsers = parser.add_subparsers(dest="subcommand")
+    OmniServeCommand().subparser_init(subparsers)
+
+    args = parser.parse_args(
+        [
+            "serve",
+            "fake-model",
+            "--omni",
+            "--audio-scheduling-policy",
+            "liveserve_audio",
+            "--active-stream-window",
+            "0",
+        ]
+    )
+
+    assert args.audio_scheduling_policy == "liveserve_audio"
+    assert args.active_stream_window == 0
+    explicit = args.get_explicit_kwargs_dict()
+    assert explicit["audio_scheduling_policy"] == "liveserve_audio"
+    assert explicit["active_stream_window"] == 0
+
+
 def _make_headless_args(**kwargs) -> TrackingNamespace:
     defaults = {
         "model": "fake-model",

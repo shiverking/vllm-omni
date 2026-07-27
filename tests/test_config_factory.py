@@ -1389,6 +1389,27 @@ class TestCLIOverrideFlow:
             s.runtime_overrides = StageConfigFactory._merge_cli_overrides(s, overrides)
             assert s.runtime_overrides["enforce_eager"] is True
 
+    def test_audio_policy_cli_override_is_redistributed_to_all_stages(self):
+        deploy_path = (
+            Path(__file__).parent.parent / "vllm_omni" / "deploy" / "qwen3_tts_910b4_single.yaml"
+        )
+        with patch.object(StageConfigFactory, "_auto_detect_model_type", return_value=("qwen3_tts", None)):
+            stages = StageConfigFactory.create_from_model(
+                "fake-model",
+                cli_overrides={
+                    "audio_scheduling_policy": "liveserve_audio",
+                    "active_stream_window": 0,
+                },
+                deploy_config_path=str(deploy_path),
+            )
+
+        assert stages is not None
+        for stage in stages:
+            assert stage.yaml_engine_args["audio_scheduling_policy"] == "liveserve_audio"
+            assert stage.yaml_engine_args["active_stream_window"] == 0
+            assert "audio_scheduling_policy" not in stage.runtime_overrides
+            assert "active_stream_window" not in stage.runtime_overrides
+
 
 class TestSentinelDefaultPrecedence:
     """Caller-typed (non-None) values win over YAML; None values fall through
@@ -1580,32 +1601,21 @@ class TestSamplingConstraintsPrecedence:
 
 
 class TestAudioSchedulingConfig:
-    def test_single_910b4_profiles_only_change_scheduling_policy(self):
+    def test_single_910b4_profile_does_not_embed_scheduling_policy(self):
         deploy_dir = Path(__file__).parent.parent / "vllm_omni" / "deploy"
-        profiles = {
-            name: load_deploy_config(deploy_dir / f"qwen3_tts_910b4_single_{name}.yaml")
-            for name in ("legacy", "bounded_k2", "liveserve_audio")
-        }
+        deploy_path = deploy_dir / "qwen3_tts_910b4_single.yaml"
+        raw_config = deploy_path.read_text(encoding="utf-8")
+        profile = load_deploy_config(deploy_path)
 
-        assert profiles["legacy"].audio_scheduling_policy == "legacy"
-        assert profiles["bounded_k2"].audio_scheduling_policy == "bounded_k"
-        assert profiles["bounded_k2"].active_stream_window == 2
-        assert profiles["liveserve_audio"].audio_scheduling_policy == "liveserve_audio"
-
-        reference_stages = profiles["legacy"].stages
-        reference_connectors = profiles["legacy"].connectors
-        reference_edges = profiles["legacy"].edges
-        for profile in profiles.values():
-            assert profile.async_chunk is True
-            assert profile.playback_safe_buffer_ms == 100
-            assert profile.interaction_state_ttl_ms == 500
-            assert profile.stages == reference_stages
-            assert profile.connectors == reference_connectors
-            assert profile.edges == reference_edges
-            assert [stage.devices for stage in profile.stages] == ["0", "0"]
-            assert [stage.max_num_seqs for stage in profile.stages] == [10, 10]
-            assert [stage.gpu_memory_utilization for stage in profile.stages] == [0.3, 0.3]
-            assert [stage.enforce_eager for stage in profile.stages] == [False, True]
+        assert "audio_scheduling_policy:" not in raw_config
+        assert "active_stream_window:" not in raw_config
+        assert profile.async_chunk is True
+        assert profile.playback_safe_buffer_ms == 100
+        assert profile.interaction_state_ttl_ms == 500
+        assert [stage.devices for stage in profile.stages] == ["0", "0"]
+        assert [stage.max_num_seqs for stage in profile.stages] == [10, 10]
+        assert [stage.gpu_memory_utilization for stage in profile.stages] == [0.3, 0.3]
+        assert [stage.enforce_eager for stage in profile.stages] == [False, True]
 
     def test_single_910b4_profile_contains_complete_runtime_tuning(self):
         deploy_path = (
