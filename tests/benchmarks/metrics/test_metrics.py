@@ -101,14 +101,17 @@ def test_useful_audio_throughput_and_realtime_capacity():
     useful = _make_tts_output(100)
     useful.audio_ttfp = 0.2
     useful.audio_rtf = 0.8
+    useful.streaming_audio_rtf = 0.8
     useful.audio_continuity_ok = True
     late = _make_tts_output(100)
     late.audio_ttfp = 1.2
     late.audio_rtf = 0.9
+    late.streaming_audio_rtf = 0.9
     late.audio_continuity_ok = True
     underrun = _make_tts_output(100)
     underrun.audio_ttfp = 0.1
     underrun.audio_rtf = 0.7
+    underrun.streaming_audio_rtf = 0.7
     underrun.audio_continuity_ok = False
 
     metrics, _ = calculate_metrics(
@@ -185,9 +188,14 @@ def test_audio_request_result_schema_timeline_is_opt_in():
         "e2e_latency_s",
         "audio_duration_s",
         "audio_rtf",
+        "streaming_audio_rtf",
         "max_underrun_s",
+        "total_underrun_s",
         "underrun_event_count",
         "continuity_ok",
+        "playback_engine",
+        "startup_buffer_ms",
+        "feedback_interval_ms",
         "feedback_sent_count",
         "feedback_coalesced_count",
         "feedback_failure_count",
@@ -233,6 +241,7 @@ def _make_tts_output(prompt_len: int) -> MixRequestFuncOutput:
     output.itl = []
     output.audio_ttfp = 0.05
     output.audio_rtf = 0.2
+    output.streaming_audio_rtf = 0.2
     output.audio_duration = 5.0
     output.audio_frames = 120000
     output.input_audio_duration = 0.0

@@ -13,7 +13,7 @@ import wave
 from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Literal
+from typing import Any, Callable, Literal
 
 import aiohttp
 import numpy as np
@@ -37,7 +37,6 @@ from vllm.tokenizers import TokenizerLike
 
 logger = init_logger(__name__)
 
-from vllm_omni.benchmarks.audio_continuity import compute_continuity_stats
 from vllm_omni.benchmarks.data_modules.daily_omni_dataset import DailyOmniDataset, DailyOmniSampleRequest
 from vllm_omni.benchmarks.data_modules.random_multi_modal_dataset import OmniRandomMultiModalDataset
 from vllm_omni.benchmarks.data_modules.seed_tts_dataset import (
@@ -49,9 +48,16 @@ from vllm_omni.benchmarks.data_modules.seed_tts_dataset import (
 )
 from vllm_omni.benchmarks.data_modules.sound_effect_dataset import SoundEffectDataset
 from vllm_omni.benchmarks.data_modules.ttsd_dataset import TTSDDataset
+from vllm_omni.benchmarks.gstreamer_player import (
+    CONTINUITY_THRESHOLD_S,
+    FEEDBACK_INTERVAL_S,
+    STARTUP_BUFFER_MS,
+    GStreamerSilentPlayer,
+    PlaybackSnapshot,
+    require_gstreamer,
+)
 from vllm_omni.metrics import definitions as defs
 
-_AUDIO_CONTINUITY_THRESHOLD_ENV = "VLLM_OMNI_BENCH_AUDIO_CONTINUITY_THRESHOLD_S"
 RETURN_STAGE_METRICS_FIELD = "return_stage_metrics"
 _IMAGE_STAGE_METRICS_BACKENDS = frozenset({"openai-image-edits-omni"})
 _PRINT_STAGE = False
@@ -122,29 +128,6 @@ def configure_audio_benchmark(
     _REALTIME_MIN_CONTINUITY = realtime_min_continuity
     _REALTIME_MAX_P90_RTF = realtime_max_p90_rtf
     _ENABLE_PLAYBACK_FEEDBACK = bool(enable_playback_feedback)
-
-
-def _audio_continuity_threshold_s() -> float:
-    """Return the per-request underrun budget (s).
-
-    Read from ``VLLM_OMNI_BENCH_AUDIO_CONTINUITY_THRESHOLD_S`` so users can
-    re-aim the SLO without rebuilding. Defaults to 100 ms - the standard
-    "audible gap" budget for streaming TTS.
-    """
-    raw = os.environ.get(_AUDIO_CONTINUITY_THRESHOLD_ENV)
-    if not raw:
-        return defs.AUDIO_CONTINUITY_DEFAULT_THRESHOLD_S
-    try:
-        value = float(raw)
-    except ValueError:
-        logger.warning(
-            "Invalid %s=%r; using default %.3fs",
-            _AUDIO_CONTINUITY_THRESHOLD_ENV,
-            raw,
-            defs.AUDIO_CONTINUITY_DEFAULT_THRESHOLD_S,
-        )
-        return defs.AUDIO_CONTINUITY_DEFAULT_THRESHOLD_S
-    return max(value, 0.0)
 
 
 get_samples_old = datasets.get_samples
@@ -432,6 +415,7 @@ class MixRequestFuncOutput(RequestFuncOutput):
     audio_duration: float = 0.0
     audio_frames: int = 0
     audio_rtf: float = 0.0
+    streaming_audio_rtf: float = 0.0
     image_count: int = 0
     image_generation_time_ms: float = 0.0
     image_pixels: int = 0
@@ -441,6 +425,7 @@ class MixRequestFuncOutput(RequestFuncOutput):
     #: would have been starved). Populated by the audio-speech backend; ``0.0``
     #: for backends that do not run continuity analysis.
     audio_underrun_s: float = 0.0
+    audio_total_underrun_s: float = 0.0
     #: Whether the request stayed under the continuity threshold (default
     #: 100 ms). Mirrors ``audio_underrun_s <= threshold``.
     audio_continuity_ok: bool = True
@@ -454,6 +439,9 @@ class MixRequestFuncOutput(RequestFuncOutput):
     feedback_failure_count: int = 0
     max_feedback_delay_s: float = 0.0
     playback_buffer_timeline: list[dict[str, float]] | None = None
+    playback_engine: str = "gstreamer"
+    startup_buffer_ms: float = STARTUP_BUFFER_MS
+    feedback_interval_ms: float = FEEDBACK_INTERVAL_S * 1000.0
     #: Raw PCM s16le mono at 24 kHz for Seed-TTS WER: from ``/v1/audio/speech`` stream or
     #: resampled export after ``openai-chat-omni`` audio deltas.
     tts_output_pcm_bytes: bytes | None = None
@@ -1097,18 +1085,23 @@ def _playback_feedback_url(api_url: str) -> str:
     return f"{base}{path}/playback{query}"
 
 
-def _played_audio_ms(*, received_audio_ms: float, first_chunk_time_s: float, now_s: float) -> float:
-    return min(received_audio_ms, max(0.0, now_s - first_chunk_time_s) * 1000.0)
-
-
 class _PlaybackFeedbackPublisher:
     """Coalescing, non-blocking per-request playback feedback publisher."""
 
-    def __init__(self, *, api_url: str, request_id: str, headers: dict[str, str], output: MixRequestFuncOutput):
+    def __init__(
+        self,
+        *,
+        api_url: str,
+        request_id: str,
+        headers: dict[str, str],
+        output: MixRequestFuncOutput,
+        payload_provider: Callable[[], dict[str, Any]],
+    ):
         self.api_url = _playback_feedback_url(api_url)
         self.request_id = request_id
         self.headers = headers
         self.output = output
+        self._payload_provider = payload_provider
         self._event = asyncio.Event()
         self._pending: tuple[dict[str, Any], float, int] | None = None
         self._version = 0
@@ -1137,7 +1130,7 @@ class _PlaybackFeedbackPublisher:
             while True:
                 await self._event.wait()
                 self._event.clear()
-                wait_s = 0.05 - (time.perf_counter() - last_send_s)
+                wait_s = FEEDBACK_INTERVAL_S - (time.perf_counter() - last_send_s)
                 if wait_s > 0:
                     await asyncio.sleep(wait_s)
                 pending = self._pending
@@ -1169,15 +1162,9 @@ class _PlaybackFeedbackPublisher:
                     break
                 if not self._stopping and not self._event.is_set():
                     try:
-                        await asyncio.wait_for(self._event.wait(), timeout=0.05)
+                        await asyncio.wait_for(self._event.wait(), timeout=FEEDBACK_INTERVAL_S)
                     except TimeoutError:
-                        self._version += 1
-                        heartbeat = {
-                            **payload,
-                            "client_timestamp_ms": time.monotonic() * 1000.0,
-                        }
-                        self._pending = heartbeat, time.perf_counter(), self._version
-                        self._event.set()
+                        self.publish(self._payload_provider())
 
 
 async def async_request_openai_audio_speech(
@@ -1217,6 +1204,7 @@ async def async_request_openai_audio_speech(
     output = MixRequestFuncOutput()
     output.prompt_len = request_func_input.prompt_len
     output.request_id = request_id
+    player = GStreamerSilentPlayer()
 
     # PCM format: 16-bit signed, 24 kHz, mono
     sample_rate = 24000
@@ -1228,34 +1216,48 @@ async def async_request_openai_audio_speech(
     total_pcm_bytes = 0
     capture_wer_pcm = _seed_tts_capture_pcm_for_wer() and getattr(request_func_input, "seed_tts_row", False)
     pcm_capture = bytearray() if capture_wer_pcm else None
-    chunk_arrival_times_s: list[float] = []
-    chunk_sizes: list[int] = []
     first_chunk_time_s: float | None = None
+
+    def playback_payload() -> dict[str, Any]:
+        snapshot = player.snapshot()
+        if _SAVE_AUDIO_TIMELINE:
+            if output.playback_buffer_timeline is None:
+                output.playback_buffer_timeline = []
+            output.playback_buffer_timeline.append(
+                {
+                    "time_s": time.perf_counter() - st,
+                    "received_audio_ms": snapshot.received_audio_ms,
+                    "played_audio_ms": snapshot.played_audio_ms,
+                    "playback_buffer_ms": snapshot.playback_buffer_ms,
+                    "max_underrun_ms": snapshot.max_underrun_ms,
+                }
+            )
+        return {
+            "received_audio_ms": snapshot.received_audio_ms,
+            "played_audio_ms": snapshot.played_audio_ms,
+            "first_audio_received": snapshot.received_audio_ms > 0,
+            "finished": False,
+            "aborted": False,
+        }
+
     publisher = (
         _PlaybackFeedbackPublisher(
             api_url=api_url,
             request_id=request_id,
             headers=headers,
             output=output,
+            payload_provider=playback_payload,
         )
         if feedback_enabled
         else None
     )
-    if publisher is not None:
+    if _SAVE_AUDIO_TIMELINE:
         output.playback_buffer_timeline = []
     try:
         async with session.post(url=api_url, json=payload, headers=headers) as response:
             if response.status == 200:
                 if publisher is not None:
-                    publisher.publish(
-                        {
-                            "received_audio_ms": 0.0,
-                            "played_audio_ms": 0.0,
-                            "first_audio_received": False,
-                            "finished": False,
-                            "aborted": False,
-                        }
-                    )
+                    publisher.publish(playback_payload())
                 async for chunk in response.content.iter_any():
                     if not chunk:
                         continue
@@ -1266,8 +1268,7 @@ async def async_request_openai_audio_speech(
                         output.audio_ttfp = timestamp - st
                         first_chunk_time_s = timestamp
                     total_pcm_bytes += len(chunk)
-                    chunk_arrival_times_s.append(timestamp - st)
-                    chunk_sizes.append(len(chunk))
+                    snapshot = player.push_pcm(chunk)
                     if _SAVE_AUDIO_TIMELINE:
                         if output.audio_timeline is None:
                             output.audio_timeline = []
@@ -1280,31 +1281,8 @@ async def async_request_openai_audio_speech(
                         )
                     if pcm_capture is not None:
                         pcm_capture.extend(chunk)
-                    if publisher is not None and first_chunk_time_s is not None:
-                        received_audio_ms = total_pcm_bytes / (sample_rate * sample_width * channels) * 1000.0
-                        played_audio_ms = _played_audio_ms(
-                            received_audio_ms=received_audio_ms,
-                            first_chunk_time_s=first_chunk_time_s,
-                            now_s=timestamp,
-                        )
-                        buffer_ms = received_audio_ms - played_audio_ms
-                        output.playback_buffer_timeline.append(
-                            {
-                                "time_s": timestamp - st,
-                                "received_audio_ms": received_audio_ms,
-                                "played_audio_ms": played_audio_ms,
-                                "playback_buffer_ms": buffer_ms,
-                            }
-                        )
-                        publisher.publish(
-                            {
-                                "received_audio_ms": received_audio_ms,
-                                "played_audio_ms": played_audio_ms,
-                                "first_audio_received": True,
-                                "finished": False,
-                                "aborted": False,
-                            }
-                        )
+                    if publisher is not None:
+                        publisher.publish(playback_payload())
 
                 end_time = time.perf_counter()
                 output.latency = end_time - st
@@ -1314,21 +1292,12 @@ async def async_request_openai_audio_speech(
                 output.audio_frames = total_samples
                 if output.audio_duration > 0:
                     output.audio_rtf = output.latency / output.audio_duration
+                    output.streaming_audio_rtf = max(0.0, output.latency - output.audio_ttfp) / output.audio_duration
                 else:
                     output.audio_rtf = 0
+                    output.streaming_audio_rtf = 0
                     logger.warning("Audio duration is zero")
 
-                continuity = compute_continuity_stats(
-                    chunk_arrival_times_s=chunk_arrival_times_s,
-                    chunk_bytes=chunk_sizes,
-                    sample_rate=sample_rate,
-                    sample_width=sample_width,
-                    channels=channels,
-                    threshold_s=_audio_continuity_threshold_s(),
-                )
-                output.audio_underrun_s = continuity.max_underrun_s
-                output.audio_continuity_ok = continuity.is_continuous
-                output.audio_underrun_event_count = continuity.underrun_event_count
                 if pcm_capture is not None and pcm_capture:
                     output.tts_output_pcm_bytes = bytes(pcm_capture)
                 elif capture_wer_pcm:
@@ -1354,27 +1323,28 @@ async def async_request_openai_audio_speech(
         output.error = traceback.format_exc()
         logger.error(f"ERROR: send request failed, reason is: {output.error}")
     finally:
+        try:
+            final_snapshot = player.finish() if output.success else player.abort()
+            output.audio_underrun_s = final_snapshot.max_underrun_ms / 1000.0
+            output.audio_total_underrun_s = final_snapshot.total_underrun_ms / 1000.0
+            output.audio_underrun_event_count = final_snapshot.underrun_event_count
+            output.audio_continuity_ok = output.audio_underrun_s <= CONTINUITY_THRESHOLD_S
+        except Exception:
+            output.success = False
+            output.error = traceback.format_exc()
+            logger.error("Failed to finalize GStreamer playback", exc_info=True)
+            final_snapshot = PlaybackSnapshot(0, 0, 0, False, 0, 0, 0)
         if publisher is not None:
-            now_s = time.perf_counter()
-            received_audio_ms = total_pcm_bytes / (sample_rate * sample_width * channels) * 1000.0
-            played_audio_ms = (
-                _played_audio_ms(
-                    received_audio_ms=received_audio_ms,
-                    first_chunk_time_s=first_chunk_time_s,
-                    now_s=now_s,
-                )
-                if first_chunk_time_s is not None
-                else 0.0
-            )
             await publisher.close(
                 {
-                    "received_audio_ms": received_audio_ms,
-                    "played_audio_ms": played_audio_ms,
-                    "first_audio_received": first_chunk_time_s is not None,
+                    "received_audio_ms": final_snapshot.received_audio_ms,
+                    "played_audio_ms": final_snapshot.played_audio_ms,
+                    "first_audio_received": final_snapshot.received_audio_ms > 0,
                     "finished": output.success,
                     "aborted": not output.success,
                 }
             )
+        player.close()
 
     if pbar:
         pbar.update(1)
@@ -1420,7 +1390,15 @@ def check_goodput_args(args: Any) -> dict[str, float]:
     if not getattr(args, "goodput", None):
         return {}
     config = serve.parse_goodput(args.goodput)
-    valid_names = {"ttft", "tpot", "e2el", "audio_ttfp", "audio_rtf", "audio_continuity"}
+    valid_names = {
+        "ttft",
+        "tpot",
+        "e2el",
+        "audio_ttfp",
+        "audio_rtf",
+        "streaming_audio_rtf",
+        "audio_continuity",
+    }
     for name, value in config.items():
         if name not in valid_names:
             raise ValueError(f"Invalid goodput metric {name!r}; expected one of {sorted(valid_names)}")
@@ -1446,9 +1424,14 @@ def build_audio_request_results(
             "e2e_latency_s": output.latency,
             "audio_duration_s": output.audio_duration,
             "audio_rtf": output.audio_rtf,
+            "streaming_audio_rtf": output.streaming_audio_rtf,
             "max_underrun_s": output.audio_underrun_s,
+            "total_underrun_s": output.audio_total_underrun_s,
             "underrun_event_count": output.audio_underrun_event_count,
             "continuity_ok": output.audio_continuity_ok,
+            "playback_engine": output.playback_engine,
+            "startup_buffer_ms": output.startup_buffer_ms,
+            "feedback_interval_ms": output.feedback_interval_ms,
             "feedback_sent_count": output.feedback_sent_count,
             "feedback_coalesced_count": output.feedback_coalesced_count,
             "feedback_failure_count": output.feedback_failure_count,
@@ -1776,6 +1759,14 @@ async def benchmark(
             defs.TOTAL_AUDIO_FRAMES: getattr(metrics, defs.TOTAL_AUDIO_FRAMES),
             defs.AUDIO_THROUGHPUT: getattr(metrics, defs.AUDIO_THROUGHPUT),
             defs.AUDIO_CONTINUITY_OK_RATE: getattr(metrics, defs.AUDIO_CONTINUITY_OK_RATE),
+            defs.MEAN_STREAMING_AUDIO_RTF: getattr(metrics, defs.MEAN_STREAMING_AUDIO_RTF),
+            defs.MEDIAN_STREAMING_AUDIO_RTF: getattr(metrics, defs.MEDIAN_STREAMING_AUDIO_RTF),
+            defs.STD_STREAMING_AUDIO_RTF: getattr(metrics, defs.STD_STREAMING_AUDIO_RTF),
+            defs.MIN_STREAMING_AUDIO_RTF: getattr(metrics, defs.MIN_STREAMING_AUDIO_RTF),
+            defs.MAX_STREAMING_AUDIO_RTF: getattr(metrics, defs.MAX_STREAMING_AUDIO_RTF),
+            defs.PERCENTILES_STREAMING_AUDIO_RTF: getattr(metrics, defs.PERCENTILES_STREAMING_AUDIO_RTF),
+            defs.STREAMING_AUDIO_RTF_SPREAD: getattr(metrics, defs.STREAMING_AUDIO_RTF_SPREAD),
+            defs.MEAN_AUDIO_TOTAL_UNDERRUN_S: getattr(metrics, defs.MEAN_AUDIO_TOTAL_UNDERRUN_S),
             defs.USEFUL_REQUEST_COUNT: getattr(metrics, defs.USEFUL_REQUEST_COUNT),
             defs.USEFUL_REQUEST_THROUGHPUT: getattr(metrics, defs.USEFUL_REQUEST_THROUGHPUT),
             defs.REALTIME_CAPACITY_PASS: getattr(metrics, defs.REALTIME_CAPACITY_PASS),

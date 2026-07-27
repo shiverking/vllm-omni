@@ -280,24 +280,27 @@ def observe_audio_streaming_finalize(
 ) -> None:
     """Emit audio_underrun_s + audio_continuity_ok_total at request end.
 
-    Reuses the math from ``vllm_omni.benchmarks.audio_continuity`` so the
-    server-side and bench-side definitions stay aligned. Caller is responsible
-    for collecting per-chunk arrival timestamps and byte sizes during the
-    streaming response.
+    This server-side Prometheus estimate has no access to the client player;
+    it therefore tracks the largest individual buffer-empty interval without
+    carrying one underrun deficit into later chunks.
     """
     if replica_id is None or not chunk_arrival_times_s:
         return
-    # Local import to keep the bench module optional at import time.
-    from vllm_omni.benchmarks.audio_continuity import compute_continuity_stats
-
-    stats = compute_continuity_stats(
-        chunk_arrival_times_s=chunk_arrival_times_s,
-        chunk_bytes=chunk_bytes,
-        sample_rate=sample_rate,
-        threshold_s=threshold_s,
-    )
+    bytes_per_s = sample_rate * 2
+    if bytes_per_s <= 0 or len(chunk_arrival_times_s) != len(chunk_bytes):
+        return
+    buffer_s = 0.0
+    max_underrun_s = 0.0
+    previous_arrival = chunk_arrival_times_s[0]
+    for index, (arrival, size) in enumerate(zip(chunk_arrival_times_s, chunk_bytes)):
+        if index > 0:
+            elapsed = max(0.0, arrival - previous_arrival)
+            max_underrun_s = max(max_underrun_s, max(0.0, elapsed - buffer_s))
+            buffer_s = max(0.0, buffer_s - elapsed)
+        buffer_s += size / bytes_per_s
+        previous_arrival = arrival
     stage_label = str(stage_id)
     replica_label = str(replica_id)
-    mod_metrics.observe_audio_underrun(stage_label, replica_label, stats.max_underrun_s)
-    if stats.is_continuous:
+    mod_metrics.observe_audio_underrun(stage_label, replica_label, max_underrun_s)
+    if max_underrun_s <= threshold_s:
         mod_metrics.inc_audio_continuity_ok(stage_label, replica_label, int(threshold_s * 1000))

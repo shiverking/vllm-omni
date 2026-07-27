@@ -15,9 +15,12 @@ from vllm_omni.benchmarks.patch.patch import (
     set_print_stage,
     should_request_stage_metrics,
 )
+from vllm_omni.benchmarks.gstreamer_player import require_gstreamer
 
 
 def main(args: argparse.Namespace) -> dict[str, Any]:
+    if getattr(args, "backend", None) == "openai-audio-speech":
+        require_gstreamer()
     if getattr(args, "seed_tts_wer_eval", False):
         os.environ["SEED_TTS_WER_EVAL"] = "1"
     if getattr(args, "seed_tts_wer_save_items", False):

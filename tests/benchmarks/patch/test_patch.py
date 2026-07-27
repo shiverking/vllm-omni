@@ -14,7 +14,6 @@ from vllm.benchmarks.lib.endpoint_request_func import RequestFuncInput
 
 from vllm_omni.benchmarks.patch.patch import (
     MixRequestFuncOutput,
-    _played_audio_ms,
     async_request_openai_audio_speech,
     async_request_openai_chat_omni_completions,
     load_arrival_trace,
@@ -23,6 +22,33 @@ from vllm_omni.benchmarks.patch.patch import (
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.benchmark, pytest.mark.cpu]
+
+
+@pytest.fixture(autouse=True)
+def _fake_gstreamer_player(monkeypatch):
+    import vllm_omni.benchmarks.patch.patch as patch_mod
+    from vllm_omni.benchmarks.gstreamer_player import PlaybackSnapshot
+
+    class FakePlayer:
+        def __init__(self):
+            self.received = 0.0
+
+        def push_pcm(self, data):
+            self.received += len(data) / 48.0
+            return self.snapshot()
+
+        def snapshot(self):
+            return PlaybackSnapshot(self.received, 0.0, self.received, self.received >= 100, 0, 0, 0)
+
+        def finish(self):
+            return self.snapshot()
+
+        abort = finish
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr(patch_mod, "GStreamerSilentPlayer", FakePlayer)
 
 
 def test_load_and_replay_arrival_trace(tmp_path):
@@ -61,11 +87,6 @@ class MockResponse:
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         pass
-
-
-def test_played_audio_is_capped_by_received_audio():
-    assert _played_audio_ms(received_audio_ms=500, first_chunk_time_s=10, now_s=10.2) == pytest.approx(200)
-    assert _played_audio_ms(received_audio_ms=100, first_chunk_time_s=10, now_s=10.2) == 100
 
 
 def test_warmup_failure_is_not_reported_as_completed():

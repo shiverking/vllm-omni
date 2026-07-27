@@ -26,6 +26,13 @@ _MULTIMODAL_BENCHMARK_FIELDS = [
     (defs.MEDIAN_AUDIO_RTF, float, field(default=0.0)),
     (defs.STD_AUDIO_RTF, float, field(default=0.0)),
     (defs.PERCENTILES_AUDIO_RTF, _PERCENTILE_ROWS_TYPE, field(default=None)),
+    (defs.MEAN_STREAMING_AUDIO_RTF, float, field(default=0.0)),
+    (defs.MEDIAN_STREAMING_AUDIO_RTF, float, field(default=0.0)),
+    (defs.STD_STREAMING_AUDIO_RTF, float, field(default=0.0)),
+    (defs.MIN_STREAMING_AUDIO_RTF, float, field(default=0.0)),
+    (defs.MAX_STREAMING_AUDIO_RTF, float, field(default=0.0)),
+    (defs.PERCENTILES_STREAMING_AUDIO_RTF, _PERCENTILE_ROWS_TYPE, field(default=None)),
+    (defs.STREAMING_AUDIO_RTF_SPREAD, float, field(default=0.0)),
     (defs.MEAN_AUDIO_DURATION_S, float, field(default=0.0)),
     (defs.MEDIAN_AUDIO_DURATION_S, float, field(default=0.0)),
     (defs.STD_AUDIO_DURATION_S, float, field(default=0.0)),
@@ -34,6 +41,7 @@ _MULTIMODAL_BENCHMARK_FIELDS = [
     (defs.MEDIAN_AUDIO_UNDERRUN_S, float, field(default=0.0)),
     (defs.STD_AUDIO_UNDERRUN_S, float, field(default=0.0)),
     (defs.PERCENTILES_AUDIO_UNDERRUN_S, _PERCENTILE_ROWS_TYPE, field(default=None)),
+    (defs.MEAN_AUDIO_TOTAL_UNDERRUN_S, float, field(default=0.0)),
     (defs.AUDIO_CONTINUITY_OK_RATE, float, field(default=1.0)),
     (defs.USEFUL_REQUEST_COUNT, int, field(default=0)),
     (defs.USEFUL_REQUEST_THROUGHPUT, float, field(default=0.0)),
@@ -271,6 +279,14 @@ def print_audio_metrics(selected_percentile_metrics, metrics: MultiModalsBenchma
     print(
         "{:<40} {:<10.2f}".format("Total audio duration generated(s):", getattr(metrics, defs.TOTAL_AUDIO_DURATION_S))
     )
+    print("-" * 17 + "Streaming Real Time Factor" + "-" * 7)
+    print("{:<40} {:<10.3f}".format("Min STREAMING_AUDIO_RTF:", getattr(metrics, defs.MIN_STREAMING_AUDIO_RTF)))
+    print("{:<40} {:<10.3f}".format("Mean STREAMING_AUDIO_RTF:", getattr(metrics, defs.MEAN_STREAMING_AUDIO_RTF)))
+    for percentile, value in getattr(metrics, defs.PERCENTILES_STREAMING_AUDIO_RTF) or []:
+        print("{:<40} {:<10.3f}".format(f"P{percentile:g} STREAMING_AUDIO_RTF:", value))
+    print("{:<40} {:<10.3f}".format("Max STREAMING_AUDIO_RTF:", getattr(metrics, defs.MAX_STREAMING_AUDIO_RTF)))
+    print("{:<40} {:<10.3f}".format("P90-P10 STREAMING_AUDIO_RTF spread:", getattr(metrics, defs.STREAMING_AUDIO_RTF_SPREAD)))
+    print("{:<40} {:<10.3f}".format("Mean total underrun (s):", getattr(metrics, defs.MEAN_AUDIO_TOTAL_UNDERRUN_S)))
     print("{:<40} {:<10}".format("Total audio frames generated:", getattr(metrics, defs.TOTAL_AUDIO_FRAMES)))
     print("{:<40} {:<10.2f}".format("Audio throughput(audio duration/s):", getattr(metrics, defs.AUDIO_THROUGHPUT)))
     print(
@@ -755,6 +771,7 @@ def calculate_metrics(
     e2els: list[float] = []
     audio_ttfps: list[float] = []
     audio_rtfs: list[float] = []
+    streaming_audio_rtfs: list[float] = []
     audio_duration: list[float] = []
     audio_frames: list[int] = []
     image_generation_times_ms: list[float] = []
@@ -762,6 +779,7 @@ def calculate_metrics(
     total_images = 0
     total_image_pixels = 0
     audio_underruns: list[float] = []
+    audio_total_underruns: list[float] = []
     audio_continuity_ok: list[bool] = []
     input_audio_duration = 0.0
     useful_completed = 0
@@ -795,6 +813,7 @@ def calculate_metrics(
             ttfts.append(outputs[i].ttft)
             audio_ttfps.append(getattr(outputs[i], defs.AUDIO_TTFP, 0.0))
             audio_rtfs.append(getattr(outputs[i], defs.AUDIO_RTF, 0.0))
+            streaming_audio_rtfs.append(getattr(outputs[i], defs.STREAMING_AUDIO_RTF, 0.0))
             audio_duration.append(getattr(outputs[i], defs.AUDIO_DURATION, 0.0))
             audio_frames.append(getattr(outputs[i], defs.AUDIO_FRAMES, 0.0))
             image_count = int(getattr(outputs[i], defs.IMAGE_COUNT, 0) or 0)
@@ -807,6 +826,7 @@ def calculate_metrics(
             if denoise_step_latency_ms > 0:
                 denoise_step_latencies_ms.append(denoise_step_latency_ms)
             audio_underruns.append(getattr(outputs[i], f"{defs.AUDIO_UNDERRUN}_s", 0.0))
+            audio_total_underruns.append(getattr(outputs[i], "audio_total_underrun_s", 0.0))
             audio_continuity_ok.append(bool(getattr(outputs[i], defs.AUDIO_CONTINUITY_OK, True)))
             is_useful = (
                 getattr(outputs[i], defs.AUDIO_DURATION, 0.0) > 0
@@ -814,7 +834,10 @@ def calculate_metrics(
                 and bool(getattr(outputs[i], defs.AUDIO_CONTINUITY_OK, True))
             )
             if useful_require_audio_rtf:
-                is_useful = is_useful and getattr(outputs[i], defs.AUDIO_RTF, 0.0) <= useful_audio_rtf_max
+                is_useful = (
+                    is_useful
+                    and getattr(outputs[i], defs.STREAMING_AUDIO_RTF, 0.0) <= useful_audio_rtf_max
+                )
             if is_useful:
                 useful_completed += 1
             e2els.append(outputs[i].latency)
@@ -843,6 +866,10 @@ def calculate_metrics(
                 is_good_req &= output.latency <= goodput_config_dict["e2el"] / MILLISECONDS_TO_SECONDS_CONVERSION
             if "audio_rtf" in goodput_config_dict:
                 is_good_req &= getattr(output, defs.AUDIO_RTF, 0.0) <= goodput_config_dict["audio_rtf"]
+            if "streaming_audio_rtf" in goodput_config_dict:
+                is_good_req &= getattr(output, defs.STREAMING_AUDIO_RTF, 0.0) <= goodput_config_dict[
+                    "streaming_audio_rtf"
+                ]
             if "audio_continuity" in goodput_config_dict:
                 required = bool(goodput_config_dict["audio_continuity"])
                 is_good_req &= bool(getattr(output, defs.AUDIO_CONTINUITY_OK, True)) is required
@@ -968,6 +995,19 @@ def calculate_metrics(
             defs.STD_AUDIO_RTF: np.std(audio_rtfs or 0),
             defs.MEDIAN_AUDIO_RTF: np.median(audio_rtfs or 0),
             defs.PERCENTILES_AUDIO_RTF: [(p, np.percentile(audio_rtfs or 0, p)) for p in selected_percentiles],
+            defs.MEAN_STREAMING_AUDIO_RTF: np.mean(streaming_audio_rtfs or 0),
+            defs.MEDIAN_STREAMING_AUDIO_RTF: np.median(streaming_audio_rtfs or 0),
+            defs.STD_STREAMING_AUDIO_RTF: np.std(streaming_audio_rtfs or 0),
+            defs.MIN_STREAMING_AUDIO_RTF: np.min(streaming_audio_rtfs or 0),
+            defs.MAX_STREAMING_AUDIO_RTF: np.max(streaming_audio_rtfs or 0),
+            defs.PERCENTILES_STREAMING_AUDIO_RTF: [
+                (p, np.percentile(streaming_audio_rtfs or 0, p)) for p in selected_percentiles
+            ],
+            defs.STREAMING_AUDIO_RTF_SPREAD: (
+                float(np.percentile(streaming_audio_rtfs, 90) - np.percentile(streaming_audio_rtfs, 10))
+                if streaming_audio_rtfs
+                else 0.0
+            ),
             defs.TOTAL_IMAGES: total_images,
             defs.IMAGE_THROUGHPUT: total_images / dur_s,
             defs.AVERAGE_PIXELS_PER_IMAGE: (total_image_pixels / total_images) if total_images > 0 else 0.0,
@@ -984,6 +1024,7 @@ def calculate_metrics(
             defs.PERCENTILES_AUDIO_UNDERRUN_S: [
                 (p, np.percentile(audio_underruns or 0, p)) for p in selected_percentiles
             ],
+            defs.MEAN_AUDIO_TOTAL_UNDERRUN_S: np.mean(audio_total_underruns or 0),
             defs.AUDIO_CONTINUITY_OK_RATE: (
                 (sum(audio_continuity_ok) / len(audio_continuity_ok)) if audio_continuity_ok else 1.0
             ),
@@ -992,7 +1033,7 @@ def calculate_metrics(
             defs.REALTIME_CAPACITY_PASS: bool(
                 any(duration > 0 for duration in audio_duration)
                 and np.percentile(
-                    [rtf for rtf, duration in zip(audio_rtfs, audio_duration) if duration > 0], 90
+                    [rtf for rtf, duration in zip(streaming_audio_rtfs, audio_duration) if duration > 0], 90
                 )
                 <= realtime_max_p90_rtf
                 and (sum(audio_continuity_ok) / len(audio_continuity_ok)) >= realtime_min_continuity
