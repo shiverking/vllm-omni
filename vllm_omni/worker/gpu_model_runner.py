@@ -1651,7 +1651,16 @@ class OmniGPUModelRunner(GPUModelRunner):
                 self._sync_local_stage_payloads()
 
         if hasattr(self.model, "has_preprocess") and self.model.has_preprocess:
-            preprocess_device = input_ids.device if input_ids is not None else inputs_embeds.device
+            # Prompt-embed and multimodal forward paths intentionally pass
+            # ``input_ids=None`` to the model, but Omni preprocess hooks still
+            # need the scheduled token ids for span sizing, decode embedding,
+            # and bookkeeping. Keep those ids separate from the model-forward
+            # input so preprocessing does not accidentally re-enable the token
+            # input path.
+            preprocess_input_ids = (
+                input_ids if input_ids is not None else self.input_ids.gpu[:num_input_tokens]
+            )
+            preprocess_device = preprocess_input_ids.device
             self._maybe_run_batch_preprocess(self.input_batch.req_ids, preprocess_device)
 
             # Overlay custom prompt_embeds per request for the prompt portion;
@@ -1669,21 +1678,27 @@ class OmniGPUModelRunner(GPUModelRunner):
                 req_ids_b = [item[0] for item in decode_batch_items]
                 start_offsets_b = [item[1] for item in decode_batch_items]
                 req_infos_b = [item[2] for item in decode_batch_items]
-                ids_b = torch.stack([input_ids[offset : offset + 1].reshape(-1)[0] for offset in start_offsets_b])
+                ids_b = torch.stack(
+                    [preprocess_input_ids[offset : offset + 1].reshape(-1)[0] for offset in start_offsets_b]
+                )
                 req_input_ids, req_embeds, last_talker_hidden, text_step, updates = batch_decode_preprocess(
                     input_ids=ids_b,
                     req_infos=req_infos_b,
                 )
                 if inputs_embeds is None:
                     inputs_embeds = torch.empty(
-                        (input_ids.shape[0], req_embeds.shape[-1]),
+                        (preprocess_input_ids.shape[0], req_embeds.shape[-1]),
                         device=req_embeds.device,
                         dtype=req_embeds.dtype,
                     )
 
                 offsets_t = torch.tensor(start_offsets_b, device=req_embeds.device, dtype=torch.long)
                 inputs_embeds.index_copy_(0, offsets_t, req_embeds)
-                input_ids.index_copy_(0, offsets_t, req_input_ids.reshape(-1).to(dtype=input_ids.dtype))
+                preprocess_input_ids.index_copy_(
+                    0,
+                    offsets_t,
+                    req_input_ids.reshape(-1).to(dtype=preprocess_input_ids.dtype),
+                )
 
                 dst = slice(len(decode_req_ids), len(decode_req_ids) + len(req_ids_b))
                 self.talker_mtp_input_ids.gpu[dst].copy_(req_input_ids.reshape(-1))
@@ -1727,11 +1742,11 @@ class OmniGPUModelRunner(GPUModelRunner):
 
                 embed_slice = inputs_embeds[s:e] if inputs_embeds is not None else None
                 req_input_ids, req_embeds, update_dict = self.model.preprocess(
-                    input_ids=input_ids[s:e], input_embeds=embed_slice, **req_infos
+                    input_ids=preprocess_input_ids[s:e], input_embeds=embed_slice, **req_infos
                 )
                 if inputs_embeds is None:
                     inputs_embeds = torch.empty(
-                        (input_ids.shape[0], req_embeds.shape[-1]),
+                        (preprocess_input_ids.shape[0], req_embeds.shape[-1]),
                         device=req_embeds.device,
                         dtype=req_embeds.dtype,
                     )
@@ -1753,7 +1768,7 @@ class OmniGPUModelRunner(GPUModelRunner):
                 seg_len = min(span_len, req_embeds.shape[0])
                 inputs_embeds[s : s + seg_len] = req_embeds[:seg_len]
                 if isinstance(req_input_ids, torch.Tensor) and req_input_ids.numel() == seg_len:
-                    input_ids[s : s + seg_len] = req_input_ids
+                    preprocess_input_ids[s : s + seg_len] = req_input_ids
 
             flush_decode_batch()
 
