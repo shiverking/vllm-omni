@@ -477,12 +477,13 @@ class CodePredictorWrapper(nn.Module):
         prefix_graph_cfg = self._stage_connector_extra_config(vllm_config)
         prefix_graphs_requested = self._parse_bool_config(prefix_graph_cfg.get("code_predictor_prefix_graphs"))
         is_npu = current_omni_platform.is_npu()
-        self._prefix_graphs_enabled = prefix_graphs_requested and wrapper_config.use_cuda_graphs and not is_npu
+        self._is_npu = is_npu
+        self._prefix_graphs_enabled = prefix_graphs_requested and wrapper_config.use_cuda_graphs
         if prefix_graphs_requested and not self._prefix_graphs_enabled:
-            logger.info_once(
-                "code_predictor: prefix CUDA graphs requested but disabled because use_cuda_graphs=%s is_npu=%s",
-                wrapper_config.use_cuda_graphs,
-                is_npu,
+            print(
+                "[Qwen3-TTS][prefix graph] requested but disabled "
+                f"use_device_graphs={wrapper_config.use_cuda_graphs} is_npu={is_npu}",
+                flush=True,
             )
         self._prefix_graph_buckets = self._parse_positive_int_set(
             prefix_graph_cfg.get("code_predictor_prefix_graph_buckets")
@@ -490,6 +491,14 @@ class CodePredictorWrapper(nn.Module):
         self._prefix_graph_seq_lens = self._parse_positive_int_set(
             prefix_graph_cfg.get("code_predictor_prefix_graph_seq_lens")
         )
+        self._printed_short_prefix_seq_lens: set[int] = set()
+        if is_npu and self._prefix_graphs_enabled:
+            print(
+                "[Qwen3-TTS][NPU prefix graph] enabled "
+                f"buckets={sorted(self._prefix_graph_buckets) if self._prefix_graph_buckets else 'all'} "
+                f"seq_lens={self._prefix_seq_lens(self._num_groups + 1)}",
+                flush=True,
+            )
 
     def get_input_embeddings(self) -> nn.ModuleList:
         return self.model.get_input_embeddings()
@@ -752,18 +761,58 @@ class CodePredictorWrapper(nn.Module):
         max_seq = self._num_groups + 1
         proj_buf = self._proj_buf
         pool = torch.npu.graph_pool_handle()
+        prefix_graph_keys: list[tuple[int, int]] = []
+        full_graph_keys: list[int] = []
 
-        for bsz in self._bucket_sizes:
-            static_input = proj_buf[:bsz, :max_seq, :]
-            pos_ids = self._bucket_pos_ids[bsz]
+        if self._prefix_graphs_enabled:
+            prefix_seq_lens = self._prefix_seq_lens(max_seq)
+            needs_full_graph = set(prefix_seq_lens) != set(range(2, max_seq))
+            for bsz in self._bucket_sizes:
+                capture_prefixes = not self._prefix_graph_buckets or bsz in self._prefix_graph_buckets
+                if not capture_prefixes or needs_full_graph:
+                    static_input = proj_buf[:bsz, :max_seq, :]
+                    pos_ids = self._bucket_pos_ids[bsz]
 
-            g = torch.npu.NPUGraph()
-            with torch.npu.graph(g, pool=pool):
-                static_output = self._compiled_model_fwd(static_input, pos_ids)
+                    g = torch.npu.NPUGraph()
+                    with torch.npu.graph(g, pool=pool):
+                        static_output = self._compiled_model_fwd(static_input, pos_ids)
 
-            self._device_graphs[bsz] = (g, static_output)
+                    self._device_graphs[bsz] = (g, static_output)
+                    full_graph_keys.append(bsz)
 
-        logger.info("code_predictor: captured NPU graphs for buckets %s", self._bucket_sizes)
+                if capture_prefixes:
+                    for seq_len in prefix_seq_lens:
+                        static_input = proj_buf[:bsz, :seq_len, :]
+                        pos_ids = self._bucket_pos_ids[(bsz, seq_len)]
+
+                        g = torch.npu.NPUGraph()
+                        with torch.npu.graph(g, pool=pool):
+                            static_output = self._compiled_model_fwd(static_input, pos_ids)
+
+                        graph_key = (bsz, seq_len)
+                        self._device_graphs[graph_key] = (g, static_output)
+                        prefix_graph_keys.append(graph_key)
+        else:
+            for bsz in self._bucket_sizes:
+                static_input = proj_buf[:bsz, :max_seq, :]
+                pos_ids = self._bucket_pos_ids[bsz]
+
+                g = torch.npu.NPUGraph()
+                with torch.npu.graph(g, pool=pool):
+                    static_output = self._compiled_model_fwd(static_input, pos_ids)
+
+                self._device_graphs[bsz] = (g, static_output)
+                full_graph_keys.append(bsz)
+
+        if self._prefix_graphs_enabled:
+            print(
+                "[Qwen3-TTS][NPU prefix graph] capture complete "
+                f"prefix_keys={sorted(prefix_graph_keys)} "
+                f"full_fallback_keys={sorted(full_graph_keys)}",
+                flush=True,
+            )
+        else:
+            logger.info("code_predictor: captured NPU graphs for buckets %s", self._bucket_sizes)
 
     # ------------------------------------------------------------------
     #  Forward -- re-prefill + inline sampling
@@ -842,6 +891,15 @@ class CodePredictorWrapper(nn.Module):
                 if prefix_key in self._device_graphs:
                     graph_key = prefix_key
                     seq_len = step + 1
+                    if self._is_npu and seq_len not in self._printed_short_prefix_seq_lens:
+                        print(
+                            "[Qwen3-TTS][NPU prefix graph] short prefix active "
+                            f"batch_bucket={padded_bsz} "
+                            f"seq_len={seq_len} "
+                            f"full_seq_len={max_seq}",
+                            flush=True,
+                        )
+                        self._printed_short_prefix_seq_lens.add(seq_len)
             pos_ids = self._bucket_pos_ids.get(graph_key)
             if pos_ids is None:
                 pos_ids = (

@@ -15,6 +15,7 @@ import importlib.util
 import os
 import sys
 import types
+from contextlib import nullcontext
 
 import pytest
 import torch
@@ -163,6 +164,71 @@ def _make_vllm_config(mocker: MockerFixture, max_num_seqs: int = 4):
     vllm_config = mocker.MagicMock()
     vllm_config.scheduler_config.max_num_seqs = max_num_seqs
     return vllm_config
+
+
+class _FakeNPUGraph:
+    def __init__(self) -> None:
+        self.replay_count = 0
+
+    def replay(self) -> None:
+        self.replay_count += 1
+
+
+class _FakeNPU:
+    def __init__(self) -> None:
+        self.graphs: list[_FakeNPUGraph] = []
+
+    @staticmethod
+    def graph_pool_handle():
+        return object()
+
+    def NPUGraph(self) -> _FakeNPUGraph:
+        graph = _FakeNPUGraph()
+        self.graphs.append(graph)
+        return graph
+
+    @staticmethod
+    def graph(_graph, *, pool):
+        assert pool is not None
+        return nullcontext()
+
+
+def _make_npu_prefix_wrapper(
+    mocker: MockerFixture,
+    loaded_target_classes,
+    *,
+    prefix_graphs: bool = True,
+    prefix_buckets: list[int] | None = None,
+    prefix_seq_lens: list[int] | None = None,
+):
+    common_mod = sys.modules["vllm_omni.model_executor.models.common.qwen3_code_predictor"]
+    mocker.patch.object(common_mod.current_omni_platform, "is_npu", return_value=True)
+
+    cp_config, _ = _make_tiny_config(loaded_target_classes)
+    vllm_config = _make_vllm_config(mocker, max_num_seqs=2)
+    vllm_config.model_config.stage_connector_config = {
+        "extra": {
+            "code_predictor_prefix_graphs": prefix_graphs,
+            "code_predictor_prefix_graph_buckets": prefix_buckets or [],
+            "code_predictor_prefix_graph_seq_lens": prefix_seq_lens or [],
+        }
+    }
+    wrapper = common_mod.CodePredictorWrapper(
+        vllm_config=vllm_config,
+        cp_config=cp_config,
+        wrapper_config=common_mod.CodePredictorWrapperConfig(use_cuda_graphs=True),
+    )
+    wrapper._model_dtype = next(wrapper.model.parameters()).dtype
+    wrapper._test_forward_seq_lens = []
+
+    def _recording_forward(hidden_states, _position_ids):
+        wrapper._test_forward_seq_lens.append(int(hidden_states.shape[1]))
+        return hidden_states.clone()
+
+    wrapper._compiled_model_fwd = _recording_forward
+    wrapper._lm_heads_list = list(wrapper.lm_head)
+    wrapper._codec_embeds_list = list(wrapper.model.codec_embedding)
+    return wrapper
 
 
 class TestCodePredictorDtypeAlignment:
@@ -457,3 +523,127 @@ class TestCodePredictorWrapperConfig:
             wrapper_config=common_mod.CodePredictorWrapperConfig(use_cuda_graphs=True),
         )
         assert graph_wrapper._prefix_graphs_enabled is True
+
+    def test_npu_prefix_graph_config_can_be_enabled(
+        self,
+        mocker: MockerFixture,
+        loaded_target_classes,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        wrapper = _make_npu_prefix_wrapper(
+            mocker,
+            loaded_target_classes,
+            prefix_buckets=[2],
+            prefix_seq_lens=[2, 3, 4],
+        )
+
+        assert wrapper._prefix_graphs_enabled is True
+        assert wrapper._prefix_graph_buckets == {2}
+        assert wrapper._prefix_graph_seq_lens == {2, 3, 4}
+        assert (
+            "[Qwen3-TTS][NPU prefix graph] enabled buckets=[2] seq_lens=[2, 3, 4]" in capsys.readouterr().out
+        )
+
+        disabled_wrapper = _make_npu_prefix_wrapper(
+            mocker,
+            loaded_target_classes,
+            prefix_graphs=False,
+            prefix_buckets=[2],
+            prefix_seq_lens=[2, 3, 4],
+        )
+        assert disabled_wrapper._prefix_graphs_enabled is False
+
+    def test_npu_prefix_graph_capture_and_short_prefix_routing(
+        self,
+        mocker: MockerFixture,
+        loaded_target_classes,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        wrapper = _make_npu_prefix_wrapper(
+            mocker,
+            loaded_target_classes,
+            prefix_buckets=[2],
+            prefix_seq_lens=[2, 3, 4],
+        )
+        fake_npu = _FakeNPU()
+        mocker.patch.object(torch, "npu", fake_npu, create=True)
+
+        wrapper._warmup_buckets()
+        wrapper._test_forward_seq_lens.clear()
+        wrapper._capture_npu_graphs()
+
+        assert wrapper._test_forward_seq_lens == [5, 2, 3, 4]
+        assert set(wrapper._device_graphs) == {
+            1,
+            (2, 2),
+            (2, 3),
+            (2, 4),
+        }
+
+        bsz = 2
+        hidden_size = wrapper.config.hidden_size
+        inputs = {
+            "layer0_code": torch.zeros(bsz, dtype=torch.long),
+            "layer0_embed": torch.randn(bsz, hidden_size),
+            "last_talker_hidden": torch.randn(bsz, hidden_size),
+            "do_sample": False,
+        }
+        first = wrapper(**inputs)
+        second = wrapper(**inputs)
+
+        assert first.shape == (bsz, wrapper.config.num_code_groups)
+        assert second.shape == first.shape
+        for graph_key in ((2, 2), (2, 3), (2, 4)):
+            graph = wrapper._device_graphs[graph_key][0]
+            assert graph.replay_count == 2
+
+        output = capsys.readouterr().out
+        assert (
+            "[Qwen3-TTS][NPU prefix graph] capture complete "
+            "prefix_keys=[(2, 2), (2, 3), (2, 4)] full_fallback_keys=[1]" in output
+        )
+        for seq_len in (2, 3, 4):
+            marker = (
+                "[Qwen3-TTS][NPU prefix graph] short prefix active "
+                f"batch_bucket=2 seq_len={seq_len} full_seq_len=5"
+            )
+            assert output.count(marker) == 1
+
+    def test_npu_prefix_graph_falls_back_to_full_graph(
+        self,
+        mocker: MockerFixture,
+        loaded_target_classes,
+    ) -> None:
+        wrapper = _make_npu_prefix_wrapper(
+            mocker,
+            loaded_target_classes,
+            prefix_buckets=[2],
+            prefix_seq_lens=[2, 3],
+        )
+        fake_npu = _FakeNPU()
+        mocker.patch.object(torch, "npu", fake_npu, create=True)
+
+        wrapper._warmup_buckets()
+        wrapper._test_forward_seq_lens.clear()
+        wrapper._capture_npu_graphs()
+
+        assert wrapper._test_forward_seq_lens == [5, 5, 2, 3]
+        assert set(wrapper._device_graphs) == {
+            1,
+            2,
+            (2, 2),
+            (2, 3),
+        }
+
+        bsz = 2
+        hidden_size = wrapper.config.hidden_size
+        wrapper(
+            layer0_code=torch.zeros(bsz, dtype=torch.long),
+            layer0_embed=torch.randn(bsz, hidden_size),
+            last_talker_hidden=torch.randn(bsz, hidden_size),
+            do_sample=False,
+        )
+
+        assert wrapper._device_graphs[(2, 2)][0].replay_count == 1
+        assert wrapper._device_graphs[(2, 3)][0].replay_count == 1
+        assert wrapper._device_graphs[2][0].replay_count == 1
