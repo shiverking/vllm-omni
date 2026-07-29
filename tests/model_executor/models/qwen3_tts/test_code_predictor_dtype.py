@@ -231,6 +231,57 @@ def _make_npu_prefix_wrapper(
     return wrapper
 
 
+def _make_npu_kv_wrapper(
+    mocker: MockerFixture,
+    loaded_target_classes,
+    *,
+    kv_cache: bool = True,
+    kv_buckets: list[int] | None = None,
+    prefix_graphs: bool = False,
+):
+    common_mod = sys.modules["vllm_omni.model_executor.models.common.qwen3_code_predictor"]
+    mocker.patch.object(common_mod.current_omni_platform, "is_npu", return_value=True)
+
+    cp_config, _ = _make_tiny_config(loaded_target_classes)
+    vllm_config = _make_vllm_config(mocker, max_num_seqs=2)
+    vllm_config.model_config.stage_connector_config = {
+        "extra": {
+            "code_predictor_kv_cache": kv_cache,
+            "code_predictor_kv_cache_buckets": kv_buckets or [],
+            "code_predictor_prefix_graphs": prefix_graphs,
+        }
+    }
+    wrapper = common_mod.CodePredictorWrapper(
+        vllm_config=vllm_config,
+        cp_config=cp_config,
+        wrapper_config=common_mod.CodePredictorWrapperConfig(use_cuda_graphs=True),
+    )
+    wrapper._model_dtype = next(wrapper.model.parameters()).dtype
+    wrapper._test_kv_calls = []
+
+    def _recording_forward(
+        hidden_states,
+        _position_ids,
+        key_cache=None,
+        value_cache=None,
+        cache_position=0,
+    ):
+        wrapper._test_kv_calls.append(
+            (
+                int(hidden_states.shape[1]),
+                int(cache_position),
+                None if key_cache is None else id(key_cache),
+                None if value_cache is None else id(value_cache),
+            )
+        )
+        return hidden_states.clone()
+
+    wrapper._compiled_model_fwd = _recording_forward
+    wrapper._lm_heads_list = list(wrapper.lm_head)
+    wrapper._codec_embeds_list = list(wrapper.model.codec_embedding)
+    return wrapper
+
+
 class TestCodePredictorDtypeAlignment:
     """Test that code predictor buffers match model parameter dtype."""
 
@@ -647,3 +698,202 @@ class TestCodePredictorWrapperConfig:
         assert wrapper._device_graphs[(2, 2)][0].replay_count == 1
         assert wrapper._device_graphs[(2, 3)][0].replay_count == 1
         assert wrapper._device_graphs[2][0].replay_count == 1
+
+
+class TestCodePredictorKVCache:
+    def test_config_enable_disable_and_conflict(
+        self,
+        mocker: MockerFixture,
+        loaded_target_classes,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        wrapper = _make_npu_kv_wrapper(
+            mocker,
+            loaded_target_classes,
+            kv_buckets=[2],
+        )
+        assert wrapper._kv_cache_enabled is True
+        assert wrapper._kv_cache_buckets == {2}
+        assert (
+            "[Qwen3-TTS][NPU KV cache] enabled buckets=[2] cache_lens=[2, 3, 4]"
+            in capsys.readouterr().out
+        )
+
+        disabled = _make_npu_kv_wrapper(
+            mocker,
+            loaded_target_classes,
+            kv_cache=False,
+            kv_buckets=[2],
+        )
+        assert disabled._kv_cache_enabled is False
+
+        with pytest.raises(
+            ValueError,
+            match="code_predictor_kv_cache and code_predictor_prefix_graphs",
+        ):
+            _make_npu_kv_wrapper(
+                mocker,
+                loaded_target_classes,
+                kv_buckets=[2],
+                prefix_graphs=True,
+            )
+
+    def test_npu_kv_graph_capture_and_routing(
+        self,
+        mocker: MockerFixture,
+        loaded_target_classes,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        wrapper = _make_npu_kv_wrapper(
+            mocker,
+            loaded_target_classes,
+            kv_buckets=[2],
+        )
+        fake_npu = _FakeNPU()
+        mocker.patch.object(torch, "npu", fake_npu, create=True)
+
+        wrapper._warmup_buckets()
+        wrapper._test_kv_calls.clear()
+        wrapper._capture_npu_graphs()
+
+        assert [(input_len, cache_pos) for input_len, cache_pos, _, _ in wrapper._test_kv_calls] == [
+            (5, 0),
+            (2, 0),
+            (1, 2),
+            (1, 3),
+        ]
+        assert set(wrapper._kv_device_graphs) == {(2, 2), (2, 3), (2, 4)}
+        assert set(wrapper._device_graphs) == {1}
+        cache_ids = {(key_id, value_id) for _, _, key_id, value_id in wrapper._test_kv_calls[1:]}
+        assert len(cache_ids) == 1
+        key_cache, value_cache = wrapper._kv_cache_by_bucket[2]
+        assert key_cache.shape == (1, 2, 2, 4, 8)
+        assert value_cache.shape == key_cache.shape
+
+        inputs = {
+            "layer0_code": torch.zeros(2, dtype=torch.long),
+            "layer0_embed": torch.randn(2, wrapper.config.hidden_size),
+            "last_talker_hidden": torch.randn(2, wrapper.config.hidden_size),
+            "do_sample": False,
+        }
+        wrapper(**inputs)
+        wrapper(**inputs)
+
+        for graph_key in ((2, 2), (2, 3), (2, 4)):
+            assert wrapper._kv_device_graphs[graph_key][0].replay_count == 2
+        assert wrapper._device_graphs[1][0].replay_count == 0
+
+        output = capsys.readouterr().out
+        assert (
+            "[Qwen3-TTS][NPU KV cache] capture complete "
+            "graph_keys=[(2, 2), (2, 3), (2, 4)] "
+            "cache_shapes={2: (1, 2, 2, 4, 8)} full_fallback_keys=[1]"
+            in output
+        )
+        for cache_len, phase, input_len in (
+            (2, "prefill", 2),
+            (3, "decode", 1),
+            (4, "decode", 1),
+        ):
+            marker = (
+                "[Qwen3-TTS][NPU KV cache] active "
+                f"batch_bucket=2 phase={phase} input_len={input_len} cache_len={cache_len}"
+            )
+            assert output.count(marker) == 1
+
+    def test_npu_kv_bucket_miss_uses_full_graph(
+        self,
+        mocker: MockerFixture,
+        loaded_target_classes,
+    ) -> None:
+        wrapper = _make_npu_kv_wrapper(
+            mocker,
+            loaded_target_classes,
+            kv_buckets=[1],
+        )
+        fake_npu = _FakeNPU()
+        mocker.patch.object(torch, "npu", fake_npu, create=True)
+        wrapper._warmup_buckets()
+        wrapper._capture_npu_graphs()
+
+        wrapper(
+            layer0_code=torch.zeros(2, dtype=torch.long),
+            layer0_embed=torch.randn(2, wrapper.config.hidden_size),
+            last_talker_hidden=torch.randn(2, wrapper.config.hidden_size),
+            do_sample=False,
+        )
+        assert wrapper._device_graphs[2][0].replay_count == 3
+        assert all(graph.replay_count == 0 for graph, _ in wrapper._kv_device_graphs.values())
+
+    def test_cached_decode_matches_full_causal_model(
+        self,
+        loaded_target_classes,
+    ) -> None:
+        common_mod = sys.modules["vllm_omni.model_executor.models.common.qwen3_code_predictor"]
+        cp_config, _ = _make_tiny_config(loaded_target_classes)
+        torch.manual_seed(0)
+        model = common_mod.CodePredictorBaseModel(cp_config).eval()
+        inputs = torch.randn(2, 4, cp_config.hidden_size)
+        pos_ids = torch.arange(4).unsqueeze(0).expand(2, -1)
+
+        with torch.inference_mode():
+            full_output = model(inputs, pos_ids)
+            cache_shape = (1, 2, 2, 4, 8)
+            key_cache = torch.empty(cache_shape)
+            value_cache = torch.empty(cache_shape)
+            cached_outputs = [
+                model(inputs[:, :2], pos_ids[:, :2], key_cache, value_cache, 0),
+                model(inputs[:, 2:3], pos_ids[:, 2:3], key_cache, value_cache, 2),
+                model(inputs[:, 3:4], pos_ids[:, 3:4], key_cache, value_cache, 3),
+            ]
+        cached_output = torch.cat(cached_outputs, dim=1)
+        torch.testing.assert_close(cached_output, full_output, rtol=1e-5, atol=1e-5)
+
+        # Reuse the same buffers for a second request. Prefill/decode must
+        # overwrite every readable position instead of leaking prior K/V.
+        second_inputs = torch.randn_like(inputs)
+        with torch.inference_mode():
+            second_full = model(second_inputs, pos_ids)
+            second_cached = torch.cat(
+                [
+                    model(second_inputs[:, :2], pos_ids[:, :2], key_cache, value_cache, 0),
+                    model(second_inputs[:, 2:3], pos_ids[:, 2:3], key_cache, value_cache, 2),
+                    model(second_inputs[:, 3:4], pos_ids[:, 3:4], key_cache, value_cache, 3),
+                ],
+                dim=1,
+            )
+        torch.testing.assert_close(second_cached, second_full, rtol=1e-5, atol=1e-5)
+
+    def test_npu_prefill_and_decode_attention_modes(
+        self,
+        mocker: MockerFixture,
+        loaded_target_classes,
+    ) -> None:
+        common_mod = sys.modules["vllm_omni.model_executor.models.common.qwen3_code_predictor"]
+        mocker.patch.object(common_mod.current_omni_platform, "is_npu", return_value=True)
+        calls = []
+        fake_torch_npu = types.ModuleType("torch_npu")
+
+        def _fake_fusion_attention(*args, **kwargs):
+            calls.append((args, kwargs))
+            return args[0], None
+
+        fake_torch_npu.npu_fusion_attention = _fake_fusion_attention
+        mocker.patch.dict(sys.modules, {"torch_npu": fake_torch_npu})
+        cp_config, _ = _make_tiny_config(loaded_target_classes)
+        attention = common_mod.CodePredictorAttention(cp_config).eval()
+        key_cache = torch.empty(1, 2, 4, 8)
+        value_cache = torch.empty_like(key_cache)
+
+        prefill = torch.randn(1, 2, cp_config.hidden_size)
+        prefill_rope = (torch.ones(1, 2, 8), torch.zeros(1, 2, 8))
+        attention(prefill, prefill_rope, key_cache, value_cache, 0)
+        decode = torch.randn(1, 1, cp_config.hidden_size)
+        decode_rope = (torch.ones(1, 1, 8), torch.zeros(1, 1, 8))
+        attention(decode, decode_rope, key_cache, value_cache, 2)
+
+        assert calls[0][1]["atten_mask"] is not None
+        assert calls[0][1]["sparse_mode"] == 2
+        assert calls[1][1]["atten_mask"] is None
+        assert calls[1][1]["sparse_mode"] == 0
+        assert calls[1][0][1].shape[2] == 3
