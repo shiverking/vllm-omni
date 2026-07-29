@@ -25,6 +25,11 @@ connectors:
       # Must match the decoder sliding attention window.
       codec_chunk_frames: 25
       codec_left_context_frames: 72
+      # Capture the residual code predictor with the growing causal prefix
+      # instead of replaying the full codebook sequence at every MTP step.
+      code_predictor_prefix_graphs: true
+      code_predictor_prefix_graph_buckets: [1, 2, 4, 8, 16]
+      code_predictor_prefix_graph_seq_lens: [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
       # Emit only the first audio chunk early, then return to codec_chunk_frames.
       initial_codec_chunk_frames: 1
       # Common Stage1 decode buckets:
