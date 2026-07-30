@@ -1163,6 +1163,23 @@ class TestCodePredictorSyncFreeSampling:
         wrapper._warmup_buckets()
         wrapper._capture_npu_graphs()
 
+        # Fake graph capture returns zero hidden states, so the bias-free LM
+        # heads otherwise produce fully tied logits. Existing top-k filtering
+        # intentionally retains every token tied at the kth threshold. Use
+        # distinct deterministic logits here so this test measures filtering
+        # before sampling instead of the valid tie-preserving behavior.
+        def _distinct_logits(hidden_states):
+            logits = torch.arange(
+                wrapper.config.vocab_size,
+                device=hidden_states.device,
+                dtype=hidden_states.dtype,
+            )
+            return logits.unsqueeze(0).expand(hidden_states.shape[0], -1)
+
+        wrapper._lm_heads_list = [
+            _distinct_logits for _ in range(wrapper.config.num_code_groups - 1)
+        ]
+
         sampled_probs = []
         original_sample = common_mod._npu_sync_free_sample
 
