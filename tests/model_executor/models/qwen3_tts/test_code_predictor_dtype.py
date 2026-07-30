@@ -238,6 +238,7 @@ def _make_npu_kv_wrapper(
     kv_cache: bool = True,
     kv_buckets: list[int] | None = None,
     prefix_graphs: bool = False,
+    fia_gqa: bool = False,
 ):
     common_mod = sys.modules["vllm_omni.model_executor.models.common.qwen3_code_predictor"]
     mocker.patch.object(common_mod.current_omni_platform, "is_npu", return_value=True)
@@ -249,6 +250,7 @@ def _make_npu_kv_wrapper(
             "code_predictor_kv_cache": kv_cache,
             "code_predictor_kv_cache_buckets": kv_buckets or [],
             "code_predictor_prefix_graphs": prefix_graphs,
+            "code_predictor_fia_gqa": fia_gqa,
         }
     }
     wrapper = common_mod.CodePredictorWrapper(
@@ -738,6 +740,17 @@ class TestCodePredictorKVCache:
                 prefix_graphs=True,
             )
 
+        with pytest.raises(
+            ValueError,
+            match="code_predictor_fia_gqa requires code_predictor_kv_cache",
+        ):
+            _make_npu_kv_wrapper(
+                mocker,
+                loaded_target_classes,
+                kv_cache=False,
+                fia_gqa=True,
+            )
+
     def test_npu_kv_graph_capture_and_routing(
         self,
         mocker: MockerFixture,
@@ -897,3 +910,149 @@ class TestCodePredictorKVCache:
         assert calls[1][1]["atten_mask"] is None
         assert calls[1][1]["sparse_mode"] == 0
         assert calls[1][0][1].shape[2] == 3
+
+    def test_npu_fia_gqa_uses_full_static_kv_cache(
+        self,
+        mocker: MockerFixture,
+        loaded_target_classes,
+    ) -> None:
+        common_mod = sys.modules["vllm_omni.model_executor.models.common.qwen3_code_predictor"]
+        mocker.patch.object(common_mod.current_omni_platform, "is_npu", return_value=True)
+        fia_calls = []
+        legacy_calls = []
+        fake_torch_npu = types.ModuleType("torch_npu")
+
+        def _fake_fia(**kwargs):
+            fia_calls.append(kwargs)
+            return kwargs["query"], None
+
+        def _fake_legacy(*args, **kwargs):
+            legacy_calls.append((args, kwargs))
+            return args[0], None
+
+        fake_torch_npu.npu_fused_infer_attention_score = _fake_fia
+        fake_torch_npu.npu_fusion_attention = _fake_legacy
+        mocker.patch.dict(sys.modules, {"torch_npu": fake_torch_npu})
+
+        cp_config, _ = _make_tiny_config(loaded_target_classes)
+        attention = common_mod.CodePredictorAttention(cp_config).to(torch.bfloat16).eval()
+        attention._npu_fia_gqa_enabled = True
+        key_cache = torch.empty(2, 2, 4, 8, dtype=torch.bfloat16)
+        value_cache = torch.empty_like(key_cache)
+        key_ptr = key_cache.data_ptr()
+        value_ptr = value_cache.data_ptr()
+
+        for cache_position, query_len in ((0, 2), (2, 1), (3, 1)):
+            hidden = torch.randn(2, query_len, cp_config.hidden_size, dtype=torch.bfloat16)
+            rope = (
+                torch.ones(2, query_len, 8, dtype=torch.bfloat16),
+                torch.zeros(2, query_len, 8, dtype=torch.bfloat16),
+            )
+            attention(hidden, rope, key_cache, value_cache, cache_position)
+
+        assert not legacy_calls
+        assert len(fia_calls) == 3
+        assert [tuple(call["query"].shape) for call in fia_calls] == [
+            (2, 4, 2, 8),
+            (2, 4, 1, 8),
+            (2, 4, 1, 8),
+        ]
+        assert all(tuple(call["key"].shape) == (2, 2, 4, 8) for call in fia_calls)
+        assert all(tuple(call["value"].shape) == (2, 2, 4, 8) for call in fia_calls)
+        assert all(call["key"].data_ptr() == key_ptr for call in fia_calls)
+        assert all(call["value"].data_ptr() == value_ptr for call in fia_calls)
+        assert [call["actual_seq_lengths_kv"] for call in fia_calls] == [[2, 2], [3, 3], [4, 4]]
+        assert [call["actual_seq_lengths"] for call in fia_calls] == [[2, 2], [1, 1], [1, 1]]
+        assert all(call["input_layout"] == "BNSD" for call in fia_calls)
+        assert all(call["num_heads"] == 4 for call in fia_calls)
+        assert all(call["num_key_value_heads"] == 2 for call in fia_calls)
+        assert fia_calls[0]["atten_mask"] is not None
+        assert fia_calls[0]["sparse_mode"] == 2
+        assert fia_calls[1]["atten_mask"] is None
+        assert fia_calls[1]["sparse_mode"] == 0
+
+    def test_npu_fia_gqa_float32_falls_back_to_legacy_attention(
+        self,
+        mocker: MockerFixture,
+        loaded_target_classes,
+    ) -> None:
+        common_mod = sys.modules["vllm_omni.model_executor.models.common.qwen3_code_predictor"]
+        mocker.patch.object(common_mod.current_omni_platform, "is_npu", return_value=True)
+        fia_calls = []
+        legacy_calls = []
+        fake_torch_npu = types.ModuleType("torch_npu")
+
+        def _fake_fia(**kwargs):
+            fia_calls.append(kwargs)
+            return kwargs["query"], None
+
+        def _fake_legacy(*args, **kwargs):
+            legacy_calls.append((args, kwargs))
+            return args[0], None
+
+        fake_torch_npu.npu_fused_infer_attention_score = _fake_fia
+        fake_torch_npu.npu_fusion_attention = _fake_legacy
+        mocker.patch.dict(sys.modules, {"torch_npu": fake_torch_npu})
+
+        cp_config, _ = _make_tiny_config(loaded_target_classes)
+        attention = common_mod.CodePredictorAttention(cp_config).eval()
+        attention._npu_fia_gqa_enabled = True
+        key_cache = torch.empty(1, 2, 4, 8)
+        value_cache = torch.empty_like(key_cache)
+        hidden = torch.randn(1, 1, cp_config.hidden_size)
+        rope = (torch.ones(1, 1, 8), torch.zeros(1, 1, 8))
+        attention(hidden, rope, key_cache, value_cache, 2)
+
+        assert not fia_calls
+        assert len(legacy_calls) == 1
+        assert legacy_calls[0][0][1].shape == (1, 4, 3, 8)
+
+    def test_npu_fia_gqa_config_capture_and_prints(
+        self,
+        mocker: MockerFixture,
+        loaded_target_classes,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        wrapper = _make_npu_kv_wrapper(
+            mocker,
+            loaded_target_classes,
+            kv_buckets=[2],
+            fia_gqa=True,
+        )
+        wrapper.to(torch.bfloat16)
+        wrapper._model_dtype = torch.bfloat16
+        wrapper._configure_fia_gqa()
+        assert wrapper._fia_gqa_enabled is True
+        assert all(layer.self_attn._npu_fia_gqa_enabled for layer in wrapper.model.layers)
+
+        fake_npu = _FakeNPU()
+        mocker.patch.object(torch, "npu", fake_npu, create=True)
+        wrapper._warmup_buckets()
+        wrapper._capture_npu_graphs()
+        inputs = {
+            "layer0_code": torch.zeros(2, dtype=torch.long),
+            "layer0_embed": torch.randn(2, wrapper.config.hidden_size),
+            "last_talker_hidden": torch.randn(2, wrapper.config.hidden_size),
+            "do_sample": False,
+        }
+        wrapper(**inputs)
+        wrapper(**inputs)
+
+        output = capsys.readouterr().out
+        assert (
+            "[Qwen3-TTS][NPU FIA GQA] enabled "
+            "dtype=torch.bfloat16 query_heads=4 kv_heads=2 layout=BNSD"
+            in output
+        )
+        assert (
+            "[Qwen3-TTS][NPU FIA GQA] capture complete "
+            "graph_keys=[(2, 2), (2, 3), (2, 4)] query_heads=4 materialized_kv_heads=2"
+            in output
+        )
+        for cache_len, phase, query_len in ((2, "prefill", 2), (3, "decode", 1), (4, "decode", 1)):
+            marker = (
+                "[Qwen3-TTS][NPU FIA GQA] active "
+                f"batch_bucket=2 phase={phase} query_len={query_len} "
+                f"valid_kv_len={cache_len} query_heads=4 kv_heads=2 cache_backed=true"
+            )
+            assert output.count(marker) == 1
