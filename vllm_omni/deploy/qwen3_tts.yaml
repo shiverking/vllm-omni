@@ -38,6 +38,16 @@ connectors:
           #   Base ref-context first/steady chunks: 73 / 169 frames
           #   decoder internal non-streaming chunks: 325 frames
       decode_cudagraph_capture_sizes: [25, 73, 97, 169, 325]
+      # Ascend Code2Wav inner graph. Keep capture shapes sparse to bound graph memory.
+      decode_npugraph: true
+      decode_npugraph_capture_sizes: [25, 73, 97, 169, 325]
+      decode_npugraph_extra_capture_shapes:
+        - [2, 97]
+        - [4, 97]
+        - [8, 97]
+        - [2, 169]
+        - [4, 169]
+        - [8, 169]
 
 stages:
   - stage_id: 0
