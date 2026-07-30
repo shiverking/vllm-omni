@@ -69,6 +69,16 @@ def _rotate_half(x: torch.Tensor) -> torch.Tensor:
     return torch.cat((-x2, x1), dim=-1)
 
 
+def _npu_sync_free_sample(
+    probs: torch.Tensor,
+    generator: torch.Generator | None,
+) -> torch.Tensor:
+    """Sample categorical probabilities without torch.multinomial's NPU sync."""
+    noise = torch.empty_like(probs)
+    noise.exponential_(generator=generator)
+    return probs.div_(noise).argmax(dim=-1, keepdim=True)
+
+
 class _RotaryEmbedding(nn.Module):
     """RoPE matching HuggingFace's implementation exactly.
 
@@ -590,6 +600,9 @@ class CodePredictorWrapper(nn.Module):
         prefix_graphs_requested = self._parse_bool_config(graph_cfg.get("code_predictor_prefix_graphs"))
         kv_cache_requested = self._parse_bool_config(graph_cfg.get("code_predictor_kv_cache"))
         fia_gqa_requested = self._parse_bool_config(graph_cfg.get("code_predictor_fia_gqa"))
+        sync_free_sampling_requested = self._parse_bool_config(
+            graph_cfg.get("code_predictor_sync_free_sampling")
+        )
         if prefix_graphs_requested and kv_cache_requested:
             raise ValueError(
                 "code_predictor_kv_cache and code_predictor_prefix_graphs cannot both be enabled"
@@ -603,6 +616,7 @@ class CodePredictorWrapper(nn.Module):
         self._fia_gqa_requested = fia_gqa_requested
         self._fia_gqa_enabled = False
         self._fia_gqa_configured = False
+        self._sync_free_sampling_enabled = sync_free_sampling_requested and is_npu
         if prefix_graphs_requested and not self._prefix_graphs_enabled:
             print(
                 "[Qwen3-TTS][prefix graph] requested but disabled "
@@ -621,6 +635,7 @@ class CodePredictorWrapper(nn.Module):
         self._printed_short_prefix_seq_lens: set[int] = set()
         self._printed_kv_cache_lens: set[int] = set()
         self._printed_fia_gqa_cache_lens: set[int] = set()
+        self._printed_sync_free_sampling_modes: set[str] = set()
         if is_npu and self._prefix_graphs_enabled:
             print(
                 "[Qwen3-TTS][NPU prefix graph] enabled "
@@ -639,6 +654,13 @@ class CodePredictorWrapper(nn.Module):
                 "[Qwen3-TTS][NPU KV cache] enabled "
                 f"buckets={sorted(self._kv_cache_buckets) if self._kv_cache_buckets else 'all'} "
                 f"cache_lens={list(range(2, self._num_groups + 1))}",
+                flush=True,
+            )
+        if self._sync_free_sampling_enabled:
+            print(
+                "[Qwen3-TTS][NPU sync-free sampling] enabled "
+                "method=exponential_race "
+                "modes=['stored', 'per_call']",
                 flush=True,
             )
 
@@ -740,6 +762,32 @@ class CodePredictorWrapper(nn.Module):
                 "backend=npu_fusion_attention",
                 flush=True,
             )
+
+    def _sample_probs(
+        self,
+        probs: torch.Tensor,
+        generator: torch.Generator | None,
+        *,
+        sampling_mode: str,
+        batch_size: int,
+        top_k: int,
+        top_p: float,
+    ) -> torch.Tensor:
+        if not self._sync_free_sampling_enabled:
+            return torch.multinomial(probs, num_samples=1, generator=generator)
+
+        if sampling_mode not in self._printed_sync_free_sampling_modes:
+            print(
+                "[Qwen3-TTS][NPU sync-free sampling] active "
+                f"mode={sampling_mode} "
+                f"batch_size={batch_size} "
+                f"top_k={top_k} "
+                f"top_p={top_p} "
+                f"generator={'explicit' if generator is not None else 'global'}",
+                flush=True,
+            )
+            self._printed_sync_free_sampling_modes.add(sampling_mode)
+        return _npu_sync_free_sample(probs, generator)
 
     def _setup_compile(self) -> None:
         """Lazily set up torch.compile with optional device graph capture."""
@@ -1249,7 +1297,7 @@ class CodePredictorWrapper(nn.Module):
 
             # Sample next code
             if stored_mode:
-                # "stored" mode: top-k -> top-p -> softmax -> multinomial
+                # "stored" mode: top-k -> top-p -> softmax -> categorical sample
                 if s_top_k > 0:
                     topk_vals, _ = logits.topk(s_top_k, dim=-1)
                     logits = logits.masked_fill(logits < topk_vals[:, -1:], float("-inf"))
@@ -1261,7 +1309,14 @@ class CodePredictorWrapper(nn.Module):
                     sorted_logits[remove_mask] = float("-inf")
                     logits = sorted_logits.scatter(1, sorted_idx, sorted_logits)
                 probs = F.softmax(logits, dim=-1, dtype=torch.float32)
-                code = torch.multinomial(probs, num_samples=1, generator=generator)
+                code = self._sample_probs(
+                    probs,
+                    generator,
+                    sampling_mode="stored",
+                    batch_size=bsz,
+                    top_k=s_top_k,
+                    top_p=s_top_p,
+                )
             else:
                 # "per_call" mode: temperature-scaled + top-k
                 if use_sampling:
@@ -1270,7 +1325,14 @@ class CodePredictorWrapper(nn.Module):
                         topk_vals, _ = scaled.topk(top_k, dim=-1)
                         scaled = scaled.masked_fill(scaled < topk_vals[:, -1:], float("-inf"))
                     probs = F.softmax(scaled, dim=-1, dtype=torch.float32)
-                    code = torch.multinomial(probs, num_samples=1, generator=generator)
+                    code = self._sample_probs(
+                        probs,
+                        generator,
+                        sampling_mode="per_call",
+                        batch_size=bsz,
+                        top_k=top_k,
+                        top_p=top_p,
+                    )
                 else:
                     code = logits.argmax(dim=-1, keepdim=True)
 
