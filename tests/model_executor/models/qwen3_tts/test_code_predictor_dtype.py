@@ -239,6 +239,8 @@ def _make_npu_kv_wrapper(
     kv_buckets: list[int] | None = None,
     prefix_graphs: bool = False,
     fia_gqa: bool = False,
+    sync_free_sampling: bool = False,
+    sampling_mode: str = "stored",
 ):
     common_mod = sys.modules["vllm_omni.model_executor.models.common.qwen3_code_predictor"]
     mocker.patch.object(common_mod.current_omni_platform, "is_npu", return_value=True)
@@ -251,12 +253,16 @@ def _make_npu_kv_wrapper(
             "code_predictor_kv_cache_buckets": kv_buckets or [],
             "code_predictor_prefix_graphs": prefix_graphs,
             "code_predictor_fia_gqa": fia_gqa,
+            "code_predictor_sync_free_sampling": sync_free_sampling,
         }
     }
     wrapper = common_mod.CodePredictorWrapper(
         vllm_config=vllm_config,
         cp_config=cp_config,
-        wrapper_config=common_mod.CodePredictorWrapperConfig(use_cuda_graphs=True),
+        wrapper_config=common_mod.CodePredictorWrapperConfig(
+            use_cuda_graphs=True,
+            sampling_mode=sampling_mode,
+        ),
     )
     wrapper._model_dtype = next(wrapper.model.parameters()).dtype
     wrapper._test_kv_calls = []
@@ -1056,3 +1062,189 @@ class TestCodePredictorKVCache:
                 f"valid_kv_len={cache_len} query_heads=4 kv_heads=2 cache_backed=true"
             )
             assert output.count(marker) == 1
+
+
+class TestCodePredictorSyncFreeSampling:
+    def test_exponential_race_shape_range_and_seed(
+        self,
+        loaded_target_classes,
+    ) -> None:
+        _ = loaded_target_classes
+        common_mod = sys.modules["vllm_omni.model_executor.models.common.qwen3_code_predictor"]
+        probs = torch.tensor([[0.1, 0.2, 0.7]]).expand(32, -1).clone()
+        first_generator = torch.Generator().manual_seed(1234)
+        second_generator = torch.Generator().manual_seed(1234)
+
+        first = common_mod._npu_sync_free_sample(probs.clone(), first_generator)
+        second = common_mod._npu_sync_free_sample(probs.clone(), second_generator)
+
+        assert torch.equal(first, second)
+        assert first.shape == (32, 1)
+        assert first.dtype == torch.long
+        assert int(first.min()) >= 0
+        assert int(first.max()) < probs.shape[-1]
+
+    def test_config_enable_disable_and_non_npu_fallback(
+        self,
+        mocker: MockerFixture,
+        loaded_target_classes,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        common_mod = sys.modules["vllm_omni.model_executor.models.common.qwen3_code_predictor"]
+        enabled = _make_npu_kv_wrapper(
+            mocker,
+            loaded_target_classes,
+            kv_buckets=[2],
+            sync_free_sampling=True,
+        )
+        assert enabled._sync_free_sampling_enabled is True
+        assert (
+            "[Qwen3-TTS][NPU sync-free sampling] enabled "
+            "method=exponential_race modes=['stored', 'per_call']"
+            in capsys.readouterr().out
+        )
+
+        disabled = _make_npu_kv_wrapper(
+            mocker,
+            loaded_target_classes,
+            kv_buckets=[2],
+            sync_free_sampling=False,
+        )
+        assert disabled._sync_free_sampling_enabled is False
+
+        mocker.patch.object(common_mod.current_omni_platform, "is_npu", return_value=False)
+        cp_config, _ = _make_tiny_config(loaded_target_classes)
+        vllm_config = _make_vllm_config(mocker)
+        vllm_config.model_config.stage_connector_config = {
+            "extra": {"code_predictor_sync_free_sampling": True}
+        }
+        fallback = common_mod.CodePredictorWrapper(
+            vllm_config=vllm_config,
+            cp_config=cp_config,
+            wrapper_config=common_mod.CodePredictorWrapperConfig(use_cuda_graphs=False),
+        )
+        assert fallback._sync_free_sampling_enabled is False
+        multinomial = mocker.patch.object(
+            torch,
+            "multinomial",
+            return_value=torch.zeros(2, 1, dtype=torch.long),
+        )
+        result = fallback._sample_probs(
+            torch.full((2, 4), 0.25),
+            None,
+            sampling_mode="stored",
+            batch_size=2,
+            top_k=4,
+            top_p=1.0,
+        )
+        assert result.shape == (2, 1)
+        multinomial.assert_called_once()
+
+    @pytest.mark.parametrize("sampling_mode", ["stored", "per_call"])
+    def test_npu_random_modes_use_exponential_race_once_per_mode(
+        self,
+        mocker: MockerFixture,
+        loaded_target_classes,
+        capsys: pytest.CaptureFixture[str],
+        sampling_mode: str,
+    ) -> None:
+        common_mod = sys.modules["vllm_omni.model_executor.models.common.qwen3_code_predictor"]
+        wrapper = _make_npu_kv_wrapper(
+            mocker,
+            loaded_target_classes,
+            kv_buckets=[2],
+            sync_free_sampling=True,
+            sampling_mode=sampling_mode,
+        )
+        wrapper._top_k = 8
+        wrapper._top_p = 0.5
+        fake_npu = _FakeNPU()
+        mocker.patch.object(torch, "npu", fake_npu, create=True)
+        wrapper._warmup_buckets()
+        wrapper._capture_npu_graphs()
+
+        sampled_probs = []
+        original_sample = common_mod._npu_sync_free_sample
+
+        def _record_sample(probs, generator):
+            sampled_probs.append(probs.clone())
+            return original_sample(probs, generator)
+
+        sample = mocker.patch.object(
+            common_mod,
+            "_npu_sync_free_sample",
+            side_effect=_record_sample,
+        )
+        mocker.patch.object(
+            torch,
+            "multinomial",
+            side_effect=AssertionError("NPU sync-free path called torch.multinomial"),
+        )
+        inputs = {
+            "layer0_code": torch.zeros(2, dtype=torch.long),
+            "layer0_embed": torch.randn(2, wrapper.config.hidden_size),
+            "last_talker_hidden": torch.randn(2, wrapper.config.hidden_size),
+            "do_sample": True,
+            "temperature": 0.5,
+            "top_k": 3,
+            "top_p": 1.0,
+            "generator": torch.Generator().manual_seed(1234),
+        }
+        first = wrapper(**inputs)
+        second = wrapper(**inputs)
+
+        assert sample.call_count == 2 * (wrapper.config.num_code_groups - 1)
+        assert first.shape == second.shape == (2, wrapper.config.num_code_groups)
+        assert first.dtype == second.dtype == torch.long
+        assert int(first.min()) >= 0
+        assert int(first.max()) < wrapper.config.vocab_size
+        expected_max_candidates = 8 if sampling_mode == "stored" else 3
+        assert all(
+            torch.all((probs > 0).sum(dim=-1) <= expected_max_candidates)
+            for probs in sampled_probs
+        )
+        assert all(
+            torch.allclose(probs.sum(dim=-1), torch.ones(probs.shape[0]))
+            for probs in sampled_probs
+        )
+
+        output = capsys.readouterr().out
+        marker = f"[Qwen3-TTS][NPU sync-free sampling] active mode={sampling_mode} "
+        assert output.count(marker) == 1
+        assert "generator=explicit" in output
+
+    def test_greedy_does_not_generate_exponential_noise(
+        self,
+        mocker: MockerFixture,
+        loaded_target_classes,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        common_mod = sys.modules["vllm_omni.model_executor.models.common.qwen3_code_predictor"]
+        wrapper = _make_npu_kv_wrapper(
+            mocker,
+            loaded_target_classes,
+            kv_buckets=[2],
+            sync_free_sampling=True,
+            sampling_mode="per_call",
+        )
+        fake_npu = _FakeNPU()
+        mocker.patch.object(torch, "npu", fake_npu, create=True)
+        wrapper._warmup_buckets()
+        wrapper._capture_npu_graphs()
+        sample = mocker.patch.object(
+            common_mod,
+            "_npu_sync_free_sample",
+            side_effect=AssertionError("greedy path generated sampling noise"),
+        )
+
+        result = wrapper(
+            layer0_code=torch.zeros(2, dtype=torch.long),
+            layer0_embed=torch.randn(2, wrapper.config.hidden_size),
+            last_talker_hidden=torch.randn(2, wrapper.config.hidden_size),
+            do_sample=False,
+            temperature=0.0,
+        )
+
+        assert result.shape == (2, wrapper.config.num_code_groups)
+        sample.assert_not_called()
+        assert "[Qwen3-TTS][NPU sync-free sampling] active" not in capsys.readouterr().out
