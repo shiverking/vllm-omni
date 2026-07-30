@@ -189,6 +189,34 @@ class Qwen3TTSCode2Wav(nn.Module):
         )
         logger.info("Code2Wav decoder CUDA Graph enabled")
 
+    def _maybe_enable_decoder_npugraph(
+        self,
+        *,
+        device: torch.device,
+        enabled: bool,
+        codec_chunk_frames: int,
+        codec_left_context_frames: int,
+        capture_sizes: list[int] | None,
+        extra_capture_shapes: list[tuple[int, int]] | None,
+    ) -> None:
+        """Enable the inner Code2Wav NPU graph when explicitly configured."""
+        if not enabled or not hasattr(self.decoder, "enable_npugraph") or device.type != "npu":
+            return
+
+        model_cfg = getattr(self.vllm_config, "model_config", None)
+        if getattr(model_cfg, "enforce_eager", False):
+            return
+
+        self.decoder.enable_npugraph(
+            capture_sizes=capture_sizes,
+            extra_capture_shapes=extra_capture_shapes,
+            device=device,
+            codec_chunk_frames=codec_chunk_frames,
+            codec_left_context_frames=codec_left_context_frames,
+            decode_chunk_size=self._decode_chunk_frames,
+            decode_left_context=self._decode_left_context_frames,
+        )
+
     def _get_decode_batch_bucket_frames(self, actual_frames: int) -> int:
         for bucket_frames in self._decode_batch_bucket_frames:
             if actual_frames <= bucket_frames:
@@ -646,7 +674,7 @@ class Qwen3TTSCode2Wav(nn.Module):
                 return bool(value)
             raise ValueError(f"Invalid Qwen3-TTS Code2Wav config {name}={value!r}")
 
-        def _get_int_list_config(name: str) -> list[int] | None:
+        def _get_int_list_config(name: str, *, strict_positive: bool = False) -> list[int] | None:
             value = extra_cfg.get(name)
             if value is None:
                 return None
@@ -665,11 +693,18 @@ class Qwen3TTSCode2Wav(nn.Module):
                     parsed = int(item)
                 except (TypeError, ValueError) as exc:
                     raise ValueError(f"Invalid Qwen3-TTS Code2Wav config {name}={value!r}") from exc
-                if parsed > 0:
-                    values.add(parsed)
+                if parsed <= 0:
+                    if strict_positive:
+                        raise ValueError(f"Invalid Qwen3-TTS Code2Wav config {name}={value!r}")
+                    continue
+                values.add(parsed)
             return sorted(values)
 
-        def _get_int_pair_list_config(name: str) -> list[tuple[int, int]] | None:
+        def _get_int_pair_list_config(
+            name: str,
+            *,
+            strict_positive: bool = False,
+        ) -> list[tuple[int, int]] | None:
             value = extra_cfg.get(name)
             if value is None:
                 return None
@@ -700,8 +735,11 @@ class Qwen3TTSCode2Wav(nn.Module):
                     seq_len = int(raw_pair[1])
                 except (TypeError, ValueError) as exc:
                     raise ValueError(f"Invalid Qwen3-TTS Code2Wav config {name}={value!r}") from exc
-                if batch_size > 0 and seq_len > 0:
-                    pairs.add((batch_size, seq_len))
+                if batch_size <= 0 or seq_len <= 0:
+                    if strict_positive:
+                        raise ValueError(f"Invalid Qwen3-TTS Code2Wav config {name}={value!r}")
+                    continue
+                pairs.add((batch_size, seq_len))
             return sorted(pairs)
 
         if isinstance(extra_cfg, dict):
@@ -742,12 +780,29 @@ class Qwen3TTSCode2Wav(nn.Module):
                 )
             self._decode_variable_chunk_batch_min_frames = decode_variable_chunk_batch_min_frames
             decode_enable_tf32 = _get_bool_config("decode_enable_tf32", False)
+            if device.type == "npu":
+                decode_npugraph = _get_bool_config("decode_npugraph", False)
+                decode_npugraph_capture_sizes = _get_int_list_config(
+                    "decode_npugraph_capture_sizes",
+                    strict_positive=True,
+                )
+                decode_npugraph_extra_capture_shapes = _get_int_pair_list_config(
+                    "decode_npugraph_extra_capture_shapes",
+                    strict_positive=True,
+                )
+            else:
+                decode_npugraph = False
+                decode_npugraph_capture_sizes = None
+                decode_npugraph_extra_capture_shapes = None
         else:
             decode_cudagraph_capture_sizes = None
             decode_cudagraph_batch_sizes = None
             decode_cudagraph_extra_capture_shapes = None
             decode_compile_shapes = None
             decode_enable_tf32 = False
+            decode_npugraph = False
+            decode_npugraph_capture_sizes = None
+            decode_npugraph_extra_capture_shapes = None
 
         if decode_enable_tf32 and device.type == "cuda":
             # PyTorch exposes TF32 controls as process-wide CUDA backend
@@ -778,6 +833,22 @@ class Qwen3TTSCode2Wav(nn.Module):
             except Exception:
                 logger.warning(
                     "Failed to enable CUDA Graph for Code2Wav decoder",
+                    exc_info=True,
+                )
+
+        if device.type == "npu" and decode_npugraph:
+            try:
+                self._maybe_enable_decoder_npugraph(
+                    device=device,
+                    enabled=decode_npugraph,
+                    codec_chunk_frames=codec_chunk_frames,
+                    codec_left_context_frames=codec_left_context_frames,
+                    capture_sizes=decode_npugraph_capture_sizes,
+                    extra_capture_shapes=decode_npugraph_extra_capture_shapes,
+                )
+            except Exception:
+                logger.warning(
+                    "Failed to enable NPU Graph for Code2Wav decoder; using eager fallback",
                     exc_info=True,
                 )
 

@@ -27,6 +27,7 @@ class _FakeDecoder(nn.Module):
         self.batched_decode_calls: list[dict[str, int]] = []
         self.decode_codes: list[torch.Tensor] = []
         self.cudagraph_calls: list[dict[str, int | torch.device]] = []
+        self.npugraph_calls: list[dict[str, object]] = []
 
     def to(self, *args, **kwargs):
         return self
@@ -80,6 +81,9 @@ class _FakeDecoder(nn.Module):
 
     def enable_cudagraph(self, **kwargs):
         self.cudagraph_calls.append(kwargs)
+
+    def enable_npugraph(self, **kwargs):
+        self.npugraph_calls.append(kwargs)
 
 
 def _fake_dec_config():
@@ -594,6 +598,110 @@ def test_cudagraph_capture_shapes_can_be_configured():
     assert call["capture_sizes"] == [97, 325]
     assert call["capture_batch_sizes"] == [1, 2, 4, 8]
     assert call["extra_capture_shapes"] == [(3, 325), (5, 325)]
+
+
+def test_npugraph_capture_shapes_can_be_configured():
+    npu_device = SimpleNamespace(type="npu")
+    model = _make_model(
+        async_chunk=True,
+        device=npu_device,
+        stage_connector_config={
+            "extra": {
+                "codec_chunk_frames": 25,
+                "codec_left_context_frames": 72,
+                "decode_npugraph": True,
+                "decode_npugraph_capture_sizes": "25,73,97,169",
+                "decode_npugraph_extra_capture_shapes": ["2:97", [4, 169]],
+            }
+        },
+    )
+
+    _load_weights_noop(model)
+
+    assert model.decoder.npugraph_calls == [
+        {
+            "capture_sizes": [25, 73, 97, 169],
+            "extra_capture_shapes": [(2, 97), (4, 169)],
+            "device": npu_device,
+            "codec_chunk_frames": 25,
+            "codec_left_context_frames": 72,
+            "decode_chunk_size": 300,
+            "decode_left_context": 25,
+        }
+    ]
+    assert model.decoder.cudagraph_calls == []
+
+
+@pytest.mark.parametrize("configured", [False, None])
+def test_npugraph_disabled_or_missing_keeps_npu_eager(configured):
+    extra = {}
+    if configured is not None:
+        extra["decode_npugraph"] = configured
+    model = _make_model(
+        device=SimpleNamespace(type="npu"),
+        stage_connector_config={"extra": extra},
+    )
+    _load_weights_noop(model)
+    assert model.decoder.npugraph_calls == []
+
+
+def test_npugraph_respects_enforce_eager():
+    model = _make_model(
+        device=SimpleNamespace(type="npu"),
+        stage_connector_config={"extra": {"decode_npugraph": True}},
+    )
+    model.vllm_config.model_config.enforce_eager = True
+    _load_weights_noop(model)
+    assert model.decoder.npugraph_calls == []
+
+
+def test_invalid_npugraph_shape_is_rejected_on_npu():
+    model = _make_model(
+        device=SimpleNamespace(type="npu"),
+        stage_connector_config={
+            "extra": {
+                "decode_npugraph": True,
+                "decode_npugraph_extra_capture_shapes": ["invalid"],
+            }
+        },
+    )
+    with pytest.raises(ValueError, match="decode_npugraph_extra_capture_shapes"):
+        _load_weights_noop(model)
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("decode_npugraph_capture_sizes", [25, 0]),
+        ("decode_npugraph_extra_capture_shapes", [[1, 97], [0, 169]]),
+    ],
+)
+def test_non_positive_npugraph_shape_is_rejected_on_npu(name, value):
+    model = _make_model(
+        device=SimpleNamespace(type="npu"),
+        stage_connector_config={
+            "extra": {
+                "decode_npugraph": True,
+                name: value,
+            }
+        },
+    )
+    with pytest.raises(ValueError, match=name):
+        _load_weights_noop(model)
+
+
+def test_cuda_ignores_invalid_npugraph_only_config():
+    model = _make_model(
+        device=torch.device("cuda"),
+        stage_connector_config={
+            "extra": {
+                "decode_npugraph": True,
+                "decode_npugraph_extra_capture_shapes": ["invalid"],
+            }
+        },
+    )
+    _load_weights_noop(model)
+    assert model.decoder.npugraph_calls == []
 
 
 def test_decode_compile_shapes_can_be_configured():
