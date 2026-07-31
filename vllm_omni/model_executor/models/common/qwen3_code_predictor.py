@@ -14,7 +14,7 @@ Shared by Qwen3-Omni and Qwen3-TTS talker models.
 from __future__ import annotations
 
 import dataclasses
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 
 import torch
 import torch.nn as nn
@@ -27,6 +27,9 @@ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
+
+_GeneratorLike = torch.Generator | Sequence[torch.Generator | None] | None
+_UNIFORM_EPS = 1e-20
 
 
 # ===================================================================
@@ -766,15 +769,27 @@ class CodePredictorWrapper(nn.Module):
     def _sample_probs(
         self,
         probs: torch.Tensor,
-        generator: torch.Generator | None,
+        generator: _GeneratorLike,
         *,
         sampling_mode: str,
         batch_size: int,
         top_k: int,
         top_p: float,
     ) -> torch.Tensor:
+        row_generators = self._normalize_generators(generator, int(probs.shape[0]))
         if not self._sync_free_sampling_enabled:
-            return torch.multinomial(probs, num_samples=1, generator=generator)
+            if isinstance(row_generators, list):
+                return torch.cat(
+                    [
+                        torch.multinomial(
+                            probs[row : row + 1],
+                            num_samples=1,
+                            generator=row_generator,
+                        )
+                        for row, row_generator in enumerate(row_generators)
+                    ]
+                )
+            return torch.multinomial(probs, num_samples=1, generator=row_generators)
 
         if sampling_mode not in self._printed_sync_free_sampling_modes:
             print(
@@ -783,11 +798,55 @@ class CodePredictorWrapper(nn.Module):
                 f"batch_size={batch_size} "
                 f"top_k={top_k} "
                 f"top_p={top_p} "
-                f"generator={'explicit' if generator is not None else 'global'}",
+                f"generator={'explicit' if row_generators is not None else 'global'}",
                 flush=True,
             )
             self._printed_sync_free_sampling_modes.add(sampling_mode)
-        return _npu_sync_free_sample(probs, generator)
+        if isinstance(row_generators, list):
+            return torch.cat(
+                [
+                    _npu_sync_free_sample(probs[row : row + 1], row_generator)
+                    for row, row_generator in enumerate(row_generators)
+                ]
+            )
+        return _npu_sync_free_sample(probs, row_generators)
+
+    @staticmethod
+    def _normalize_generators(
+        generator: _GeneratorLike,
+        batch_size: int,
+    ) -> torch.Generator | list[torch.Generator | None] | None:
+        if generator is None or isinstance(generator, torch.Generator):
+            return generator
+
+        row_generators = list(generator)
+        if len(row_generators) != batch_size:
+            raise ValueError(f"Expected {batch_size} per-row generators, but got {len(row_generators)}.")
+        return row_generators
+
+    @classmethod
+    def _sample_codes_gumbel(
+        cls,
+        logits: torch.Tensor,
+        generator: _GeneratorLike = None,
+    ) -> torch.Tensor:
+        """Sample logits via Gumbel-max with optional per-row generators."""
+        row_generators = cls._normalize_generators(generator, int(logits.shape[0]))
+        uniform = torch.empty_like(logits, dtype=torch.float32)
+        if isinstance(row_generators, list):
+            for row, row_generator in enumerate(row_generators):
+                uniform[row : row + 1].uniform_(
+                    _UNIFORM_EPS,
+                    1.0 - _UNIFORM_EPS,
+                    generator=row_generator,
+                )
+        else:
+            uniform.uniform_(
+                _UNIFORM_EPS,
+                1.0 - _UNIFORM_EPS,
+                generator=row_generators,
+            )
+        return (logits.float() - torch.log(-torch.log(uniform))).argmax(dim=-1, keepdim=True)
 
     def _setup_compile(self) -> None:
         """Lazily set up torch.compile with optional device graph capture."""
@@ -1162,7 +1221,7 @@ class CodePredictorWrapper(nn.Module):
         temperature: float = 0.9,
         top_k: int = 50,
         top_p: float = 1.0,
-        generator: torch.Generator | None = None,
+        generator: _GeneratorLike = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """Predict residual codebooks 1..G-1 autoregressively."""
         bsz = int(layer0_code.shape[0])
@@ -1308,15 +1367,20 @@ class CodePredictorWrapper(nn.Module):
                     remove_mask = (cumulative_probs - sorted_probs) >= s_top_p
                     sorted_logits[remove_mask] = float("-inf")
                     logits = sorted_logits.scatter(1, sorted_idx, sorted_logits)
-                probs = F.softmax(logits, dim=-1, dtype=torch.float32)
-                code = self._sample_probs(
-                    probs,
-                    generator,
-                    sampling_mode="stored",
-                    batch_size=bsz,
-                    top_k=s_top_k,
-                    top_p=s_top_p,
-                )
+                # Keep the explicit Ascend exponential-race switch as a
+                # temporary rollback path; Gumbel-max is the default.
+                if self._sync_free_sampling_enabled:
+                    probs = F.softmax(logits, dim=-1, dtype=torch.float32)
+                    code = self._sample_probs(
+                        probs,
+                        generator,
+                        sampling_mode="stored",
+                        batch_size=bsz,
+                        top_k=s_top_k,
+                        top_p=s_top_p,
+                    )
+                else:
+                    code = self._sample_codes_gumbel(logits, generator=generator)
             else:
                 # "per_call" mode: temperature-scaled + top-k
                 if use_sampling:
@@ -1324,15 +1388,20 @@ class CodePredictorWrapper(nn.Module):
                     if top_k > 0:
                         topk_vals, _ = scaled.topk(top_k, dim=-1)
                         scaled = scaled.masked_fill(scaled < topk_vals[:, -1:], float("-inf"))
-                    probs = F.softmax(scaled, dim=-1, dtype=torch.float32)
-                    code = self._sample_probs(
-                        probs,
-                        generator,
-                        sampling_mode="per_call",
-                        batch_size=bsz,
-                        top_k=top_k,
-                        top_p=top_p,
-                    )
+                    # Keep the explicit Ascend exponential-race switch as a
+                    # temporary rollback path; Gumbel-max is the default.
+                    if self._sync_free_sampling_enabled:
+                        probs = F.softmax(scaled, dim=-1, dtype=torch.float32)
+                        code = self._sample_probs(
+                            probs,
+                            generator,
+                            sampling_mode="per_call",
+                            batch_size=bsz,
+                            top_k=top_k,
+                            top_p=top_p,
+                        )
+                    else:
+                        code = self._sample_codes_gumbel(scaled, generator=generator)
                 else:
                     code = logits.argmax(dim=-1, keepdim=True)
 
