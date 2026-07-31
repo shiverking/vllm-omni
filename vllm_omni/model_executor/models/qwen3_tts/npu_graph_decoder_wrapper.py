@@ -26,6 +26,8 @@ class NPUGraphDecoderWrapper:
         num_quantizers: int = 8,
         enabled: bool = True,
         stats_log_every: int = 100,
+        padding_enabled: bool = False,
+        max_pad_frames: int = 0,
     ) -> None:
         self.decoder = decoder
         self._explicit_sizes = capture_sizes is not None
@@ -40,14 +42,21 @@ class NPUGraphDecoderWrapper:
         self.num_quantizers = int(num_quantizers)
         self.enabled = bool(enabled)
         self.stats_log_every = max(0, int(stats_log_every))
+        self.padding_enabled = bool(padding_enabled)
+        self.max_pad_frames = int(max_pad_frames)
+        if self.max_pad_frames < 0:
+            raise ValueError(f"max_pad_frames must be non-negative, got {max_pad_frames}")
 
         self.graphs: dict[tuple[int, int], object] = {}
         self.static_inputs: dict[tuple[int, int], torch.Tensor] = {}
         self.static_outputs: dict[tuple[int, int], torch.Tensor] = {}
+        self._frame_buckets_by_batch: dict[int, list[int]] = {}
         self._printed_active_graph_keys: set[tuple[int, int]] = set()
-        self._printed_fallback_shapes: set[tuple[int, int]] = set()
+        self._printed_padded_routes: set[tuple[int, int, int]] = set()
+        self._printed_fallback_shapes: set[tuple[int, int, str]] = set()
         self._stats_total = 0
         self._stats_exact_hits = 0
+        self._stats_padded_hits = 0
         self._stats_fallbacks = 0
         self._warmed_up = False
         self._device: torch.device | None = None
@@ -124,7 +133,9 @@ class NPUGraphDecoderWrapper:
         print(
             "[Qwen3-TTS][NPU Code2Wav graph] enabled "
             f"capture_shapes={capture_shapes} "
-            f"exact_only=True non_packed_position_ids=True "
+            f"padding_enabled={self.padding_enabled} "
+            f"max_pad_frames={'unlimited' if self.max_pad_frames == 0 else self.max_pad_frames} "
+            f"non_packed_position_ids=True "
             f"stats_log_every={self.stats_log_every}",
             flush=True,
         )
@@ -162,6 +173,12 @@ class NPUGraphDecoderWrapper:
                         exc_info=True,
                     )
 
+        buckets_by_batch: dict[int, list[int]] = {}
+        for batch_size, size in self.graphs:
+            buckets_by_batch.setdefault(batch_size, []).append(size)
+        self._frame_buckets_by_batch = {
+            batch_size: sorted(sizes) for batch_size, sizes in buckets_by_batch.items()
+        }
         self._warmed_up = True
         print(
             "[Qwen3-TTS][NPU Code2Wav graph] capture complete "
@@ -172,22 +189,56 @@ class NPUGraphDecoderWrapper:
 
     def _get_graph_key(self, batch_size: int, actual_size: int) -> tuple[int, int] | None:
         key = (batch_size, actual_size)
-        return key if key in self.graphs else None
+        if key in self.graphs:
+            return key
+        if not self.padding_enabled:
+            return None
+        for graph_size in self._frame_buckets_by_batch.get(batch_size, []):
+            padding_frames = graph_size - actual_size
+            if padding_frames < 0:
+                continue
+            if self.max_pad_frames > 0 and padding_frames > self.max_pad_frames:
+                return None
+            return (batch_size, graph_size)
+        return None
+
+    def _fallback_reason(self, batch_size: int, actual_size: int) -> str:
+        if not self.padding_enabled:
+            return "padding_disabled"
+        upper_buckets = [
+            size for size in self._frame_buckets_by_batch.get(batch_size, []) if size >= actual_size
+        ]
+        if not upper_buckets:
+            return "no_graph_bucket"
+        if self.max_pad_frames > 0 and upper_buckets[0] - actual_size > self.max_pad_frames:
+            return "padding_limit"
+        return "no_graph_bucket"
 
     def _print_stats(self) -> None:
-        hit_rate = 100.0 * self._stats_exact_hits / self._stats_total if self._stats_total else 0.0
+        exact_hit_rate = 100.0 * self._stats_exact_hits / self._stats_total if self._stats_total else 0.0
+        graph_hits = self._stats_exact_hits + self._stats_padded_hits
+        graph_hit_rate = 100.0 * graph_hits / self._stats_total if self._stats_total else 0.0
         print(
             "[Qwen3-TTS][NPU Code2Wav graph] stats "
             f"total={self._stats_total} "
             f"exact_hits={self._stats_exact_hits} "
+            f"padded_hits={self._stats_padded_hits} "
+            f"graph_hits={graph_hits} "
             f"fallbacks={self._stats_fallbacks} "
-            f"exact_hit_rate={hit_rate:.2f}%",
+            f"exact_hit_rate={exact_hit_rate:.2f}% "
+            f"graph_hit_rate={graph_hit_rate:.2f}%",
             flush=True,
         )
 
-    def _record_route(self, *, graph_key: tuple[int, int], exact_hit: bool) -> None:
+    def _record_route(
+        self,
+        *,
+        request_key: tuple[int, int],
+        graph_key: tuple[int, int] | None,
+        fallback_reason: str | None = None,
+    ) -> None:
         self._stats_total += 1
-        if exact_hit:
+        if graph_key == request_key:
             self._stats_exact_hits += 1
             if graph_key not in self._printed_active_graph_keys:
                 self._printed_active_graph_keys.add(graph_key)
@@ -196,14 +247,29 @@ class NPUGraphDecoderWrapper:
                     f"batch_size={graph_key[0]} frames={graph_key[1]}",
                     flush=True,
                 )
+        elif graph_key is not None:
+            self._stats_padded_hits += 1
+            route = (request_key[0], request_key[1], graph_key[1])
+            if route not in self._printed_padded_routes:
+                self._printed_padded_routes.add(route)
+                print(
+                    "[Qwen3-TTS][NPU Code2Wav graph] padded hit "
+                    f"batch_size={request_key[0]} "
+                    f"actual_frames={request_key[1]} "
+                    f"graph_frames={graph_key[1]} "
+                    f"padding_frames={graph_key[1] - request_key[1]}",
+                    flush=True,
+                )
         else:
             self._stats_fallbacks += 1
-            if graph_key not in self._printed_fallback_shapes:
-                self._printed_fallback_shapes.add(graph_key)
+            reason = fallback_reason or "no_graph_bucket"
+            fallback_key = (request_key[0], request_key[1], reason)
+            if fallback_key not in self._printed_fallback_shapes:
+                self._printed_fallback_shapes.add(fallback_key)
                 print(
                     "[Qwen3-TTS][NPU Code2Wav graph] eager fallback "
-                    f"batch_size={graph_key[0]} frames={graph_key[1]} "
-                    "reason=no_exact_graph",
+                    f"batch_size={request_key[0]} frames={request_key[1]} "
+                    f"reason={reason}",
                     flush=True,
                 )
         if self.stats_log_every > 0 and self._stats_total % self.stats_log_every == 0:
@@ -219,17 +285,30 @@ class NPUGraphDecoderWrapper:
 
         batch_size = int(codes.shape[0])
         actual_size = int(codes.shape[-1])
+        request_key = (batch_size, actual_size)
         graph_key = self._get_graph_key(batch_size, actual_size)
         if graph_key is None:
-            self._record_route(graph_key=(batch_size, actual_size), exact_hit=False)
+            self._record_route(
+                request_key=request_key,
+                graph_key=None,
+                fallback_reason=self._fallback_reason(batch_size, actual_size),
+            )
             return self.decoder(codes)
 
-        self._record_route(graph_key=graph_key, exact_hit=True)
+        self._record_route(request_key=request_key, graph_key=graph_key)
         static_input = self.static_inputs[graph_key]
-        static_input.copy_(codes)
+        graph_size = graph_key[1]
+        if graph_size == actual_size:
+            static_input.copy_(codes)
+        else:
+            static_input.zero_()
+            static_input[..., :actual_size].copy_(codes)
 
         self.graphs[graph_key].replay()
         output = self.static_outputs[graph_key]
+        if graph_size != actual_size:
+            padding_samples = (graph_size - actual_size) * int(self.decoder.total_upsample)
+            output = output[..., : output.shape[-1] - padding_samples]
         return output.clone() if clone_graph_output else output
 
     def decode(self, codes: torch.Tensor) -> torch.Tensor:

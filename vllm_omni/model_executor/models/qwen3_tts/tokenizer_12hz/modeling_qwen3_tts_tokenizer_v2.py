@@ -925,6 +925,8 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
         decode_chunk_size: int = 300,
         decode_left_context: int = 25,
         stats_log_every: int = 100,
+        padding_enabled: bool = False,
+        max_pad_frames: int = 0,
     ):
         from ..npu_graph_decoder_wrapper import NPUGraphDecoderWrapper
 
@@ -941,6 +943,8 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
             num_quantizers=self.config.num_quantizers,
             enabled=True,
             stats_log_every=stats_log_every,
+            padding_enabled=padding_enabled,
+            max_pad_frames=max_pad_frames,
         )
         self._npugraph_wrapper.warmup(
             device,

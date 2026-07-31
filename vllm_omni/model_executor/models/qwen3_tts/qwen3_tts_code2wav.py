@@ -199,6 +199,8 @@ class Qwen3TTSCode2Wav(nn.Module):
         capture_sizes: list[int] | None,
         extra_capture_shapes: list[tuple[int, int]] | None,
         stats_log_every: int,
+        padding_enabled: bool,
+        max_pad_frames: int,
     ) -> None:
         """Enable the inner Code2Wav NPU graph when explicitly configured."""
         if not enabled or not hasattr(self.decoder, "enable_npugraph") or device.type != "npu":
@@ -217,6 +219,8 @@ class Qwen3TTSCode2Wav(nn.Module):
             decode_chunk_size=self._decode_chunk_frames,
             decode_left_context=self._decode_left_context_frames,
             stats_log_every=stats_log_every,
+            padding_enabled=padding_enabled,
+            max_pad_frames=max_pad_frames,
         )
 
     def _get_decode_batch_bucket_frames(self, actual_frames: int) -> int:
@@ -801,11 +805,56 @@ class Qwen3TTSCode2Wav(nn.Module):
                         "Invalid Qwen3-TTS Code2Wav config "
                         f"decode_npugraph_stats_log_every={decode_npugraph_stats_log_every}"
                     )
+                decode_npugraph_padding = _get_bool_config("decode_npugraph_padding", False)
+                decode_npugraph_padding_max_frames = _get_int_config(
+                    "decode_npugraph_padding_max_frames",
+                    0,
+                )
+                if decode_npugraph_padding_max_frames < 0:
+                    raise ValueError(
+                        "Invalid Qwen3-TTS Code2Wav config "
+                        "decode_npugraph_padding_max_frames="
+                        f"{decode_npugraph_padding_max_frames}"
+                    )
+                padding_batch_sizes = _get_int_list_config(
+                    "decode_npugraph_padding_capture_batch_sizes",
+                    strict_positive=True,
+                )
+                padding_capture_sizes = _get_int_list_config(
+                    "decode_npugraph_padding_capture_sizes",
+                    strict_positive=True,
+                )
+                if (padding_batch_sizes is None) != (padding_capture_sizes is None):
+                    raise ValueError(
+                        "decode_npugraph_padding_capture_batch_sizes and "
+                        "decode_npugraph_padding_capture_sizes must be configured together"
+                    )
+                if padding_batch_sizes is not None:
+                    if not padding_batch_sizes or not padding_capture_sizes:
+                        raise ValueError(
+                            "decode_npugraph padding capture batch sizes and frame sizes "
+                            "must not be empty"
+                        )
+                if (
+                    decode_npugraph_padding
+                    and padding_batch_sizes is not None
+                    and padding_capture_sizes is not None
+                ):
+                    padding_shapes = {
+                        (batch_size, size)
+                        for batch_size in padding_batch_sizes
+                        for size in padding_capture_sizes
+                    }
+                    decode_npugraph_extra_capture_shapes = sorted(
+                        set(decode_npugraph_extra_capture_shapes or []) | padding_shapes
+                    )
             else:
                 decode_npugraph = False
                 decode_npugraph_capture_sizes = None
                 decode_npugraph_extra_capture_shapes = None
                 decode_npugraph_stats_log_every = 0
+                decode_npugraph_padding = False
+                decode_npugraph_padding_max_frames = 0
         else:
             decode_cudagraph_capture_sizes = None
             decode_cudagraph_batch_sizes = None
@@ -816,6 +865,8 @@ class Qwen3TTSCode2Wav(nn.Module):
             decode_npugraph_capture_sizes = None
             decode_npugraph_extra_capture_shapes = None
             decode_npugraph_stats_log_every = 0
+            decode_npugraph_padding = False
+            decode_npugraph_padding_max_frames = 0
 
         if decode_enable_tf32 and device.type == "cuda":
             # PyTorch exposes TF32 controls as process-wide CUDA backend
@@ -859,6 +910,8 @@ class Qwen3TTSCode2Wav(nn.Module):
                     capture_sizes=decode_npugraph_capture_sizes,
                     extra_capture_shapes=decode_npugraph_extra_capture_shapes,
                     stats_log_every=decode_npugraph_stats_log_every,
+                    padding_enabled=decode_npugraph_padding,
+                    max_pad_frames=decode_npugraph_padding_max_frames,
                 )
             except Exception:
                 logger.warning(
