@@ -629,6 +629,8 @@ def test_npugraph_capture_shapes_can_be_configured():
             "decode_chunk_size": 300,
             "decode_left_context": 25,
             "stats_log_every": 17,
+            "padding_enabled": False,
+            "max_pad_frames": 0,
         }
     ]
     assert model.decoder.cudagraph_calls == []
@@ -653,6 +655,101 @@ def test_npugraph_respects_enforce_eager():
         stage_connector_config={"extra": {"decode_npugraph": True}},
     )
     model.vllm_config.model_config.enforce_eager = True
+    _load_weights_noop(model)
+    assert model.decoder.npugraph_calls == []
+
+
+def test_npugraph_padding_config_builds_cartesian_product_and_deduplicates():
+    npu_device = SimpleNamespace(type="npu")
+    model = _make_model(
+        device=npu_device,
+        stage_connector_config={
+            "extra": {
+                "decode_npugraph": True,
+                "decode_npugraph_extra_capture_shapes": [[2, 25], [4, 97]],
+                "decode_npugraph_padding": True,
+                "decode_npugraph_padding_max_frames": 0,
+                "decode_npugraph_padding_capture_batch_sizes": [1, 2],
+                "decode_npugraph_padding_capture_sizes": [25, 51],
+            }
+        },
+    )
+    _load_weights_noop(model)
+
+    call = model.decoder.npugraph_calls[-1]
+    assert call["extra_capture_shapes"] == [
+        (1, 25),
+        (1, 51),
+        (2, 25),
+        (2, 51),
+        (4, 97),
+    ]
+    assert call["padding_enabled"] is True
+    assert call["max_pad_frames"] == 0
+
+
+def test_disabled_npugraph_padding_does_not_expand_capture_shapes():
+    model = _make_model(
+        device=SimpleNamespace(type="npu"),
+        stage_connector_config={
+            "extra": {
+                "decode_npugraph": True,
+                "decode_npugraph_extra_capture_shapes": [[4, 97]],
+                "decode_npugraph_padding": False,
+                "decode_npugraph_padding_capture_batch_sizes": [1, 2],
+                "decode_npugraph_padding_capture_sizes": [25, 51],
+            }
+        },
+    )
+    _load_weights_noop(model)
+
+    call = model.decoder.npugraph_calls[-1]
+    assert call["extra_capture_shapes"] == [(4, 97)]
+    assert call["padding_enabled"] is False
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        {
+            "decode_npugraph_padding_capture_batch_sizes": [1, 2],
+        },
+        {
+            "decode_npugraph_padding_capture_sizes": [25, 51],
+        },
+        {
+            "decode_npugraph_padding_capture_batch_sizes": [1, 0],
+            "decode_npugraph_padding_capture_sizes": [25],
+        },
+        {
+            "decode_npugraph_padding_capture_batch_sizes": [1],
+            "decode_npugraph_padding_capture_sizes": [25, 0],
+        },
+        {
+            "decode_npugraph_padding_max_frames": -1,
+        },
+    ],
+)
+def test_invalid_npugraph_padding_config_is_rejected_on_npu(extra):
+    model = _make_model(
+        device=SimpleNamespace(type="npu"),
+        stage_connector_config={"extra": {"decode_npugraph": True, **extra}},
+    )
+    with pytest.raises(ValueError, match="decode_npugraph_padding"):
+        _load_weights_noop(model)
+
+
+def test_cuda_ignores_invalid_npugraph_padding_config():
+    model = _make_model(
+        device=torch.device("cuda"),
+        stage_connector_config={
+            "extra": {
+                "decode_npugraph": True,
+                "decode_npugraph_padding_max_frames": -1,
+                "decode_npugraph_padding_capture_batch_sizes": [0],
+            }
+        },
+    )
     _load_weights_noop(model)
     assert model.decoder.npugraph_calls == []
 

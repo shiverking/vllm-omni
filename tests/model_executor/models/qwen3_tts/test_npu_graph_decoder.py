@@ -96,6 +96,31 @@ def wrapper(monkeypatch):
     return decoder, graph_wrapper, fake_npu
 
 
+@pytest.fixture
+def padding_wrapper(monkeypatch):
+    fake_npu = _FakeNPU()
+    monkeypatch.setattr(torch, "npu", fake_npu, raising=False)
+    decoder = _TinyCausalDecoder().eval()
+    graph_wrapper = NPUGraphDecoderWrapper(
+        decoder,
+        capture_sizes=[25, 51, 73],
+        extra_capture_shapes=[(2, 51), (2, 73)],
+        num_quantizers=NUM_QUANTIZERS,
+        padding_enabled=True,
+        max_pad_frames=0,
+    )
+    graph_wrapper.warmup(torch.device("cpu"))
+    for key in graph_wrapper.graphs:
+        static_input = graph_wrapper.static_inputs[key]
+        static_output = graph_wrapper.static_outputs[key]
+
+        def replay(inp=static_input, out=static_output):
+            out.copy_(decoder(inp))
+
+        graph_wrapper.graphs[key] = _CapturedGraph(replay)
+    return decoder, graph_wrapper, fake_npu
+
+
 def _codes(batch_size: int, frames: int) -> torch.Tensor:
     generator = torch.Generator().manual_seed(batch_size * 1000 + frames)
     return torch.randint(0, 8, (batch_size, NUM_QUANTIZERS, frames), generator=generator)
@@ -250,7 +275,7 @@ def test_active_print_is_once_per_graph_key(wrapper, capsys):
     assert output.count("[Qwen3-TTS][NPU Code2Wav graph] exact hit") == 1
     assert output.count("[Qwen3-TTS][NPU Code2Wav graph] eager fallback") == 1
     assert "exact hit batch_size=1 frames=25" in output
-    assert "eager fallback batch_size=1 frames=20 reason=no_exact_graph" in output
+    assert "eager fallback batch_size=1 frames=20 reason=padding_disabled" in output
 
 
 def test_stats_print_records_exact_hit_probability(wrapper, capsys):
@@ -261,7 +286,117 @@ def test_stats_print_records_exact_hit_probability(wrapper, capsys):
     graph_wrapper.decode(_codes(1, 20))
     graph_wrapper.decode(_codes(1, 25))
     output = capsys.readouterr().out
-    assert "stats total=3 exact_hits=2 fallbacks=1 exact_hit_rate=66.67%" in output
+    assert (
+        "stats total=3 exact_hits=2 padded_hits=0 graph_hits=2 "
+        "fallbacks=1 exact_hit_rate=66.67% graph_hit_rate=66.67%"
+    ) in output
     assert graph_wrapper._stats_total == 3
     assert graph_wrapper._stats_exact_hits == 2
+    assert graph_wrapper._stats_padded_hits == 0
+    assert graph_wrapper._stats_fallbacks == 1
+
+
+def test_padding_exact_priority_and_smallest_same_batch_bucket(padding_wrapper):
+    decoder, graph_wrapper, _ = padding_wrapper
+    exact_codes = _codes(1, 25)
+    padded_codes = _codes(1, 26)
+
+    assert graph_wrapper._get_graph_key(1, 25) == (1, 25)
+    assert graph_wrapper._get_graph_key(1, 26) == (1, 51)
+    torch.testing.assert_close(graph_wrapper.decode(exact_codes), decoder(exact_codes), atol=0, rtol=0)
+    _assert_waveform_close(graph_wrapper.decode(padded_codes), decoder(padded_codes))
+
+
+def test_padding_never_selects_a_different_batch(padding_wrapper):
+    decoder, graph_wrapper, _ = padding_wrapper
+    codes = _codes(3, 26)
+    assert graph_wrapper._get_graph_key(3, 26) is None
+    torch.testing.assert_close(graph_wrapper.decode(codes), decoder(codes), atol=0, rtol=0)
+
+
+def test_padding_clears_static_tail_trims_output_and_avoids_replay_pollution(padding_wrapper):
+    decoder, graph_wrapper, _ = padding_wrapper
+    graph_key = (1, 25)
+    graph_wrapper.static_inputs[graph_key].fill_(7)
+
+    short_codes = _codes(1, 20)
+    short_output = graph_wrapper.decode(short_codes)
+    assert short_output.shape[-1] == 20 * TOTAL_UPSAMPLE
+    assert torch.count_nonzero(graph_wrapper.static_inputs[graph_key][..., 20:]) == 0
+    _assert_waveform_close(short_output, decoder(short_codes))
+
+    longer_codes = _codes(1, 24)
+    _assert_waveform_close(graph_wrapper.decode(longer_codes), decoder(longer_codes))
+    _assert_waveform_close(graph_wrapper.decode(short_codes), decoder(short_codes))
+    assert torch.count_nonzero(graph_wrapper.static_inputs[graph_key][..., 20:]) == 0
+
+
+@pytest.mark.parametrize(
+    ("max_pad_frames", "expected_key"),
+    [(0, (1, 25)), (5, (1, 25)), (4, None)],
+)
+def test_padding_limit_controls_routing(monkeypatch, max_pad_frames, expected_key):
+    fake_npu = _FakeNPU()
+    monkeypatch.setattr(torch, "npu", fake_npu, raising=False)
+    graph_wrapper = NPUGraphDecoderWrapper(
+        _TinyCausalDecoder().eval(),
+        capture_sizes=[25],
+        num_quantizers=NUM_QUANTIZERS,
+        padding_enabled=True,
+        max_pad_frames=max_pad_frames,
+    )
+    graph_wrapper.warmup(torch.device("cpu"))
+    assert graph_wrapper._get_graph_key(1, 20) == expected_key
+
+
+def test_padding_limit_fallback_prints_specific_reason(monkeypatch, capsys):
+    fake_npu = _FakeNPU()
+    monkeypatch.setattr(torch, "npu", fake_npu, raising=False)
+    graph_wrapper = NPUGraphDecoderWrapper(
+        _TinyCausalDecoder().eval(),
+        capture_sizes=[25],
+        num_quantizers=NUM_QUANTIZERS,
+        padding_enabled=True,
+        max_pad_frames=4,
+    )
+    graph_wrapper.warmup(torch.device("cpu"))
+    capsys.readouterr()
+    graph_wrapper.decode(_codes(1, 20))
+    assert "eager fallback batch_size=1 frames=20 reason=padding_limit" in capsys.readouterr().out
+
+
+def test_failed_capture_is_not_a_padding_bucket(monkeypatch):
+    fake_npu = _FailingFakeNPU(fail_capture_index=2)
+    monkeypatch.setattr(torch, "npu", fake_npu, raising=False)
+    graph_wrapper = NPUGraphDecoderWrapper(
+        _TinyCausalDecoder().eval(),
+        capture_sizes=[25, 51, 73],
+        num_quantizers=NUM_QUANTIZERS,
+        padding_enabled=True,
+    )
+    graph_wrapper.warmup(torch.device("cpu"))
+    assert (1, 51) not in graph_wrapper.graphs
+    assert graph_wrapper._get_graph_key(1, 26) == (1, 73)
+
+
+def test_padding_prints_and_stats_are_split_by_route(padding_wrapper, capsys):
+    _, graph_wrapper, _ = padding_wrapper
+    graph_wrapper.stats_log_every = 3
+    capsys.readouterr()
+
+    graph_wrapper.decode(_codes(1, 25))
+    graph_wrapper.decode(_codes(1, 26))
+    graph_wrapper.decode(_codes(3, 26))
+    graph_wrapper.decode(_codes(1, 26))
+    output = capsys.readouterr().out
+
+    assert output.count("exact hit batch_size=1 frames=25") == 1
+    assert output.count("padded hit batch_size=1 actual_frames=26 graph_frames=51 padding_frames=25") == 1
+    assert output.count("eager fallback batch_size=3 frames=26 reason=no_graph_bucket") == 1
+    assert (
+        "stats total=3 exact_hits=1 padded_hits=1 graph_hits=2 "
+        "fallbacks=1 exact_hit_rate=33.33% graph_hit_rate=66.67%"
+    ) in output
+    assert graph_wrapper._stats_exact_hits == 1
+    assert graph_wrapper._stats_padded_hits == 2
     assert graph_wrapper._stats_fallbacks == 1
