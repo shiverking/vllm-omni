@@ -631,6 +631,7 @@ def test_npugraph_capture_shapes_can_be_configured():
             "stats_log_every": 17,
             "padding_enabled": False,
             "max_pad_frames": 0,
+            "route_log_file": None,
         }
     ]
     assert model.decoder.cudagraph_calls == []
@@ -671,6 +672,7 @@ def test_npugraph_padding_config_builds_cartesian_product_and_deduplicates():
                 "decode_npugraph_padding_max_frames": 0,
                 "decode_npugraph_padding_capture_batch_sizes": [1, 2],
                 "decode_npugraph_padding_capture_sizes": [25, 51],
+                "decode_npugraph_route_log_file": "/tmp/code2wav-routes.jsonl",
             }
         },
     )
@@ -686,6 +688,7 @@ def test_npugraph_padding_config_builds_cartesian_product_and_deduplicates():
     ]
     assert call["padding_enabled"] is True
     assert call["max_pad_frames"] == 0
+    assert call["route_log_file"] == "/tmp/code2wav-routes.jsonl"
 
 
 def test_disabled_npugraph_padding_does_not_expand_capture_shapes():
@@ -747,6 +750,34 @@ def test_cuda_ignores_invalid_npugraph_padding_config():
                 "decode_npugraph": True,
                 "decode_npugraph_padding_max_frames": -1,
                 "decode_npugraph_padding_capture_batch_sizes": [0],
+            }
+        },
+    )
+    _load_weights_noop(model)
+    assert model.decoder.npugraph_calls == []
+
+
+def test_invalid_npugraph_route_log_file_is_rejected_on_npu():
+    model = _make_model(
+        device=SimpleNamespace(type="npu"),
+        stage_connector_config={
+            "extra": {
+                "decode_npugraph": True,
+                "decode_npugraph_route_log_file": 123,
+            }
+        },
+    )
+    with pytest.raises(ValueError, match="decode_npugraph_route_log_file"):
+        _load_weights_noop(model)
+
+
+def test_cuda_ignores_invalid_npugraph_route_log_file():
+    model = _make_model(
+        device=torch.device("cuda"),
+        stage_connector_config={
+            "extra": {
+                "decode_npugraph": True,
+                "decode_npugraph_route_log_file": 123,
             }
         },
     )
