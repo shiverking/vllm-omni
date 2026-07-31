@@ -612,6 +612,7 @@ def test_npugraph_capture_shapes_can_be_configured():
                 "decode_npugraph": True,
                 "decode_npugraph_capture_sizes": "25,73,97,169",
                 "decode_npugraph_extra_capture_shapes": ["2:97", [4, 169]],
+                "decode_npugraph_stats_log_every": 17,
             }
         },
     )
@@ -627,6 +628,7 @@ def test_npugraph_capture_shapes_can_be_configured():
             "codec_left_context_frames": 72,
             "decode_chunk_size": 300,
             "decode_left_context": 25,
+            "stats_log_every": 17,
         }
     ]
     assert model.decoder.cudagraph_calls == []
@@ -687,6 +689,20 @@ def test_non_positive_npugraph_shape_is_rejected_on_npu(name, value):
         },
     )
     with pytest.raises(ValueError, match=name):
+        _load_weights_noop(model)
+
+
+def test_negative_npugraph_stats_interval_is_rejected_on_npu():
+    model = _make_model(
+        device=SimpleNamespace(type="npu"),
+        stage_connector_config={
+            "extra": {
+                "decode_npugraph": True,
+                "decode_npugraph_stats_log_every": -1,
+            }
+        },
+    )
+    with pytest.raises(ValueError, match="decode_npugraph_stats_log_every"):
         _load_weights_noop(model)
 
 

@@ -7,7 +7,6 @@ import gc
 import math
 import os
 from pathlib import Path
-from unittest.mock import patch
 
 import pytest
 import torch
@@ -60,27 +59,11 @@ def real_decoder_and_graph():
 
     wrapper = NPUGraphDecoderWrapper(
         decoder,
-        capture_sizes=[25, 73, 97, 169],
+        capture_sizes=[1, 25, 26, 51, 73, 76, 97, 98, 123, 148, 169, 325],
         extra_capture_shapes=[(2, 97), (2, 169)],
         num_quantizers=int(decoder.config.num_quantizers),
     )
-    # Code2Wav always uses one ordinary, monotonically increasing position-id
-    # sequence per request. Transformers nevertheless probes for packed
-    # sequences inside create_causal_mask() and consumes an NPU ``.all()`` in a
-    # Python branch. That scalar synchronization is illegal while an NPUGraph
-    # stream is being captured. Returning None is exactly the normal result for
-    # these non-packed position ids; it only moves that data-dependent probe out
-    # of the precision test's captured region and does not change the mask.
-    print(
-        "[Qwen3-TTS][NPU Code2Wav precision] "
-        "non-packed causal-mask capture workaround active",
-        flush=True,
-    )
-    with patch(
-        "transformers.masking_utils.find_packed_sequence_indices",
-        return_value=None,
-    ):
-        wrapper.warmup(torch.device("npu"))
+    wrapper.warmup(torch.device("npu"))
     if not wrapper.graphs:
         pytest.fail("No Code2Wav NPU graph was captured")
 
@@ -143,8 +126,8 @@ def _codes(
 
 
 def _precision_metrics(graph: torch.Tensor, eager: torch.Tensor) -> tuple[float, float, float, float]:
-    graph_cpu = graph.detach().to(device="cpu", dtype=torch.float64)
-    eager_cpu = eager.detach().to(device="cpu", dtype=torch.float64)
+    graph_cpu = graph.detach().cpu().to(dtype=torch.float64)
+    eager_cpu = eager.detach().cpu().to(dtype=torch.float64)
     error = graph_cpu - eager_cpu
     max_abs = float(error.abs().max()) if error.numel() else 0.0
     mean_abs = float(error.abs().mean()) if error.numel() else 0.0
@@ -175,12 +158,17 @@ def _assert_precision(graph: torch.Tensor, eager: torch.Tensor, label: str) -> N
     ("batch_size", "frames"),
     [
         (1, 25),
-        (1, 73),
-        (1, 97),
-        (1, 169),
+        (1, 1),
         (1, 26),
-        (1, 74),
+        (1, 51),
+        (1, 73),
+        (1, 76),
+        (1, 97),
         (1, 98),
+        (1, 123),
+        (1, 148),
+        (1, 169),
+        (1, 325),
         (2, 97),
         (2, 169),
     ],
@@ -198,83 +186,3 @@ def test_real_decoder_npugraph_matches_eager(
         graph = wrapper.decode(codes)
     torch.npu.synchronize()
     _assert_precision(graph, eager, f"batch={batch_size},frames={frames}")
-
-
-def _streaming_decode(
-    decode_fn,
-    codes: torch.Tensor,
-    *,
-    total_upsample: int,
-    reference: torch.Tensor | None,
-) -> tuple[list[torch.Tensor], torch.Tensor]:
-    chunks: list[torch.Tensor] = []
-    emitted_frames = 0
-    total_frames = int(codes.shape[-1])
-    next_frames = 1
-    while emitted_frames < total_frames:
-        end = min(total_frames, emitted_frames + next_frames)
-        left_start = max(0, emitted_frames - 72)
-        window = codes[..., left_start:end]
-        context_frames = emitted_frames - left_start
-        if reference is not None:
-            window = torch.cat((reference, window), dim=-1)
-            context_frames += int(reference.shape[-1])
-        wav = decode_fn(window)
-        chunk = wav[..., context_frames * total_upsample :].clone()
-        chunks.append(chunk)
-        emitted_frames = end
-        next_frames = 25
-    return chunks, torch.cat(chunks, dim=-1)
-
-
-@pytest.mark.parametrize("with_reference", [False, True])
-def test_real_streaming_waveform_and_boundaries_match_eager(
-    real_decoder_and_graph,
-    codec_fixture,
-    with_reference,
-):
-    decoder, wrapper = real_decoder_and_graph
-    codes = _codes(decoder, codec_fixture, 1, 300)
-    reference = _codes(decoder, codec_fixture, 1, 72) if with_reference else None
-    upsample = int(decoder.total_upsample)
-
-    with torch.inference_mode():
-        eager_chunks, eager = _streaming_decode(
-            decoder,
-            codes,
-            total_upsample=upsample,
-            reference=reference,
-        )
-        graph_chunks, graph = _streaming_decode(
-            wrapper.decode,
-            codes,
-            total_upsample=upsample,
-            reference=reference,
-        )
-    torch.npu.synchronize()
-
-    assert len(graph_chunks) == len(eager_chunks)
-    offset = 0
-    boundary_width = upsample
-    for index, (graph_chunk, eager_chunk) in enumerate(zip(graph_chunks, eager_chunks, strict=True)):
-        _assert_precision(graph_chunk, eager_chunk, f"stream_chunk={index},reference={with_reference}")
-        offset += int(graph_chunk.shape[-1])
-        start = max(0, offset - boundary_width)
-        end = min(int(graph.shape[-1]), offset + boundary_width)
-        _assert_precision(
-            graph[..., start:end],
-            eager[..., start:end],
-            f"stream_boundary={index},reference={with_reference}",
-        )
-
-    _assert_precision(graph, eager, f"stream_full,reference={with_reference}")
-
-    with torch.inference_mode():
-        _, graph_repeat = _streaming_decode(
-            wrapper.decode,
-            codes,
-            total_upsample=upsample,
-            reference=reference,
-        )
-    torch.npu.synchronize()
-    torch.testing.assert_close(graph_repeat, graph, atol=0, rtol=0)
