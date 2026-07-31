@@ -109,8 +109,16 @@ def _assert_waveform_close(actual: torch.Tensor, expected: torch.Tensor) -> None
     torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-5)
 
 
-def test_capture_uses_one_pool_and_expected_sparse_shapes(wrapper, capsys):
-    _, graph_wrapper, fake_npu = wrapper
+def test_capture_uses_one_pool_and_expected_sparse_shapes(monkeypatch, capsys):
+    fake_npu = _FakeNPU()
+    monkeypatch.setattr(torch, "npu", fake_npu, raising=False)
+    graph_wrapper = NPUGraphDecoderWrapper(
+        _TinyCausalDecoder().eval(),
+        capture_sizes=[25, 73, 97, 169],
+        extra_capture_shapes=[(2, 25), (2, 97), (2, 169), (4, 97), (4, 169)],
+        num_quantizers=NUM_QUANTIZERS,
+    )
+    graph_wrapper.warmup(torch.device("cpu"))
     expected = {
         (1, 25),
         (1, 73),
@@ -189,16 +197,26 @@ def test_long_then_short_replay_does_not_leak_static_tail(wrapper):
 def test_chunked_decode_matches_eager(wrapper):
     decoder, graph_wrapper, _ = wrapper
     codes = _codes(1, 80)
-    eager_chunks = []
-    start = 0
-    while start < 80:
-        end = min(start + 25, 80)
-        context = 20 if start - 20 > 0 else start
-        eager_chunks.append(decoder(codes[..., start - context : end])[..., context * TOTAL_UPSAMPLE :])
-        start = end
-    eager = torch.cat(eager_chunks, dim=-1)
+    eager = _eager_chunked_decode(decoder, codes, chunk_size=25, left_context_size=20)
     graph = graph_wrapper.chunked_decode_with_npugraph(codes, chunk_size=25, left_context_size=20)
     _assert_waveform_close(graph, eager)
+
+
+def _eager_chunked_decode(
+    decoder: nn.Module,
+    codes: torch.Tensor,
+    *,
+    chunk_size: int,
+    left_context_size: int,
+) -> torch.Tensor:
+    eager_chunks: list[torch.Tensor] = []
+    start = 0
+    while start < codes.shape[-1]:
+        end = min(start + chunk_size, codes.shape[-1])
+        context = left_context_size if start - left_context_size > 0 else start
+        eager_chunks.append(decoder(codes[..., start - context : end])[..., context * TOTAL_UPSAMPLE :])
+        start = end
+    return torch.cat(eager_chunks, dim=-1)
 
 
 def test_variable_length_batched_decode_matches_per_request_eager(wrapper):
@@ -215,8 +233,8 @@ def test_variable_length_batched_decode_matches_per_request_eager(wrapper):
         left_context_size=0,
         max_batch_size=2,
     )
-    eager_long = decoder(long_codes)
-    eager_short = decoder(short_codes)
+    eager_long = _eager_chunked_decode(decoder, long_codes, chunk_size=25, left_context_size=0)
+    eager_short = _eager_chunked_decode(decoder, short_codes, chunk_size=25, left_context_size=0)
     _assert_waveform_close(graph[0:1, :, : eager_long.shape[-1]], eager_long)
     _assert_waveform_close(graph[1:2, :, : eager_short.shape[-1]], eager_short)
 
