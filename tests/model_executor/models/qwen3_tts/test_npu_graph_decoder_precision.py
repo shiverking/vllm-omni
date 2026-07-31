@@ -7,6 +7,7 @@ import gc
 import math
 import os
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -63,7 +64,23 @@ def real_decoder_and_graph():
         extra_capture_shapes=[(2, 97), (2, 169)],
         num_quantizers=int(decoder.config.num_quantizers),
     )
-    wrapper.warmup(torch.device("npu"))
+    # Code2Wav always uses one ordinary, monotonically increasing position-id
+    # sequence per request. Transformers nevertheless probes for packed
+    # sequences inside create_causal_mask() and consumes an NPU ``.all()`` in a
+    # Python branch. That scalar synchronization is illegal while an NPUGraph
+    # stream is being captured. Returning None is exactly the normal result for
+    # these non-packed position ids; it only moves that data-dependent probe out
+    # of the precision test's captured region and does not change the mask.
+    print(
+        "[Qwen3-TTS][NPU Code2Wav precision] "
+        "non-packed causal-mask capture workaround active",
+        flush=True,
+    )
+    with patch(
+        "transformers.masking_utils.find_packed_sequence_indices",
+        return_value=None,
+    ):
+        wrapper.warmup(torch.device("npu"))
     if not wrapper.graphs:
         pytest.fail("No Code2Wav NPU graph was captured")
 
