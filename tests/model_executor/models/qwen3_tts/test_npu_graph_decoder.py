@@ -161,14 +161,14 @@ def test_exact_shape_matches_eager_bitwise(wrapper, frames):
 
 
 @pytest.mark.parametrize(
-    ("frames", "graph_frames"),
-    [(1, 25), (26, 73), (74, 97), (98, 169)],
+    "frames",
+    [1, 26, 74, 98],
 )
-def test_padded_shape_matches_eager_and_trims_output(wrapper, frames, graph_frames):
+def test_non_exact_shape_falls_back_to_eager(wrapper, frames):
     decoder, graph_wrapper, _ = wrapper
     codes = _codes(1, frames)
-    _assert_waveform_close(graph_wrapper.decode(codes), decoder(codes))
-    assert graph_wrapper._get_graph_key(1, frames) == (1, graph_frames)
+    torch.testing.assert_close(graph_wrapper.decode(codes), decoder(codes), atol=0, rtol=0)
+    assert graph_wrapper._get_graph_key(1, frames) is None
 
 
 @pytest.mark.parametrize(("batch_size", "frames"), [(2, 97), (2, 169), (4, 97)])
@@ -184,14 +184,15 @@ def test_uncaptured_shape_falls_back_to_eager(wrapper):
     torch.testing.assert_close(graph_wrapper.decode(codes), decoder(codes), atol=0, rtol=0)
 
 
-def test_long_then_short_replay_does_not_leak_static_tail(wrapper):
-    decoder, graph_wrapper, _ = wrapper
-    _ = graph_wrapper.decode(_codes(1, 169))
-    short_codes = _codes(1, 98)
-    first = graph_wrapper.decode(short_codes)
-    second = graph_wrapper.decode(short_codes)
-    _assert_waveform_close(first, decoder(short_codes))
-    torch.testing.assert_close(second, first, atol=0, rtol=0)
+def test_exact_graph_output_survives_later_replay(wrapper):
+    _, graph_wrapper, _ = wrapper
+    codes = _codes(1, 169)
+    first = graph_wrapper.decode(codes)
+    expected = first.clone()
+
+    _ = graph_wrapper.decode(torch.flip(codes, dims=[-1]))
+
+    torch.testing.assert_close(first, expected, atol=0, rtol=0)
 
 
 def test_chunked_decode_matches_eager(wrapper):
@@ -246,5 +247,21 @@ def test_active_print_is_once_per_graph_key(wrapper, capsys):
     graph_wrapper.decode(_codes(1, 20))
     graph_wrapper.decode(_codes(1, 25))
     output = capsys.readouterr().out
-    assert output.count("[Qwen3-TTS][NPU Code2Wav graph] active") == 1
-    assert "batch_size=1 actual_frames=25 graph_frames=25" in output
+    assert output.count("[Qwen3-TTS][NPU Code2Wav graph] exact hit") == 1
+    assert output.count("[Qwen3-TTS][NPU Code2Wav graph] eager fallback") == 1
+    assert "exact hit batch_size=1 frames=25" in output
+    assert "eager fallback batch_size=1 frames=20 reason=no_exact_graph" in output
+
+
+def test_stats_print_records_exact_hit_probability(wrapper, capsys):
+    _, graph_wrapper, _ = wrapper
+    graph_wrapper.stats_log_every = 3
+    capsys.readouterr()
+    graph_wrapper.decode(_codes(1, 25))
+    graph_wrapper.decode(_codes(1, 20))
+    graph_wrapper.decode(_codes(1, 25))
+    output = capsys.readouterr().out
+    assert "stats total=3 exact_hits=2 fallbacks=1 exact_hit_rate=66.67%" in output
+    assert graph_wrapper._stats_total == 3
+    assert graph_wrapper._stats_exact_hits == 2
+    assert graph_wrapper._stats_fallbacks == 1

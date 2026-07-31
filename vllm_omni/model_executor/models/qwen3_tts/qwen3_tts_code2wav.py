@@ -198,6 +198,7 @@ class Qwen3TTSCode2Wav(nn.Module):
         codec_left_context_frames: int,
         capture_sizes: list[int] | None,
         extra_capture_shapes: list[tuple[int, int]] | None,
+        stats_log_every: int,
     ) -> None:
         """Enable the inner Code2Wav NPU graph when explicitly configured."""
         if not enabled or not hasattr(self.decoder, "enable_npugraph") or device.type != "npu":
@@ -215,6 +216,7 @@ class Qwen3TTSCode2Wav(nn.Module):
             codec_left_context_frames=codec_left_context_frames,
             decode_chunk_size=self._decode_chunk_frames,
             decode_left_context=self._decode_left_context_frames,
+            stats_log_every=stats_log_every,
         )
 
     def _get_decode_batch_bucket_frames(self, actual_frames: int) -> int:
@@ -790,10 +792,20 @@ class Qwen3TTSCode2Wav(nn.Module):
                     "decode_npugraph_extra_capture_shapes",
                     strict_positive=True,
                 )
+                decode_npugraph_stats_log_every = _get_int_config(
+                    "decode_npugraph_stats_log_every",
+                    100,
+                )
+                if decode_npugraph_stats_log_every < 0:
+                    raise ValueError(
+                        "Invalid Qwen3-TTS Code2Wav config "
+                        f"decode_npugraph_stats_log_every={decode_npugraph_stats_log_every}"
+                    )
             else:
                 decode_npugraph = False
                 decode_npugraph_capture_sizes = None
                 decode_npugraph_extra_capture_shapes = None
+                decode_npugraph_stats_log_every = 0
         else:
             decode_cudagraph_capture_sizes = None
             decode_cudagraph_batch_sizes = None
@@ -803,6 +815,7 @@ class Qwen3TTSCode2Wav(nn.Module):
             decode_npugraph = False
             decode_npugraph_capture_sizes = None
             decode_npugraph_extra_capture_shapes = None
+            decode_npugraph_stats_log_every = 0
 
         if decode_enable_tf32 and device.type == "cuda":
             # PyTorch exposes TF32 controls as process-wide CUDA backend
@@ -845,6 +858,7 @@ class Qwen3TTSCode2Wav(nn.Module):
                     codec_left_context_frames=codec_left_context_frames,
                     capture_sizes=decode_npugraph_capture_sizes,
                     extra_capture_shapes=decode_npugraph_extra_capture_shapes,
+                    stats_log_every=decode_npugraph_stats_log_every,
                 )
             except Exception:
                 logger.warning(
