@@ -201,6 +201,7 @@ class Qwen3TTSCode2Wav(nn.Module):
         stats_log_every: int,
         padding_enabled: bool,
         max_pad_frames: int,
+        route_log_file: str | None,
     ) -> None:
         """Enable the inner Code2Wav NPU graph when explicitly configured."""
         if not enabled or not hasattr(self.decoder, "enable_npugraph") or device.type != "npu":
@@ -221,6 +222,7 @@ class Qwen3TTSCode2Wav(nn.Module):
             stats_log_every=stats_log_every,
             padding_enabled=padding_enabled,
             max_pad_frames=max_pad_frames,
+            route_log_file=route_log_file,
         )
 
     def _get_decode_batch_bucket_frames(self, actual_frames: int) -> int:
@@ -806,6 +808,15 @@ class Qwen3TTSCode2Wav(nn.Module):
                         f"decode_npugraph_stats_log_every={decode_npugraph_stats_log_every}"
                     )
                 decode_npugraph_padding = _get_bool_config("decode_npugraph_padding", False)
+                route_log_file_value = extra_cfg.get("decode_npugraph_route_log_file")
+                if route_log_file_value is not None and not isinstance(route_log_file_value, str):
+                    raise ValueError(
+                        "Invalid Qwen3-TTS Code2Wav config "
+                        f"decode_npugraph_route_log_file={route_log_file_value!r}"
+                    )
+                decode_npugraph_route_log_file = (
+                    route_log_file_value.strip() if route_log_file_value and route_log_file_value.strip() else None
+                )
                 decode_npugraph_padding_max_frames = _get_int_config(
                     "decode_npugraph_padding_max_frames",
                     0,
@@ -855,6 +866,7 @@ class Qwen3TTSCode2Wav(nn.Module):
                 decode_npugraph_stats_log_every = 0
                 decode_npugraph_padding = False
                 decode_npugraph_padding_max_frames = 0
+                decode_npugraph_route_log_file = None
         else:
             decode_cudagraph_capture_sizes = None
             decode_cudagraph_batch_sizes = None
@@ -867,6 +879,7 @@ class Qwen3TTSCode2Wav(nn.Module):
             decode_npugraph_stats_log_every = 0
             decode_npugraph_padding = False
             decode_npugraph_padding_max_frames = 0
+            decode_npugraph_route_log_file = None
 
         if decode_enable_tf32 and device.type == "cuda":
             # PyTorch exposes TF32 controls as process-wide CUDA backend
@@ -912,6 +925,7 @@ class Qwen3TTSCode2Wav(nn.Module):
                     stats_log_every=decode_npugraph_stats_log_every,
                     padding_enabled=decode_npugraph_padding,
                     max_pad_frames=decode_npugraph_padding_max_frames,
+                    route_log_file=decode_npugraph_route_log_file,
                 )
             except Exception:
                 logger.warning(

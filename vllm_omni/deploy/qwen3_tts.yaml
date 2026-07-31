@@ -56,6 +56,9 @@ connectors:
       decode_npugraph_padding_max_frames: 0
       decode_npugraph_padding_capture_batch_sizes: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
       decode_npugraph_padding_capture_sizes: [25, 51, 61, 72, 73, 76]
+      # One compact JSONL file. Aggregate actual_frames frequencies to add
+      # high-value exact capture shapes and reduce padded graph selections.
+      decode_npugraph_route_log_file: /tmp/qwen3_tts_code2wav_graph_routes.jsonl
       # Print aggregate exact/padded/fallback probability every N selections.
       decode_npugraph_stats_log_every: 100
 

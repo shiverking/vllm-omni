@@ -4,7 +4,11 @@
 
 from __future__ import annotations
 
+import json
+import os
+from collections import Counter
 from collections.abc import Sequence
+from typing import TextIO
 from unittest.mock import patch
 
 import torch
@@ -28,6 +32,7 @@ class NPUGraphDecoderWrapper:
         stats_log_every: int = 100,
         padding_enabled: bool = False,
         max_pad_frames: int = 0,
+        route_log_file: str | None = None,
     ) -> None:
         self.decoder = decoder
         self._explicit_sizes = capture_sizes is not None
@@ -46,6 +51,10 @@ class NPUGraphDecoderWrapper:
         self.max_pad_frames = int(max_pad_frames)
         if self.max_pad_frames < 0:
             raise ValueError(f"max_pad_frames must be non-negative, got {max_pad_frames}")
+        self.route_log_file = route_log_file
+        self._route_log_handle: TextIO | None = None
+        self._route_log_error_printed = False
+        self._route_log_window: Counter[tuple[str, int, int, int]] = Counter()
 
         self.graphs: dict[tuple[int, int], object] = {}
         self.static_inputs: dict[tuple[int, int], torch.Tensor] = {}
@@ -60,6 +69,78 @@ class NPUGraphDecoderWrapper:
         self._stats_fallbacks = 0
         self._warmed_up = False
         self._device: torch.device | None = None
+
+    def _open_route_log(self) -> None:
+        if self.route_log_file is None or self._route_log_handle is not None:
+            return
+        try:
+            self._route_log_handle = open(self.route_log_file, "a", encoding="utf-8", buffering=1)
+            print(
+                "[Qwen3-TTS][NPU Code2Wav graph] route log enabled "
+                f"path={self.route_log_file}",
+                flush=True,
+            )
+        except OSError as exc:
+            self._disable_route_log(exc)
+
+    def _disable_route_log(self, exc: Exception) -> None:
+        handle = self._route_log_handle
+        self._route_log_handle = None
+        route_log_file = self.route_log_file
+        if handle is not None:
+            try:
+                handle.close()
+            except OSError:
+                pass
+        if not self._route_log_error_printed:
+            self._route_log_error_printed = True
+            print(
+                "[Qwen3-TTS][NPU Code2Wav graph] route log disabled "
+                f"path={route_log_file} error={exc}",
+                flush=True,
+            )
+        self.route_log_file = None
+        self._route_log_window.clear()
+
+    def _record_route_log(
+        self,
+        *,
+        route: str,
+        request_key: tuple[int, int],
+        graph_key: tuple[int, int] | None,
+        fallback_reason: str | None,
+    ) -> None:
+        if self.route_log_file is None:
+            return
+        route_code = route if route != "F" else f"F:{fallback_reason or 'no_graph_bucket'}"
+        graph_frames = graph_key[1] if graph_key is not None else 0
+        self._route_log_window[(route_code, request_key[0], request_key[1], graph_frames)] += 1
+
+    def _flush_route_log(self) -> None:
+        if self._route_log_handle is None or not self._route_log_window:
+            return
+        routes = [
+            [route, batch_size, actual_frames, graph_frames, count]
+            for (route, batch_size, actual_frames, graph_frames), count in sorted(
+                self._route_log_window.items(),
+                key=lambda item: (-item[1], item[0]),
+            )
+        ]
+        record = {
+            "pid": os.getpid(),
+            "total": self._stats_total,
+            "exact": self._stats_exact_hits,
+            "padded": self._stats_padded_hits,
+            "fallback": self._stats_fallbacks,
+            "window": sum(self._route_log_window.values()),
+            "routes": routes,
+        }
+        try:
+            self._route_log_handle.write(json.dumps(record, separators=(",", ":")) + "\n")
+            self._route_log_handle.flush()
+            self._route_log_window.clear()
+        except (OSError, ValueError) as exc:
+            self._disable_route_log(exc)
 
     @staticmethod
     def compute_capture_sizes(
@@ -130,6 +211,7 @@ class NPUGraphDecoderWrapper:
             )
 
         capture_shapes = self._get_capture_shapes()
+        self._open_route_log()
         print(
             "[Qwen3-TTS][NPU Code2Wav graph] enabled "
             f"capture_shapes={capture_shapes} "
@@ -239,6 +321,7 @@ class NPUGraphDecoderWrapper:
     ) -> None:
         self._stats_total += 1
         if graph_key == request_key:
+            route = "E"
             self._stats_exact_hits += 1
             if graph_key not in self._printed_active_graph_keys:
                 self._printed_active_graph_keys.add(graph_key)
@@ -248,10 +331,11 @@ class NPUGraphDecoderWrapper:
                     flush=True,
                 )
         elif graph_key is not None:
+            route = "P"
             self._stats_padded_hits += 1
-            route = (request_key[0], request_key[1], graph_key[1])
-            if route not in self._printed_padded_routes:
-                self._printed_padded_routes.add(route)
+            padded_route = (request_key[0], request_key[1], graph_key[1])
+            if padded_route not in self._printed_padded_routes:
+                self._printed_padded_routes.add(padded_route)
                 print(
                     "[Qwen3-TTS][NPU Code2Wav graph] padded hit "
                     f"batch_size={request_key[0]} "
@@ -261,6 +345,7 @@ class NPUGraphDecoderWrapper:
                     flush=True,
                 )
         else:
+            route = "F"
             self._stats_fallbacks += 1
             reason = fallback_reason or "no_graph_bucket"
             fallback_key = (request_key[0], request_key[1], reason)
@@ -272,12 +357,20 @@ class NPUGraphDecoderWrapper:
                     f"reason={reason}",
                     flush=True,
                 )
+        self._record_route_log(
+            route=route,
+            request_key=request_key,
+            graph_key=graph_key,
+            fallback_reason=fallback_reason,
+        )
         if self.stats_log_every > 0 and self._stats_total % self.stats_log_every == 0:
             self._print_stats()
+            self._flush_route_log()
 
     def log_decode_stats(self) -> None:
         if self._stats_total > 0:
             self._print_stats()
+            self._flush_route_log()
 
     def _decode(self, codes: torch.Tensor, *, clone_graph_output: bool) -> torch.Tensor:
         if not self.enabled or not self._warmed_up:
