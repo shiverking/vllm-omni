@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import gc
 import json
+import math
 import os
 from collections import defaultdict
 from pathlib import Path
@@ -138,6 +139,136 @@ def _synthetic_codes(decoder: Any, batch_size: int, frames: int, seed: int) -> t
         dtype=torch.long,
     )
     return codes.to(device="npu", non_blocking=False)
+
+
+@pytest.fixture(scope="module")
+def quick_codec_fixture(real_decoder):
+    fixture_value = os.environ.get("QWEN3_TTS_PRECISION_CODES")
+    if not fixture_value:
+        return None
+    return load_codec_tensor(
+        Path(fixture_value),
+        num_quantizers=int(real_decoder.config.num_quantizers),
+        codebook_size=int(real_decoder.config.codebook_size),
+    )[:1]
+
+
+def _quick_eager_codes(
+    decoder: Any,
+    frames: int,
+    codec_fixture: torch.Tensor | None,
+) -> torch.Tensor:
+    if codec_fixture is not None:
+        value = codec_fixture
+        repeats = math.ceil(frames / int(value.shape[-1]))
+        value = value.repeat(1, 1, repeats)[..., :frames]
+        return value.to(device="npu", non_blocking=False)
+    return _synthetic_codes(decoder, 1, frames, seed=20260731)
+
+
+def _quick_eager_metrics(candidate: torch.Tensor, eager: torch.Tensor) -> dict[str, float]:
+    candidate_cpu = candidate.detach().cpu().to(torch.float64).reshape(-1)
+    eager_cpu = eager.detach().cpu().to(torch.float64).reshape(-1)
+    error = candidate_cpu - eager_cpu
+    absolute_error = error.abs()
+    signal = float(torch.sum(eager_cpu.square()))
+    noise = float(torch.sum(error.square()))
+    if noise == 0:
+        snr_db = math.inf
+    elif signal == 0:
+        snr_db = -math.inf
+    else:
+        snr_db = 10.0 * math.log10(signal / noise)
+    denominator = float(torch.linalg.vector_norm(eager_cpu) * torch.linalg.vector_norm(candidate_cpu))
+    cosine = float(torch.dot(eager_cpu, candidate_cpu)) / denominator if denominator > 0 else 1.0
+    return {
+        "max_abs": float(absolute_error.max()) if absolute_error.numel() else 0.0,
+        "mean_abs": float(absolute_error.mean()) if absolute_error.numel() else 0.0,
+        "p99_abs": float(torch.quantile(absolute_error, 0.99)) if absolute_error.numel() else 0.0,
+        "cosine": cosine,
+        "snr_db": snr_db,
+    }
+
+
+@pytest.mark.npu
+@pytest.mark.A2
+@pytest.mark.tts
+@pytest.mark.full_model
+@pytest.mark.slow
+def test_eager_zero_padding_quick_b1(real_decoder, quick_codec_fixture):
+    """Quickly measure eager-only right-padding error without graph capture."""
+    results: list[dict[str, float | int]] = []
+    threshold_failures: list[str] = []
+    assert_thresholds = os.environ.get("QWEN3_TTS_PADDING_EAGER_QUICK_ASSERT", "").lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+    for actual_frames, padded_frames in CRITICAL_PAIRS:
+        codes = _quick_eager_codes(real_decoder, actual_frames, quick_codec_fixture)
+        padded_codes = codes.new_zeros((1, int(real_decoder.config.num_quantizers), padded_frames))
+        padded_codes[..., :actual_frames].copy_(codes)
+        with torch.inference_mode():
+            eager_exact = real_decoder(codes).clone()
+            eager_padded_full = real_decoder(padded_codes)
+        torch.npu.synchronize()
+
+        expected_length = actual_frames * int(real_decoder.total_upsample)
+        assert int(eager_exact.shape[-1]) == expected_length
+        assert int(eager_padded_full.shape[-1]) >= expected_length
+        eager_padded = eager_padded_full[..., :expected_length].clone()
+        assert eager_padded.shape == eager_exact.shape
+        assert eager_padded.dtype == eager_exact.dtype == torch.float32
+        assert bool(torch.isfinite(eager_exact).all())
+        assert bool(torch.isfinite(eager_padded).all())
+        assert float(eager_exact.min()) >= -1.0
+        assert float(eager_exact.max()) <= 1.0
+        assert float(eager_padded.min()) >= -1.0
+        assert float(eager_padded.max()) <= 1.0
+
+        metrics = _quick_eager_metrics(eager_padded, eager_exact)
+        result: dict[str, float | int] = {
+            "actual_frames": actual_frames,
+            "padded_frames": padded_frames,
+            "padding_frames": padded_frames - actual_frames,
+            **metrics,
+        }
+        results.append(result)
+        print(
+            "[Qwen3-TTS][Code2Wav padding eager quick]\n"
+            f"F={actual_frames} P={padded_frames} pad={padded_frames - actual_frames}\n"
+            f"max_abs={metrics['max_abs']:.9g} "
+            f"mean_abs={metrics['mean_abs']:.9g} "
+            f"p99_abs={metrics['p99_abs']:.9g} "
+            f"cosine={metrics['cosine']:.9g} "
+            f"snr_db={metrics['snr_db']:.6g}",
+            flush=True,
+        )
+        if assert_thresholds and (
+            metrics["max_abs"] > 5e-3
+            or metrics["cosine"] < 0.9999
+            or metrics["snr_db"] < 60.0
+        ):
+            threshold_failures.append(
+                f"F={actual_frames},P={padded_frames},metrics={json.dumps(metrics, allow_nan=True)}"
+            )
+
+    sorted_results = sorted(results, key=lambda item: float(item["max_abs"]), reverse=True)
+    print(
+        "[Qwen3-TTS][Code2Wav padding eager quick] summary_by_max_abs\n"
+        + "\n".join(
+            f"F={item['actual_frames']} P={item['padded_frames']} "
+            f"pad={item['padding_frames']} max_abs={float(item['max_abs']):.9g} "
+            f"mean_abs={float(item['mean_abs']):.9g} p99_abs={float(item['p99_abs']):.9g} "
+            f"cosine={float(item['cosine']):.9g} snr_db={float(item['snr_db']):.6g}"
+            for item in sorted_results
+        ),
+        flush=True,
+    )
+    if threshold_failures:
+        pytest.fail("Padding eager quick thresholds failed:\n" + "\n".join(threshold_failures))
 
 
 def _all_shape_pairs() -> list[tuple[int, int]]:
