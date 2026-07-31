@@ -271,6 +271,98 @@ def test_eager_zero_padding_quick_b1(real_decoder, quick_codec_fixture):
         pytest.fail("Padding eager quick thresholds failed:\n" + "\n".join(threshold_failures))
 
 
+@pytest.mark.npu
+@pytest.mark.A2
+@pytest.mark.tts
+@pytest.mark.full_model
+@pytest.mark.slow
+def test_graph_zero_padding_quick_b1(real_decoder, quick_codec_fixture):
+    """Quickly compare zero-padded graph replay directly with exact eager."""
+    capture_sizes = sorted({padded_frames for _, padded_frames in CRITICAL_PAIRS})
+    wrapper = NPUGraphDecoderWrapper(
+        real_decoder,
+        capture_sizes=capture_sizes,
+        num_quantizers=int(real_decoder.config.num_quantizers),
+        stats_log_every=0,
+    )
+    wrapper.warmup(torch.device("npu"))
+    missing = {(1, size) for size in capture_sizes} - set(wrapper.graphs)
+    if missing:
+        pytest.fail(f"Failed to capture quick padding graphs: {sorted(missing)}")
+
+    results: list[dict[str, float | int]] = []
+    threshold_failures: list[str] = []
+    assert_thresholds = os.environ.get("QWEN3_TTS_PADDING_GRAPH_QUICK_ASSERT", "").lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    try:
+        for actual_frames, padded_frames in CRITICAL_PAIRS:
+            codes = _quick_eager_codes(real_decoder, actual_frames, quick_codec_fixture)
+            with torch.inference_mode():
+                eager_exact = real_decoder(codes).clone()
+                graph_padded = graph_padded_decode(wrapper, codes, padded_frames, "zero")
+            torch.npu.synchronize()
+
+            expected_length = actual_frames * int(real_decoder.total_upsample)
+            assert int(eager_exact.shape[-1]) == expected_length
+            assert int(graph_padded.shape[-1]) == expected_length
+            assert graph_padded.shape == eager_exact.shape
+            assert graph_padded.dtype == eager_exact.dtype == torch.float32
+            assert bool(torch.isfinite(eager_exact).all())
+            assert bool(torch.isfinite(graph_padded).all())
+            assert float(eager_exact.min()) >= -1.0
+            assert float(eager_exact.max()) <= 1.0
+            assert float(graph_padded.min()) >= -1.0
+            assert float(graph_padded.max()) <= 1.0
+
+            metrics = _quick_eager_metrics(graph_padded, eager_exact)
+            result: dict[str, float | int] = {
+                "actual_frames": actual_frames,
+                "padded_frames": padded_frames,
+                "padding_frames": padded_frames - actual_frames,
+                **metrics,
+            }
+            results.append(result)
+            print(
+                "[Qwen3-TTS][Code2Wav graph padding quick]\n"
+                f"F={actual_frames} P={padded_frames} pad={padded_frames - actual_frames}\n"
+                f"max_abs={metrics['max_abs']:.9g} "
+                f"mean_abs={metrics['mean_abs']:.9g} "
+                f"p99_abs={metrics['p99_abs']:.9g} "
+                f"cosine={metrics['cosine']:.9g} "
+                f"snr_db={metrics['snr_db']:.6g}",
+                flush=True,
+            )
+            if assert_thresholds and (
+                metrics["max_abs"] > 5e-3
+                or metrics["cosine"] < 0.9999
+                or metrics["snr_db"] < 60.0
+            ):
+                threshold_failures.append(
+                    f"F={actual_frames},P={padded_frames},metrics={json.dumps(metrics, allow_nan=True)}"
+                )
+    finally:
+        _release_wrapper(wrapper)
+
+    sorted_results = sorted(results, key=lambda item: float(item["max_abs"]), reverse=True)
+    print(
+        "[Qwen3-TTS][Code2Wav graph padding quick] summary_by_max_abs\n"
+        + "\n".join(
+            f"F={item['actual_frames']} P={item['padded_frames']} "
+            f"pad={item['padding_frames']} max_abs={float(item['max_abs']):.9g} "
+            f"mean_abs={float(item['mean_abs']):.9g} p99_abs={float(item['p99_abs']):.9g} "
+            f"cosine={float(item['cosine']):.9g} snr_db={float(item['snr_db']):.6g}"
+            for item in sorted_results
+        ),
+        flush=True,
+    )
+    if threshold_failures:
+        pytest.fail("Graph padding quick thresholds failed:\n" + "\n".join(threshold_failures))
+
+
 def _all_shape_pairs() -> list[tuple[int, int]]:
     pairs = set(CRITICAL_PAIRS)
     for padded_frames in BUCKETS:
