@@ -63,6 +63,15 @@ CRITICAL_PAIRS = (
     (1, 25),
     (170, 325),
 )
+MULTI_BATCH_QUICK_PAIRS = (
+    (1, 25),
+    (26, 51),
+    (51, 61),
+    (53, 61),
+    (61, 72),
+    (72, 73),
+    (74, 76),
+)
 THRESHOLDS = PaddingThresholds()
 
 
@@ -150,20 +159,22 @@ def quick_codec_fixture(real_decoder):
         Path(fixture_value),
         num_quantizers=int(real_decoder.config.num_quantizers),
         codebook_size=int(real_decoder.config.codebook_size),
-    )[:1]
+    )
 
 
 def _quick_eager_codes(
     decoder: Any,
     frames: int,
     codec_fixture: torch.Tensor | None,
+    batch_size: int = 1,
 ) -> torch.Tensor:
     if codec_fixture is not None:
         value = codec_fixture
-        repeats = math.ceil(frames / int(value.shape[-1]))
-        value = value.repeat(1, 1, repeats)[..., :frames]
+        batch_repeats = math.ceil(batch_size / int(value.shape[0]))
+        frame_repeats = math.ceil(frames / int(value.shape[-1]))
+        value = value.repeat(batch_repeats, 1, frame_repeats)[:batch_size, :, :frames]
         return value.to(device="npu", non_blocking=False)
-    return _synthetic_codes(decoder, 1, frames, seed=20260731)
+    return _synthetic_codes(decoder, batch_size, frames, seed=20260731)
 
 
 def _quick_eager_metrics(candidate: torch.Tensor, eager: torch.Tensor) -> dict[str, float]:
@@ -361,6 +372,121 @@ def test_graph_zero_padding_quick_b1(real_decoder, quick_codec_fixture):
     )
     if threshold_failures:
         pytest.fail("Graph padding quick thresholds failed:\n" + "\n".join(threshold_failures))
+
+
+@pytest.mark.npu
+@pytest.mark.A2
+@pytest.mark.tts
+@pytest.mark.full_model
+@pytest.mark.slow
+@pytest.mark.parametrize("batch_size", BATCH_SIZES[1:])
+def test_multi_batch_graph_padding_vs_eager_padding_quick(
+    real_decoder,
+    quick_codec_fixture,
+    batch_size,
+):
+    """Isolate multi-batch NPU graph replay error at an identical padded shape."""
+    capture_sizes = sorted({padded_frames for _, padded_frames in MULTI_BATCH_QUICK_PAIRS})
+    capture_shapes = [(batch_size, padded_frames) for padded_frames in capture_sizes]
+    wrapper = NPUGraphDecoderWrapper(
+        real_decoder,
+        capture_sizes=[],
+        extra_capture_shapes=capture_shapes,
+        num_quantizers=int(real_decoder.config.num_quantizers),
+        stats_log_every=0,
+    )
+    wrapper.warmup(torch.device("npu"))
+    missing = set(capture_shapes) - set(wrapper.graphs)
+    if missing:
+        pytest.fail(f"Failed to capture multi-batch quick padding graphs: {sorted(missing)}")
+
+    results: list[dict[str, float | int]] = []
+    threshold_failures: list[str] = []
+    assert_thresholds = os.environ.get(
+        "QWEN3_TTS_PADDING_MULTI_GRAPH_QUICK_ASSERT",
+        "",
+    ).lower() in {"1", "true", "yes", "on"}
+    try:
+        for actual_frames, padded_frames in MULTI_BATCH_QUICK_PAIRS:
+            codes = _quick_eager_codes(
+                real_decoder,
+                actual_frames,
+                quick_codec_fixture,
+                batch_size=batch_size,
+            )
+            padded_codes = codes.new_zeros(
+                (batch_size, int(real_decoder.config.num_quantizers), padded_frames)
+            )
+            padded_codes[..., :actual_frames].copy_(codes)
+            with torch.inference_mode():
+                eager_padded_full = real_decoder(padded_codes)
+                graph_padded = graph_padded_decode(wrapper, codes, padded_frames, "zero")
+            torch.npu.synchronize()
+
+            expected_length = actual_frames * int(real_decoder.total_upsample)
+            assert int(eager_padded_full.shape[-1]) >= expected_length
+            eager_padded = eager_padded_full[..., :expected_length].clone()
+            assert graph_padded.shape == eager_padded.shape
+            assert graph_padded.dtype == eager_padded.dtype == torch.float32
+            assert bool(torch.isfinite(eager_padded).all())
+            assert bool(torch.isfinite(graph_padded).all())
+            assert float(eager_padded.min()) >= -1.0
+            assert float(eager_padded.max()) <= 1.0
+            assert float(graph_padded.min()) >= -1.0
+            assert float(graph_padded.max()) <= 1.0
+
+            metrics = _quick_eager_metrics(graph_padded, eager_padded)
+            row_errors = (graph_padded - eager_padded).detach().abs().reshape(batch_size, -1)
+            worst_row_max_abs = float(row_errors.amax(dim=1).max())
+            result: dict[str, float | int] = {
+                "batch_size": batch_size,
+                "actual_frames": actual_frames,
+                "padded_frames": padded_frames,
+                "padding_frames": padded_frames - actual_frames,
+                "worst_row_max_abs": worst_row_max_abs,
+                **metrics,
+            }
+            results.append(result)
+            print(
+                "[Qwen3-TTS][Code2Wav multi-batch graph vs eager padding quick]\n"
+                f"B={batch_size} F={actual_frames} P={padded_frames} "
+                f"pad={padded_frames - actual_frames}\n"
+                f"max_abs={metrics['max_abs']:.9g} "
+                f"worst_row_max_abs={worst_row_max_abs:.9g} "
+                f"mean_abs={metrics['mean_abs']:.9g} "
+                f"p99_abs={metrics['p99_abs']:.9g} "
+                f"cosine={metrics['cosine']:.9g} "
+                f"snr_db={metrics['snr_db']:.6g}",
+                flush=True,
+            )
+            if assert_thresholds and (
+                metrics["max_abs"] > 1e-4
+                or metrics["mean_abs"] > 1e-6
+                or metrics["cosine"] < 0.99999
+                or metrics["snr_db"] < 80.0
+            ):
+                threshold_failures.append(
+                    f"B={batch_size},F={actual_frames},P={padded_frames},"
+                    f"metrics={json.dumps(metrics, allow_nan=True)}"
+                )
+    finally:
+        _release_wrapper(wrapper)
+
+    sorted_results = sorted(results, key=lambda item: float(item["max_abs"]), reverse=True)
+    print(
+        f"[Qwen3-TTS][Code2Wav multi-batch graph vs eager padding quick] "
+        f"B={batch_size} summary_by_max_abs\n"
+        + "\n".join(
+            f"B={item['batch_size']} F={item['actual_frames']} P={item['padded_frames']} "
+            f"pad={item['padding_frames']} max_abs={float(item['max_abs']):.9g} "
+            f"mean_abs={float(item['mean_abs']):.9g} p99_abs={float(item['p99_abs']):.9g} "
+            f"cosine={float(item['cosine']):.9g} snr_db={float(item['snr_db']):.6g}"
+            for item in sorted_results
+        ),
+        flush=True,
+    )
+    if threshold_failures:
+        pytest.fail("Multi-batch graph vs eager padding thresholds failed:\n" + "\n".join(threshold_failures))
 
 
 def _all_shape_pairs() -> list[tuple[int, int]]:
