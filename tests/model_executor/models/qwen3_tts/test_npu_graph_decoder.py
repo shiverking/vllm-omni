@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from contextlib import nullcontext
 
 import pytest
@@ -400,3 +401,54 @@ def test_padding_prints_and_stats_are_split_by_route(padding_wrapper, capsys):
     assert graph_wrapper._stats_exact_hits == 1
     assert graph_wrapper._stats_padded_hits == 2
     assert graph_wrapper._stats_fallbacks == 1
+
+
+def test_route_log_writes_one_compact_aggregate_line_per_stats_window(monkeypatch, tmp_path):
+    fake_npu = _FakeNPU()
+    monkeypatch.setattr(torch, "npu", fake_npu, raising=False)
+    decoder = _TinyCausalDecoder().eval()
+    route_log_file = tmp_path / "code2wav-routes.jsonl"
+    graph_wrapper = NPUGraphDecoderWrapper(
+        decoder,
+        capture_sizes=[25, 51],
+        num_quantizers=NUM_QUANTIZERS,
+        padding_enabled=True,
+        stats_log_every=3,
+        route_log_file=str(route_log_file),
+    )
+    graph_wrapper.warmup(torch.device("cpu"))
+    for key in graph_wrapper.graphs:
+        static_input = graph_wrapper.static_inputs[key]
+        static_output = graph_wrapper.static_outputs[key]
+
+        def replay(inp=static_input, out=static_output):
+            out.copy_(decoder(inp))
+
+        graph_wrapper.graphs[key] = _CapturedGraph(replay)
+
+    graph_wrapper.decode(_codes(1, 25))
+    graph_wrapper.decode(_codes(1, 26))
+    assert route_log_file.read_text(encoding="utf-8") == ""
+    graph_wrapper.decode(_codes(3, 26))
+
+    lines = route_log_file.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 1
+    record = json.loads(lines[0])
+    assert {key: record[key] for key in ("total", "exact", "padded", "fallback", "window")} == {
+        "total": 3,
+        "exact": 1,
+        "padded": 1,
+        "fallback": 1,
+        "window": 3,
+    }
+    assert record["routes"] == [
+        ["E", 1, 25, 25, 1],
+        ["F:no_graph_bucket", 3, 26, 0, 1],
+        ["P", 1, 26, 51, 1],
+    ]
+
+    graph_wrapper.decode(_codes(1, 26))
+    graph_wrapper.log_decode_stats()
+    lines = route_log_file.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 2
+    assert json.loads(lines[1])["routes"] == [["P", 1, 26, 51, 1]]
