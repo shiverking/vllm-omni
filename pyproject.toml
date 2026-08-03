@@ -274,7 +274,6 @@ markers = [
     # more detailed markers
     "slow: Slow tests (may skip in quick CI)",
     "benchmark: Benchmark tests",
-    "padding_corpus: Code2Wav padding production-corpus precision tests",
 ]
 filterwarnings = [
     "ignore:.*does not have '__test__' attribute.*:UserWarning",
