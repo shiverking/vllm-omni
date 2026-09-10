@@ -30,6 +30,7 @@ connectors:
       # MTP codebook with a one-token query and a static per-layer KV cache.
       code_predictor_kv_cache: true
       code_predictor_kv_cache_buckets: [1, 2, 4, 8, 16]
+      code_predictor_fia_gqa: true
       code_predictor_prefix_graphs: false
       # Emit only the first audio chunk early, then return to codec_chunk_frames.
       initial_codec_chunk_frames: 1
