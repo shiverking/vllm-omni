@@ -27,6 +27,7 @@ class _FakeDecoder(nn.Module):
         self.batched_decode_calls: list[dict[str, int]] = []
         self.decode_codes: list[torch.Tensor] = []
         self.cudagraph_calls: list[dict[str, int | torch.device]] = []
+        self.npugraph_calls: list[dict[str, object]] = []
 
     def to(self, *args, **kwargs):
         return self
@@ -80,6 +81,9 @@ class _FakeDecoder(nn.Module):
 
     def enable_cudagraph(self, **kwargs):
         self.cudagraph_calls.append(kwargs)
+
+    def enable_npugraph(self, **kwargs):
+        self.npugraph_calls.append(kwargs)
 
 
 def _fake_dec_config():
@@ -578,6 +582,254 @@ def test_cudagraph_capture_shapes_can_be_configured():
     assert call["capture_sizes"] == [97, 325]
     assert call["capture_batch_sizes"] == [1, 2, 4, 8]
     assert call["extra_capture_shapes"] == [(3, 325), (5, 325)]
+
+
+def test_npugraph_capture_shapes_can_be_configured():
+    npu_device = SimpleNamespace(type="npu")
+    model = _make_model(
+        async_chunk=True,
+        device=npu_device,
+        stage_connector_config={
+            "extra": {
+                "codec_chunk_frames": 25,
+                "codec_left_context_frames": 72,
+                "decode_npugraph": True,
+                "decode_npugraph_capture_sizes": "25,73,97,169",
+                "decode_npugraph_extra_capture_shapes": ["2:97", [4, 169]],
+                "decode_npugraph_stats_log_every": 17,
+            }
+        },
+    )
+
+    _load_weights_noop(model)
+
+    assert model.decoder.npugraph_calls == [
+        {
+            "capture_sizes": [25, 73, 97, 169],
+            "extra_capture_shapes": [(2, 97), (4, 169)],
+            "device": npu_device,
+            "codec_chunk_frames": 25,
+            "codec_left_context_frames": 72,
+            "decode_chunk_size": 300,
+            "decode_left_context": 25,
+            "stats_log_every": 17,
+            "padding_enabled": False,
+            "max_pad_frames": 0,
+            "route_log_file": None,
+        }
+    ]
+    assert model.decoder.cudagraph_calls == []
+
+
+@pytest.mark.parametrize("configured", [False, None])
+def test_npugraph_disabled_or_missing_keeps_npu_eager(configured):
+    extra = {}
+    if configured is not None:
+        extra["decode_npugraph"] = configured
+    model = _make_model(
+        device=SimpleNamespace(type="npu"),
+        stage_connector_config={"extra": extra},
+    )
+    _load_weights_noop(model)
+    assert model.decoder.npugraph_calls == []
+
+
+def test_npugraph_respects_enforce_eager():
+    model = _make_model(
+        device=SimpleNamespace(type="npu"),
+        stage_connector_config={"extra": {"decode_npugraph": True}},
+    )
+    model.vllm_config.model_config.enforce_eager = True
+    _load_weights_noop(model)
+    assert model.decoder.npugraph_calls == []
+
+
+def test_npugraph_padding_config_builds_cartesian_product_and_deduplicates():
+    npu_device = SimpleNamespace(type="npu")
+    model = _make_model(
+        device=npu_device,
+        stage_connector_config={
+            "extra": {
+                "decode_npugraph": True,
+                "decode_npugraph_extra_capture_shapes": [[2, 25], [4, 97]],
+                "decode_npugraph_padding": True,
+                "decode_npugraph_padding_max_frames": 0,
+                "decode_npugraph_padding_capture_batch_sizes": [1, 2],
+                "decode_npugraph_padding_capture_sizes": [25, 51],
+                "decode_npugraph_route_log_file": "/tmp/code2wav-routes.jsonl",
+            }
+        },
+    )
+    _load_weights_noop(model)
+
+    call = model.decoder.npugraph_calls[-1]
+    assert call["extra_capture_shapes"] == [
+        (1, 25),
+        (1, 51),
+        (2, 25),
+        (2, 51),
+        (4, 97),
+    ]
+    assert call["padding_enabled"] is True
+    assert call["max_pad_frames"] == 0
+    assert call["route_log_file"] == "/tmp/code2wav-routes.jsonl"
+
+
+def test_disabled_npugraph_padding_does_not_expand_capture_shapes():
+    model = _make_model(
+        device=SimpleNamespace(type="npu"),
+        stage_connector_config={
+            "extra": {
+                "decode_npugraph": True,
+                "decode_npugraph_extra_capture_shapes": [[4, 97]],
+                "decode_npugraph_padding": False,
+                "decode_npugraph_padding_capture_batch_sizes": [1, 2],
+                "decode_npugraph_padding_capture_sizes": [25, 51],
+            }
+        },
+    )
+    _load_weights_noop(model)
+
+    call = model.decoder.npugraph_calls[-1]
+    assert call["extra_capture_shapes"] == [(4, 97)]
+    assert call["padding_enabled"] is False
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        {
+            "decode_npugraph_padding_capture_batch_sizes": [1, 2],
+        },
+        {
+            "decode_npugraph_padding_capture_sizes": [25, 51],
+        },
+        {
+            "decode_npugraph_padding_capture_batch_sizes": [1, 0],
+            "decode_npugraph_padding_capture_sizes": [25],
+        },
+        {
+            "decode_npugraph_padding_capture_batch_sizes": [1],
+            "decode_npugraph_padding_capture_sizes": [25, 0],
+        },
+        {
+            "decode_npugraph_padding_max_frames": -1,
+        },
+    ],
+)
+def test_invalid_npugraph_padding_config_is_rejected_on_npu(extra):
+    model = _make_model(
+        device=SimpleNamespace(type="npu"),
+        stage_connector_config={"extra": {"decode_npugraph": True, **extra}},
+    )
+    with pytest.raises(ValueError, match="decode_npugraph_padding"):
+        _load_weights_noop(model)
+
+
+def test_cuda_ignores_invalid_npugraph_padding_config():
+    model = _make_model(
+        device=torch.device("cuda"),
+        stage_connector_config={
+            "extra": {
+                "decode_npugraph": True,
+                "decode_npugraph_padding_max_frames": -1,
+                "decode_npugraph_padding_capture_batch_sizes": [0],
+            }
+        },
+    )
+    _load_weights_noop(model)
+    assert model.decoder.npugraph_calls == []
+
+
+def test_invalid_npugraph_route_log_file_is_rejected_on_npu():
+    model = _make_model(
+        device=SimpleNamespace(type="npu"),
+        stage_connector_config={
+            "extra": {
+                "decode_npugraph": True,
+                "decode_npugraph_route_log_file": 123,
+            }
+        },
+    )
+    with pytest.raises(ValueError, match="decode_npugraph_route_log_file"):
+        _load_weights_noop(model)
+
+
+def test_cuda_ignores_invalid_npugraph_route_log_file():
+    model = _make_model(
+        device=torch.device("cuda"),
+        stage_connector_config={
+            "extra": {
+                "decode_npugraph": True,
+                "decode_npugraph_route_log_file": 123,
+            }
+        },
+    )
+    _load_weights_noop(model)
+    assert model.decoder.npugraph_calls == []
+
+
+def test_invalid_npugraph_shape_is_rejected_on_npu():
+    model = _make_model(
+        device=SimpleNamespace(type="npu"),
+        stage_connector_config={
+            "extra": {
+                "decode_npugraph": True,
+                "decode_npugraph_extra_capture_shapes": ["invalid"],
+            }
+        },
+    )
+    with pytest.raises(ValueError, match="decode_npugraph_extra_capture_shapes"):
+        _load_weights_noop(model)
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("decode_npugraph_capture_sizes", [25, 0]),
+        ("decode_npugraph_extra_capture_shapes", [[1, 97], [0, 169]]),
+    ],
+)
+def test_non_positive_npugraph_shape_is_rejected_on_npu(name, value):
+    model = _make_model(
+        device=SimpleNamespace(type="npu"),
+        stage_connector_config={
+            "extra": {
+                "decode_npugraph": True,
+                name: value,
+            }
+        },
+    )
+    with pytest.raises(ValueError, match=name):
+        _load_weights_noop(model)
+
+
+def test_negative_npugraph_stats_interval_is_rejected_on_npu():
+    model = _make_model(
+        device=SimpleNamespace(type="npu"),
+        stage_connector_config={
+            "extra": {
+                "decode_npugraph": True,
+                "decode_npugraph_stats_log_every": -1,
+            }
+        },
+    )
+    with pytest.raises(ValueError, match="decode_npugraph_stats_log_every"):
+        _load_weights_noop(model)
+
+
+def test_cuda_ignores_invalid_npugraph_only_config():
+    model = _make_model(
+        device=torch.device("cuda"),
+        stage_connector_config={
+            "extra": {
+                "decode_npugraph": True,
+                "decode_npugraph_extra_capture_shapes": ["invalid"],
+            }
+        },
+    )
+    _load_weights_noop(model)
+    assert model.decoder.npugraph_calls == []
 
 
 def test_decode_compile_shapes_can_be_configured():

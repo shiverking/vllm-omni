@@ -855,6 +855,9 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
         # CUDA Graph support
         self._cudagraph_enabled = False
         self._cudagraph_wrapper = None
+        # Ascend NPU Graph support
+        self._npugraph_enabled = False
+        self._npugraph_wrapper = None
 
     def precompute_snake_caches(self):
         """Precompute exp(alpha) and 1/(exp(beta)+eps) for all SnakeBeta modules."""
@@ -917,6 +920,49 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
         self._cudagraph_wrapper = None
         logger.info("CUDA Graph disabled for decoder")
 
+    def enable_npugraph(
+        self,
+        capture_sizes: list[int] | None = None,
+        extra_capture_shapes: list[tuple[int, int]] | None = None,
+        device: torch.device | None = None,
+        codec_chunk_frames: int = 0,
+        codec_left_context_frames: int = 0,
+        decode_chunk_size: int = 300,
+        decode_left_context: int = 25,
+        stats_log_every: int = 100,
+        padding_enabled: bool = False,
+        max_pad_frames: int = 0,
+        route_log_file: str | None = None,
+    ):
+        from ..npu_graph_decoder_wrapper import NPUGraphDecoderWrapper
+
+        if device is None:
+            device = next(self.parameters()).device
+        if device.type != "npu":
+            logger.warning("Cannot enable NPU Graph: decoder is not on an NPU device (got %s)", device)
+            return
+
+        self._npugraph_wrapper = NPUGraphDecoderWrapper(
+            decoder=self,
+            capture_sizes=capture_sizes,
+            extra_capture_shapes=extra_capture_shapes,
+            num_quantizers=self.config.num_quantizers,
+            enabled=True,
+            stats_log_every=stats_log_every,
+            padding_enabled=padding_enabled,
+            max_pad_frames=max_pad_frames,
+            route_log_file=route_log_file,
+        )
+        self._npugraph_wrapper.warmup(
+            device,
+            dtype=torch.long,
+            codec_chunk_frames=codec_chunk_frames,
+            codec_left_context_frames=codec_left_context_frames,
+            decode_chunk_size=decode_chunk_size,
+            decode_left_context=decode_left_context,
+        )
+        self._npugraph_enabled = True
+
     def forward(self, codes):
         if codes.shape[1] != self.config.num_quantizers:
             raise ValueError(f"Expected {self.config.num_quantizers} layer of codes, got {codes.shape[1]}")
@@ -935,6 +981,8 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
         return wav.clamp(min=-1, max=1)
 
     def chunked_decode(self, codes, chunk_size=300, left_context_size=25):
+        if self._npugraph_enabled and self._npugraph_wrapper is not None:
+            return self._npugraph_wrapper.chunked_decode_with_npugraph(codes, chunk_size, left_context_size)
         # Use CUDA graph if enabled
         if self._cudagraph_enabled and self._cudagraph_wrapper is not None:
             return self._cudagraph_wrapper.chunked_decode_with_cudagraph(codes, chunk_size, left_context_size)
@@ -959,6 +1007,14 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
         left_context_size=25,
         max_batch_size=0,
     ):
+        if self._npugraph_enabled and self._npugraph_wrapper is not None:
+            return self._npugraph_wrapper.batched_chunked_decode_with_npugraph(
+                codes,
+                lengths,
+                chunk_size=chunk_size,
+                left_context_size=left_context_size,
+                max_batch_size=max_batch_size,
+            )
         if self._cudagraph_enabled and self._cudagraph_wrapper is not None:
             return self._cudagraph_wrapper.batched_chunked_decode_with_cudagraph(
                 codes,
