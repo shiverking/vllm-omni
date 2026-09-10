@@ -135,6 +135,7 @@ class CodePredictorAttention(nn.Module):
         self.hidden_size = config.hidden_size
         self.scaling = self.head_dim**-0.5
         self.max_seq = int(config.num_code_groups) + 1
+        self._npu_fia_gqa_enabled = False
 
         # Separate q/k/v projections matching HF (no fused packing)
         bias = getattr(config, "attention_bias", False)
@@ -213,6 +214,40 @@ class CodePredictorAttention(nn.Module):
             sync=True,
         )[0]
 
+    def _forward_npu_fia_gqa(
+        self,
+        q: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        bsz: int,
+        query_len: int,
+        kv_len: int,
+        *,
+        causal: bool,
+    ) -> torch.Tensor:
+        """Run native FIA GQA directly against the full static KV cache."""
+        import torch_npu
+
+        if not key_cache.is_contiguous() or not value_cache.is_contiguous():
+            raise ValueError("Qwen3-TTS FIA GQA requires contiguous full KV cache tensors")
+
+        mask = self._fusion_causal_mask.contiguous() if causal else None
+        return torch_npu.npu_fused_infer_attention_score(
+            query=q.contiguous(),
+            key=key_cache,
+            value=value_cache,
+            num_heads=self.num_heads,
+            num_key_value_heads=self.num_kv_heads,
+            input_layout="BNSD",
+            atten_mask=mask,
+            actual_seq_lengths=[query_len] * bsz,
+            actual_seq_lengths_kv=[kv_len] * bsz,
+            scale=float(self.scaling),
+            pre_tokens=2147483647,
+            next_tokens=2147483647,
+            sparse_mode=2 if causal else 0,
+        )[0]
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -237,6 +272,7 @@ class CodePredictorAttention(nn.Module):
         k = (k * cos) + (_rotate_half(k) * sin)
 
         use_cache = key_cache is not None or value_cache is not None
+        use_native_fia_gqa = False
         if use_cache:
             if key_cache is None or value_cache is None:
                 raise ValueError("key_cache and value_cache must be provided together")
@@ -248,10 +284,19 @@ class CodePredictorAttention(nn.Module):
                 )
             key_cache[:, :, cache_position:cache_end, :].copy_(k)
             value_cache[:, :, cache_position:cache_end, :].copy_(v)
-            k = key_cache[:, :, :cache_end, :]
-            v = value_cache[:, :, :cache_end, :]
             kv_len = cache_end
             causal = cache_position == 0 and seq_len > 1
+            use_native_fia_gqa = (
+                current_omni_platform.is_npu()
+                and self._npu_fia_gqa_enabled
+                and self.is_gqa
+                and q.dtype == torch.bfloat16
+                and key_cache.is_contiguous()
+                and value_cache.is_contiguous()
+            )
+            if not use_native_fia_gqa:
+                k = key_cache[:, :, :cache_end, :]
+                v = value_cache[:, :, :cache_end, :]
         else:
             kv_len = seq_len
             causal = True
@@ -264,6 +309,17 @@ class CodePredictorAttention(nn.Module):
                 scale=self.scaling,
                 is_causal=causal,
                 enable_gqa=self.is_gqa,
+            )
+        elif use_native_fia_gqa:
+            assert key_cache is not None and value_cache is not None
+            attn_out = self._forward_npu_fia_gqa(
+                q,
+                key_cache,
+                value_cache,
+                bsz,
+                seq_len,
+                kv_len,
+                causal=causal,
             )
         else:
             attn_out = self._forward_npu_attention(
@@ -539,14 +595,20 @@ class CodePredictorWrapper(nn.Module):
         graph_cfg = self._stage_connector_extra_config(vllm_config)
         prefix_graphs_requested = self._parse_bool_config(graph_cfg.get("code_predictor_prefix_graphs"))
         kv_cache_requested = self._parse_bool_config(graph_cfg.get("code_predictor_kv_cache"))
+        fia_gqa_requested = self._parse_bool_config(graph_cfg.get("code_predictor_fia_gqa"))
         if prefix_graphs_requested and kv_cache_requested:
             raise ValueError(
                 "code_predictor_kv_cache and code_predictor_prefix_graphs cannot both be enabled"
             )
         is_npu = current_omni_platform.is_npu()
+        if is_npu and fia_gqa_requested and not kv_cache_requested:
+            raise ValueError("code_predictor_fia_gqa requires code_predictor_kv_cache on NPU")
         self._is_npu = is_npu
         self._prefix_graphs_enabled = prefix_graphs_requested and wrapper_config.use_cuda_graphs
         self._kv_cache_enabled = kv_cache_requested and is_npu and wrapper_config.use_cuda_graphs
+        self._fia_gqa_requested = fia_gqa_requested
+        self._fia_gqa_enabled = False
+        self._fia_gqa_configured = False
         if prefix_graphs_requested and not self._prefix_graphs_enabled:
             print(
                 "[Qwen3-TTS][prefix graph] requested but disabled "
@@ -564,6 +626,7 @@ class CodePredictorWrapper(nn.Module):
         )
         self._printed_short_prefix_buckets: set[int] = set()
         self._printed_kv_cache_buckets: set[int] = set()
+        self._printed_fia_gqa_buckets: set[int] = set()
         if is_npu and self._prefix_graphs_enabled:
             print(
                 "[Qwen3-TTS][NPU prefix graph] enabled "
@@ -647,6 +710,43 @@ class CodePredictorWrapper(nn.Module):
             not self._kv_cache_buckets or bsz in self._kv_cache_buckets
         )
 
+    def _configure_fia_gqa(self) -> None:
+        if self._fia_gqa_configured:
+            return
+        self._fia_gqa_configured = True
+
+        is_gqa = all(layer.self_attn.is_gqa for layer in self.model.layers)
+        self._fia_gqa_enabled = (
+            self._fia_gqa_requested
+            and self._is_npu
+            and self._kv_cache_enabled
+            and is_gqa
+            and self._model_dtype == torch.bfloat16
+        )
+        for layer in self.model.layers:
+            layer.self_attn._npu_fia_gqa_enabled = self._fia_gqa_enabled
+
+        if not self._fia_gqa_requested or not self._is_npu or not self._kv_cache_enabled:
+            return
+        query_heads = int(self.config.num_attention_heads)
+        kv_heads = int(self.config.num_key_value_heads)
+        if self._fia_gqa_enabled:
+            print(
+                "[Qwen3-TTS][NPU FIA GQA] enabled "
+                f"dtype={self._model_dtype} "
+                f"query_heads={query_heads} "
+                f"kv_heads={kv_heads} "
+                "layout=BNSD",
+                flush=True,
+            )
+        elif self._model_dtype != torch.bfloat16:
+            print(
+                "[Qwen3-TTS][NPU FIA GQA] dtype fallback "
+                f"dtype={self._model_dtype} "
+                "backend=npu_fusion_attention",
+                flush=True,
+            )
+
     def _setup_compile(self) -> None:
         """Lazily set up torch.compile with optional device graph capture."""
         if self._compiled_model_fwd is not None:
@@ -658,6 +758,7 @@ class CodePredictorWrapper(nn.Module):
         self._model_dtype = next(self.model.parameters()).dtype
         self._lm_heads_list = list(self.lm_head)
         self._codec_embeds_list = list(self.model.codec_embedding)
+        self._configure_fia_gqa()
 
         if not current_omni_platform.supports_torch_inductor():
             # NPU or other platforms without Inductor support
@@ -970,6 +1071,14 @@ class CodePredictorWrapper(nn.Module):
                 f"full_fallback_keys={sorted(full_graph_keys)}",
                 flush=True,
             )
+            if self._fia_gqa_enabled:
+                print(
+                    "[Qwen3-TTS][NPU FIA GQA] capture complete "
+                    f"graph_count={len(kv_graph_keys)} "
+                    f"query_heads={int(self.config.num_attention_heads)} "
+                    f"kv_heads={int(self.config.num_key_value_heads)}",
+                    flush=True,
+                )
         elif self._prefix_graphs_enabled:
             prefix_seq_lens = self._prefix_seq_lens(max_seq)
             needs_full_graph = set(prefix_seq_lens) != set(range(2, max_seq))
@@ -1111,6 +1220,16 @@ class CodePredictorWrapper(nn.Module):
                         flush=True,
                     )
                     self._printed_kv_cache_buckets.add(padded_bsz)
+                if self._fia_gqa_enabled and padded_bsz not in self._printed_fia_gqa_buckets:
+                    print(
+                        "[Qwen3-TTS][NPU FIA GQA] active "
+                        f"batch_bucket={padded_bsz} "
+                        f"query_heads={int(self.config.num_attention_heads)} "
+                        f"kv_heads={int(self.config.num_key_value_heads)} "
+                        "cache_backed=true",
+                        flush=True,
+                    )
+                    self._printed_fia_gqa_buckets.add(padded_bsz)
                 graph_entry[0].replay()
                 hidden_out = graph_entry[1]
                 hidden_index = 1 if cache_len == 2 else 0
