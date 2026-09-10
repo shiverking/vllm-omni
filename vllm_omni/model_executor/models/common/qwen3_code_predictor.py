@@ -111,8 +111,7 @@ class CodePredictorAttention(nn.Module):
     """Multi-head self-attention for code predictor.
 
     Uses ``F.scaled_dot_product_attention`` with HF-compatible RoPE and RMSNorm.
-    No KV cache -- the code predictor always re-prefills the full (short)
-    sequence each AR step.
+    Supports both the legacy re-prefill path and an optional static KV cache.
 
     Input : [B, seq_len, hidden_size]
     Output: [B, seq_len, hidden_size]
@@ -163,7 +162,9 @@ class CodePredictorAttention(nn.Module):
         k: torch.Tensor,
         v: torch.Tensor,
         bsz: int,
-        seq_len: int,
+        kv_len: int,
+        *,
+        causal: bool,
     ) -> torch.Tensor:
         import torch_npu
 
@@ -171,17 +172,16 @@ class CodePredictorAttention(nn.Module):
         if self.is_gqa:
             k_f = (
                 k[:, :, None, :, :]
-                .expand(bsz, self.num_kv_heads, self.num_queries_per_kv, seq_len, self.head_dim)
-                .reshape(bsz, self.num_heads, seq_len, self.head_dim)
+                .expand(bsz, self.num_kv_heads, self.num_queries_per_kv, kv_len, self.head_dim)
+                .reshape(bsz, self.num_heads, kv_len, self.head_dim)
             )
             v_f = (
                 v[:, :, None, :, :]
-                .expand(bsz, self.num_kv_heads, self.num_queries_per_kv, seq_len, self.head_dim)
-                .reshape(bsz, self.num_heads, seq_len, self.head_dim)
+                .expand(bsz, self.num_kv_heads, self.num_queries_per_kv, kv_len, self.head_dim)
+                .reshape(bsz, self.num_heads, kv_len, self.head_dim)
             )
 
-        mask = self._fusion_causal_mask
-        mask = mask.contiguous()
+        mask = self._fusion_causal_mask.contiguous() if causal else None
         q_f = q_f.contiguous()
         k_f = k_f.contiguous()
         v_f = v_f.contiguous()
@@ -203,8 +203,8 @@ class CodePredictorAttention(nn.Module):
             prefix=None,
             actual_seq_qlen=None,
             actual_seq_kvlen=None,
-            # Ascend SDPA is_causal migration example uses sparse_mode=2.
-            sparse_mode=2,
+            # Decode has one newest query and may attend every cached key.
+            sparse_mode=2 if causal else 0,
             gen_mask_parallel=True,
             # Keep sync=True for the NPU fused attention path.
             sync=True,
@@ -214,6 +214,9 @@ class CodePredictorAttention(nn.Module):
         self,
         hidden_states: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        key_cache: torch.Tensor | None = None,
+        value_cache: torch.Tensor | None = None,
+        cache_position: int = 0,
     ) -> torch.Tensor:
         bsz, seq_len, _ = hidden_states.shape
         hidden_shape_q = (bsz, seq_len, self.num_heads, self.head_dim)
@@ -230,17 +233,44 @@ class CodePredictorAttention(nn.Module):
         q = (q * cos) + (_rotate_half(q) * sin)
         k = (k * cos) + (_rotate_half(k) * sin)
 
+        use_cache = key_cache is not None or value_cache is not None
+        if use_cache:
+            if key_cache is None or value_cache is None:
+                raise ValueError("key_cache and value_cache must be provided together")
+            cache_end = cache_position + seq_len
+            if cache_position < 0 or cache_end > key_cache.shape[2]:
+                raise ValueError(
+                    f"Invalid code predictor cache range [{cache_position}, {cache_end}) "
+                    f"for capacity {key_cache.shape[2]}"
+                )
+            key_cache[:, :, cache_position:cache_end, :].copy_(k)
+            value_cache[:, :, cache_position:cache_end, :].copy_(v)
+            k = key_cache[:, :, :cache_end, :]
+            v = value_cache[:, :, :cache_end, :]
+            kv_len = cache_end
+            causal = cache_position == 0 and seq_len > 1
+        else:
+            kv_len = seq_len
+            causal = True
+
         if not current_omni_platform.is_npu():
             attn_out = F.scaled_dot_product_attention(
                 q,
                 k,
                 v,
                 scale=self.scaling,
-                is_causal=True,
+                is_causal=causal,
                 enable_gqa=self.is_gqa,
             )
         else:
-            attn_out = self._forward_npu_attention(q, k, v, bsz, seq_len)
+            attn_out = self._forward_npu_attention(
+                q,
+                k,
+                v,
+                bsz,
+                kv_len,
+                causal=causal,
+            )
 
         attn_out = attn_out.transpose(1, 2).reshape(bsz, seq_len, -1)
         return self.o_proj(attn_out)
@@ -270,7 +300,7 @@ class CodePredictorMLP(nn.Module):
 
 
 class CodePredictorDecoderLayer(nn.Module):
-    """Transformer decoder layer (SDPA, no KV cache)."""
+    """Transformer decoder layer with optional static KV cache."""
 
     def __init__(self, config, *, prefix: str = "") -> None:
         super().__init__()
@@ -283,10 +313,19 @@ class CodePredictorDecoderLayer(nn.Module):
         self,
         hidden_states: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        key_cache: torch.Tensor | None = None,
+        value_cache: torch.Tensor | None = None,
+        cache_position: int = 0,
     ) -> torch.Tensor:
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
-        hidden_states = self.self_attn(hidden_states, position_embeddings)
+        hidden_states = self.self_attn(
+            hidden_states,
+            position_embeddings,
+            key_cache=key_cache,
+            value_cache=value_cache,
+            cache_position=cache_position,
+        )
         hidden_states = residual + hidden_states
 
         residual = hidden_states
@@ -297,14 +336,15 @@ class CodePredictorDecoderLayer(nn.Module):
 
 
 # ===================================================================
-#  Base Transformer Model (re-prefill, no KV cache)
+#  Base Transformer Model
 # ===================================================================
 
 
 class CodePredictorBaseModel(nn.Module):
     """Inner transformer for code predictor.
 
-    Signature: ``forward(inputs_embeds, position_ids) -> hidden_states``
+    ``key_cache`` and ``value_cache`` are optional static per-layer buffers.
+    Omitting them preserves the legacy full causal re-prefill behavior.
     """
 
     def __init__(
@@ -344,6 +384,9 @@ class CodePredictorBaseModel(nn.Module):
         self,
         inputs_embeds: torch.Tensor,
         position_ids: torch.Tensor,
+        key_cache: torch.Tensor | None = None,
+        value_cache: torch.Tensor | None = None,
+        cache_position: int = 0,
     ) -> torch.Tensor:
         # Run the transformer body in float32 when the model is in fp16.
         # fp16 lacks the dynamic range for stable attention scores and
@@ -360,8 +403,22 @@ class CodePredictorBaseModel(nn.Module):
         hidden_states = inputs_embeds
         with torch.amp.autocast(inputs_embeds.device.type, enabled=use_fp32, dtype=torch.float32):
             position_embeddings = self.rotary_emb(hidden_states, position_ids)
-            for layer in self.layers:
-                hidden_states = layer(hidden_states, position_embeddings)
+            if (key_cache is None) != (value_cache is None):
+                raise ValueError("key_cache and value_cache must be provided together")
+            if key_cache is not None and key_cache.shape[0] != len(self.layers):
+                raise ValueError(
+                    f"Expected {len(self.layers)} code predictor cache layers, got {key_cache.shape[0]}"
+                )
+            for layer_idx, layer in enumerate(self.layers):
+                layer_key_cache = None if key_cache is None else key_cache[layer_idx]
+                layer_value_cache = None if value_cache is None else value_cache[layer_idx]
+                hidden_states = layer(
+                    hidden_states,
+                    position_embeddings,
+                    key_cache=layer_key_cache,
+                    value_cache=layer_value_cache,
+                    cache_position=cache_position,
+                )
             hidden_states = self.norm(hidden_states)
         return hidden_states.to(input_dtype)
 
@@ -402,11 +459,11 @@ class CodePredictorWrapperConfig:
 
 
 class CodePredictorWrapper(nn.Module):
-    """Optimized code predictor -- re-prefill approach, no KV cache.
+    """Optimized code predictor with re-prefill and optional NPU KV cache.
 
-    Each AR step forwards the full growing sequence (len 2 -> num_code_groups+1)
-    through the transformer.  The extra O(T^2) FLOPs are negligible for
-    short sequences, and this avoids all KV-cache management overhead.
+    The default path re-prefills the growing sequence. Ascend deployments may
+    opt into a static per-bucket KV cache: prefill two tokens once, then replay
+    one-token decode graphs for the remaining code groups.
 
     Optimizations:
       1. Per-call embedding buffer -- avoids cross-request aliasing.
@@ -471,22 +528,59 @@ class CodePredictorWrapper(nn.Module):
         self._lm_heads_list: list[nn.Module] | None = None
         self._codec_embeds_list: list[nn.Module] | None = None
         self._device_graphs: dict[int | tuple[int, int], tuple] = {}  # (graph, static_output) per bucket
-        prefix_graph_cfg = self._stage_connector_extra_config(vllm_config)
-        prefix_graphs_requested = self._parse_bool_config(prefix_graph_cfg.get("code_predictor_prefix_graphs"))
+        self._kv_device_graphs: dict[tuple[int, int], tuple] = {}
+        # All graphs in one bucket share these address-stable buffers. Replays
+        # must stay serialized per wrapper; concurrent execution needs one
+        # wrapper/cache set per execution slot.
+        self._kv_cache_by_bucket: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+        graph_cfg = self._stage_connector_extra_config(vllm_config)
+        prefix_graphs_requested = self._parse_bool_config(graph_cfg.get("code_predictor_prefix_graphs"))
+        kv_cache_requested = self._parse_bool_config(graph_cfg.get("code_predictor_kv_cache"))
+        if prefix_graphs_requested and kv_cache_requested:
+            raise ValueError(
+                "code_predictor_kv_cache and code_predictor_prefix_graphs cannot both be enabled"
+            )
         is_npu = current_omni_platform.is_npu()
-        self._prefix_graphs_enabled = prefix_graphs_requested and wrapper_config.use_cuda_graphs and not is_npu
+        self._is_npu = is_npu
+        self._prefix_graphs_enabled = prefix_graphs_requested and wrapper_config.use_cuda_graphs
+        self._kv_cache_enabled = kv_cache_requested and is_npu and wrapper_config.use_cuda_graphs
         if prefix_graphs_requested and not self._prefix_graphs_enabled:
-            logger.info_once(
-                "code_predictor: prefix CUDA graphs requested but disabled because use_cuda_graphs=%s is_npu=%s",
-                wrapper_config.use_cuda_graphs,
-                is_npu,
+            print(
+                "[Qwen3-TTS][prefix graph] requested but disabled "
+                f"use_device_graphs={wrapper_config.use_cuda_graphs} is_npu={is_npu}",
+                flush=True,
             )
         self._prefix_graph_buckets = self._parse_positive_int_set(
-            prefix_graph_cfg.get("code_predictor_prefix_graph_buckets")
+            graph_cfg.get("code_predictor_prefix_graph_buckets")
         )
         self._prefix_graph_seq_lens = self._parse_positive_int_set(
-            prefix_graph_cfg.get("code_predictor_prefix_graph_seq_lens")
+            graph_cfg.get("code_predictor_prefix_graph_seq_lens")
         )
+        self._kv_cache_buckets = self._parse_positive_int_set(
+            graph_cfg.get("code_predictor_kv_cache_buckets")
+        )
+        self._printed_short_prefix_buckets: set[int] = set()
+        self._printed_kv_cache_buckets: set[int] = set()
+        if is_npu and self._prefix_graphs_enabled:
+            print(
+                "[Qwen3-TTS][NPU prefix graph] enabled "
+                f"buckets={sorted(self._prefix_graph_buckets) if self._prefix_graph_buckets else 'all'} "
+                f"seq_lens={self._prefix_seq_lens(self._num_groups + 1)}",
+                flush=True,
+            )
+        if kv_cache_requested and not self._kv_cache_enabled:
+            print(
+                "[Qwen3-TTS][NPU KV cache] requested but disabled "
+                f"use_device_graphs={wrapper_config.use_cuda_graphs} is_npu={is_npu}",
+                flush=True,
+            )
+        if self._kv_cache_enabled:
+            print(
+                "[Qwen3-TTS][NPU KV cache] enabled "
+                f"buckets={sorted(self._kv_cache_buckets) if self._kv_cache_buckets else 'all'} "
+                f"cache_lens={list(range(2, self._num_groups + 1))}",
+                flush=True,
+            )
 
     def get_input_embeddings(self) -> nn.ModuleList:
         return self.model.get_input_embeddings()
@@ -512,6 +606,43 @@ class CodePredictorWrapper(nn.Module):
         ):
             return
         self._proj_buf = torch.zeros(bsz, max_seq, self._cp_hidden, dtype=dtype, device=device)
+
+    def _kv_cache_dtype(self) -> torch.dtype:
+        if self._model_dtype == torch.float16:
+            return torch.float32
+        return self._model_dtype
+
+    def _ensure_kv_cache(
+        self,
+        device: torch.device,
+        bsz: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        existing = self._kv_cache_by_bucket.get(bsz)
+        cache_dtype = self._kv_cache_dtype()
+        if (
+            existing is not None
+            and existing[0].device == device
+            and existing[0].dtype == cache_dtype
+        ):
+            return existing
+        cache_shape = (
+            len(self.model.layers),
+            bsz,
+            int(self.config.num_key_value_heads),
+            self._num_groups,
+            int(self.model.layers[0].self_attn.head_dim),
+        )
+        caches = (
+            torch.empty(cache_shape, dtype=cache_dtype, device=device),
+            torch.empty(cache_shape, dtype=cache_dtype, device=device),
+        )
+        self._kv_cache_by_bucket[bsz] = caches
+        return caches
+
+    def _kv_bucket_enabled(self, bsz: int) -> bool:
+        return self._kv_cache_enabled and (
+            not self._kv_cache_buckets or bsz in self._kv_cache_buckets
+        )
 
     def _setup_compile(self) -> None:
         """Lazily set up torch.compile with optional device graph capture."""
@@ -628,7 +759,48 @@ class CodePredictorWrapper(nn.Module):
         self._ensure_buffers(device, self._model_dtype, max(self._bucket_sizes))
         proj_buf = self._proj_buf
 
-        if self._prefix_graphs_enabled:
+        if self._kv_cache_enabled:
+            for bsz in self._bucket_sizes:
+                if not self._kv_bucket_enabled(bsz):
+                    pos_ids = (
+                        torch.arange(max_seq, device=device, dtype=torch.long)
+                        .unsqueeze(0)
+                        .expand(bsz, -1)
+                        .contiguous()
+                    )
+                    self._bucket_pos_ids[bsz] = pos_ids
+                    for _ in range(3):
+                        self._compiled_model_fwd(proj_buf[:bsz, :max_seq, :], pos_ids)
+                    continue
+
+                key_cache, value_cache = self._ensure_kv_cache(device, bsz)
+                for cache_len in range(2, self._num_groups + 1):
+                    input_len = 2 if cache_len == 2 else 1
+                    input_start = 0 if cache_len == 2 else cache_len - 1
+                    pos_ids = (
+                        torch.arange(input_start, input_start + input_len, device=device, dtype=torch.long)
+                        .unsqueeze(0)
+                        .expand(bsz, -1)
+                        .contiguous()
+                    )
+                    self._bucket_pos_ids[(bsz, cache_len)] = pos_ids
+                for _ in range(2):
+                    for cache_len in range(2, self._num_groups + 1):
+                        input_len = 2 if cache_len == 2 else 1
+                        input_start = 0 if cache_len == 2 else cache_len - 1
+                        self._compiled_model_fwd(
+                            proj_buf[:bsz, input_start : input_start + input_len, :],
+                            self._bucket_pos_ids[(bsz, cache_len)],
+                            key_cache,
+                            value_cache,
+                            input_start,
+                        )
+            logger.info(
+                "code_predictor: KV cache warmup done for buckets %s kv_buckets=%s",
+                self._bucket_sizes,
+                sorted(self._kv_cache_buckets) if self._kv_cache_buckets else "all",
+            )
+        elif self._prefix_graphs_enabled:
             prefix_seq_lens = self._prefix_seq_lens(max_seq)
             needs_full_graph = set(prefix_seq_lens) != set(range(2, max_seq))
             for bsz in self._bucket_sizes:
@@ -725,21 +897,106 @@ class CodePredictorWrapper(nn.Module):
         max_seq = self._num_groups + 1
         proj_buf = self._proj_buf
         pool = torch.npu.graph_pool_handle()
+        prefix_graph_keys: list[tuple[int, int]] = []
+        full_graph_keys: list[int] = []
 
-        for bsz in self._bucket_sizes:
-            static_input = proj_buf[:bsz, :max_seq, :]
-            pos_ids = self._bucket_pos_ids[bsz]
+        if self._kv_cache_enabled:
+            kv_graph_keys: list[tuple[int, int]] = []
+            for bsz in self._bucket_sizes:
+                if not self._kv_bucket_enabled(bsz):
+                    static_input = proj_buf[:bsz, :max_seq, :]
+                    pos_ids = self._bucket_pos_ids[bsz]
+                    g = torch.npu.NPUGraph()
+                    with torch.npu.graph(g, pool=pool):
+                        static_output = self._compiled_model_fwd(static_input, pos_ids)
+                    self._device_graphs[bsz] = (g, static_output)
+                    full_graph_keys.append(bsz)
+                    continue
 
-            g = torch.npu.NPUGraph()
-            with torch.npu.graph(g, pool=pool):
-                static_output = self._compiled_model_fwd(static_input, pos_ids)
+                key_cache, value_cache = self._kv_cache_by_bucket[bsz]
+                for cache_len in range(2, self._num_groups + 1):
+                    input_len = 2 if cache_len == 2 else 1
+                    input_start = 0 if cache_len == 2 else cache_len - 1
+                    static_input = proj_buf[:bsz, input_start : input_start + input_len, :]
+                    pos_ids = self._bucket_pos_ids[(bsz, cache_len)]
+                    g = torch.npu.NPUGraph()
+                    with torch.npu.graph(g, pool=pool):
+                        static_output = self._compiled_model_fwd(
+                            static_input,
+                            pos_ids,
+                            key_cache,
+                            value_cache,
+                            input_start,
+                        )
+                    graph_key = (bsz, cache_len)
+                    self._kv_device_graphs[graph_key] = (g, static_output)
+                    kv_graph_keys.append(graph_key)
+            cache_shapes = {
+                bsz: tuple(caches[0].shape)
+                for bsz, caches in sorted(self._kv_cache_by_bucket.items())
+            }
+            print(
+                "[Qwen3-TTS][NPU KV cache] capture complete "
+                f"graph_count={len(kv_graph_keys)} "
+                f"buckets={sorted(self._kv_cache_by_bucket)} "
+                f"cache_shapes={cache_shapes} "
+                f"full_fallback_keys={sorted(full_graph_keys)}",
+                flush=True,
+            )
+        elif self._prefix_graphs_enabled:
+            prefix_seq_lens = self._prefix_seq_lens(max_seq)
+            needs_full_graph = set(prefix_seq_lens) != set(range(2, max_seq))
+            for bsz in self._bucket_sizes:
+                capture_prefixes = not self._prefix_graph_buckets or bsz in self._prefix_graph_buckets
+                if not capture_prefixes or needs_full_graph:
+                    static_input = proj_buf[:bsz, :max_seq, :]
+                    pos_ids = self._bucket_pos_ids[bsz]
 
-            self._device_graphs[bsz] = (g, static_output)
+                    g = torch.npu.NPUGraph()
+                    with torch.npu.graph(g, pool=pool):
+                        static_output = self._compiled_model_fwd(static_input, pos_ids)
 
-        logger.info("code_predictor: captured NPU graphs for buckets %s", self._bucket_sizes)
+                    self._device_graphs[bsz] = (g, static_output)
+                    full_graph_keys.append(bsz)
+
+                if capture_prefixes:
+                    for seq_len in prefix_seq_lens:
+                        static_input = proj_buf[:bsz, :seq_len, :]
+                        pos_ids = self._bucket_pos_ids[(bsz, seq_len)]
+
+                        g = torch.npu.NPUGraph()
+                        with torch.npu.graph(g, pool=pool):
+                            static_output = self._compiled_model_fwd(static_input, pos_ids)
+
+                        graph_key = (bsz, seq_len)
+                        self._device_graphs[graph_key] = (g, static_output)
+                        prefix_graph_keys.append(graph_key)
+        else:
+            for bsz in self._bucket_sizes:
+                static_input = proj_buf[:bsz, :max_seq, :]
+                pos_ids = self._bucket_pos_ids[bsz]
+
+                g = torch.npu.NPUGraph()
+                with torch.npu.graph(g, pool=pool):
+                    static_output = self._compiled_model_fwd(static_input, pos_ids)
+
+                self._device_graphs[bsz] = (g, static_output)
+                full_graph_keys.append(bsz)
+
+        if self._kv_cache_enabled:
+            return
+        if self._prefix_graphs_enabled:
+            print(
+                "[Qwen3-TTS][NPU prefix graph] capture complete "
+                f"prefix_keys={sorted(prefix_graph_keys)} "
+                f"full_fallback_keys={sorted(full_graph_keys)}",
+                flush=True,
+            )
+        else:
+            logger.info("code_predictor: captured NPU graphs for buckets %s", self._bucket_sizes)
 
     # ------------------------------------------------------------------
-    #  Forward -- re-prefill + inline sampling
+    #  Forward -- re-prefill or static KV cache + inline sampling
     # ------------------------------------------------------------------
 
     @torch.inference_mode()
@@ -754,7 +1011,7 @@ class CodePredictorWrapper(nn.Module):
         top_p: float = 1.0,
         generator: torch.Generator | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        """Predict residual codebooks 1..G-1 autoregressively via re-prefill."""
+        """Predict residual codebooks 1..G-1 autoregressively."""
         bsz = int(layer0_code.shape[0])
         num_groups = self._num_groups
         device = layer0_code.device
@@ -802,35 +1059,72 @@ class CodePredictorWrapper(nn.Module):
             all_codes = torch.empty(bsz, num_groups, dtype=torch.long, device=device)
             all_codes[:, 0] = layer0_code.reshape(bsz)
 
+        required_kv_keys = [(padded_bsz, cache_len) for cache_len in range(2, num_groups + 1)]
+        # Select the cache path only when the complete prefill/decode graph set
+        # exists. Mid-request fallback would mix incompatible cache state.
+        use_kv_cache = self._kv_bucket_enabled(padded_bsz) and all(
+            graph_key in self._kv_device_graphs for graph_key in required_kv_keys
+        )
+
         # Autoregressive loop: predict layers 1..G-1
         for step in range(1, num_groups):
-            graph_key: int | tuple[int, int] = padded_bsz
-            seq_len = max_seq
-            if self._prefix_graphs_enabled:
-                prefix_key = (padded_bsz, step + 1)
-                if prefix_key in self._device_graphs:
-                    graph_key = prefix_key
-                    seq_len = step + 1
-            pos_ids = self._bucket_pos_ids.get(graph_key)
-            if pos_ids is None:
-                pos_ids = (
-                    torch.arange(seq_len, device=device, dtype=torch.long)
-                    .unsqueeze(0)
-                    .expand(padded_bsz, -1)
-                    .contiguous()
-                )
-
-            # Use captured device graph if available, otherwise call compiled fn.
-            device_graph_entry = self._device_graphs.get(graph_key)
-
-            # Run transformer (device graph replay or compiled forward)
-            if device_graph_entry is not None:
-                device_graph_entry[0].replay()
-                hidden_out = device_graph_entry[1]
+            if use_kv_cache:
+                cache_len = step + 1
+                graph_entry = self._kv_device_graphs[(padded_bsz, cache_len)]
+                if padded_bsz not in self._printed_kv_cache_buckets:
+                    print(
+                        "[Qwen3-TTS][NPU KV cache] active "
+                        f"batch_bucket={padded_bsz} "
+                        "prefill_input_len=2 decode_input_len=1 "
+                        f"max_cache_len={num_groups}",
+                        flush=True,
+                    )
+                    self._printed_kv_cache_buckets.add(padded_bsz)
+                graph_entry[0].replay()
+                hidden_out = graph_entry[1]
+                hidden_index = 1 if cache_len == 2 else 0
             else:
-                hidden_out = model_fwd(proj_buf[:padded_bsz, :seq_len, :], pos_ids)
+                graph_key: int | tuple[int, int] = padded_bsz
+                seq_len = max_seq
+                if self._prefix_graphs_enabled:
+                    prefix_key = (padded_bsz, step + 1)
+                    if prefix_key in self._device_graphs:
+                        graph_key = prefix_key
+                        seq_len = step + 1
+                    if (
+                        graph_key == prefix_key
+                        and self._is_npu
+                        and padded_bsz not in self._printed_short_prefix_buckets
+                    ):
+                        print(
+                            "[Qwen3-TTS][NPU prefix graph] short prefix active "
+                            f"batch_bucket={padded_bsz} "
+                            f"seq_len={seq_len} "
+                            f"full_seq_len={max_seq}",
+                            flush=True,
+                        )
+                        self._printed_short_prefix_buckets.add(padded_bsz)
+                pos_ids = self._bucket_pos_ids.get(graph_key)
+                if pos_ids is None:
+                    pos_ids = (
+                        torch.arange(seq_len, device=device, dtype=torch.long)
+                        .unsqueeze(0)
+                        .expand(padded_bsz, -1)
+                        .contiguous()
+                    )
 
-            logits = lm_heads[step - 1](hidden_out[:bsz, step, :])
+                # Use captured device graph if available, otherwise call compiled fn.
+                device_graph_entry = self._device_graphs.get(graph_key)
+
+                # Run transformer (device graph replay or compiled forward)
+                if device_graph_entry is not None:
+                    device_graph_entry[0].replay()
+                    hidden_out = device_graph_entry[1]
+                else:
+                    hidden_out = model_fwd(proj_buf[:padded_bsz, :seq_len, :], pos_ids)
+                hidden_index = step
+
+            logits = lm_heads[step - 1](hidden_out[:bsz, hidden_index, :])
 
             # Sample next code
             if stored_mode:
