@@ -12,6 +12,7 @@ produce float32 hidden states.
 from __future__ import annotations
 
 import importlib.util
+import logging
 import os
 import sys
 import types
@@ -52,7 +53,7 @@ def _build_mock_modules(mocker: MockerFixture) -> dict[str, object]:
     platforms_mock.current_omni_platform.is_npu.return_value = False
 
     logger_mock = mocker.MagicMock()
-    logger_mock.init_logger = lambda name: mocker.MagicMock()
+    logger_mock.init_logger = logging.getLogger
 
     vllm_config_mod = mocker.MagicMock()
     vllm_config_mod.set_current_vllm_config = lambda cfg: mocker.MagicMock(
@@ -581,8 +582,9 @@ class TestCodePredictorWrapperConfig:
         self,
         mocker: MockerFixture,
         loaded_target_classes,
-        capsys: pytest.CaptureFixture[str],
+        caplog: pytest.LogCaptureFixture,
     ) -> None:
+        caplog.set_level(logging.INFO)
         wrapper = _make_npu_prefix_wrapper(
             mocker,
             loaded_target_classes,
@@ -594,7 +596,7 @@ class TestCodePredictorWrapperConfig:
         assert wrapper._prefix_graph_buckets == {2}
         assert wrapper._prefix_graph_seq_lens == {2, 3, 4}
         assert (
-            "[Qwen3-TTS][NPU prefix graph] enabled buckets=[2] seq_lens=[2, 3, 4]" in capsys.readouterr().out
+            "[Qwen3-TTS][NPU prefix graph] enabled buckets=[2] seq_lens=[2, 3, 4]" in caplog.text
         )
 
         disabled_wrapper = _make_npu_prefix_wrapper(
@@ -610,8 +612,9 @@ class TestCodePredictorWrapperConfig:
         self,
         mocker: MockerFixture,
         loaded_target_classes,
-        capsys: pytest.CaptureFixture[str],
+        caplog: pytest.LogCaptureFixture,
     ) -> None:
+        caplog.set_level(logging.INFO)
         wrapper = _make_npu_prefix_wrapper(
             mocker,
             loaded_target_classes,
@@ -650,7 +653,7 @@ class TestCodePredictorWrapperConfig:
             graph = wrapper._device_graphs[graph_key][0]
             assert graph.replay_count == 2
 
-        output = capsys.readouterr().out
+        output = caplog.text
         assert (
             "[Qwen3-TTS][NPU prefix graph] capture complete "
             "prefix_keys=[(2, 2), (2, 3), (2, 4)] full_fallback_keys=[1]" in output
@@ -706,8 +709,9 @@ class TestCodePredictorKVCache:
         self,
         mocker: MockerFixture,
         loaded_target_classes,
-        capsys: pytest.CaptureFixture[str],
+        caplog: pytest.LogCaptureFixture,
     ) -> None:
+        caplog.set_level(logging.INFO)
         wrapper = _make_npu_kv_wrapper(
             mocker,
             loaded_target_classes,
@@ -717,7 +721,7 @@ class TestCodePredictorKVCache:
         assert wrapper._kv_cache_buckets == {2}
         assert (
             "[Qwen3-TTS][NPU KV cache] enabled buckets=[2] cache_lens=[2, 3, 4]"
-            in capsys.readouterr().out
+            in caplog.text
         )
 
         disabled = _make_npu_kv_wrapper(
@@ -754,8 +758,9 @@ class TestCodePredictorKVCache:
         self,
         mocker: MockerFixture,
         loaded_target_classes,
-        capsys: pytest.CaptureFixture[str],
+        caplog: pytest.LogCaptureFixture,
     ) -> None:
+        caplog.set_level(logging.INFO)
         wrapper = _make_npu_kv_wrapper(
             mocker,
             loaded_target_classes,
@@ -795,7 +800,7 @@ class TestCodePredictorKVCache:
             assert wrapper._kv_device_graphs[graph_key][0].replay_count == 2
         assert wrapper._device_graphs[1][0].replay_count == 0
 
-        output = capsys.readouterr().out
+        output = caplog.text
         assert (
             "[Qwen3-TTS][NPU KV cache] capture complete "
             "graph_count=3 buckets=[2] "
@@ -1001,12 +1006,13 @@ class TestCodePredictorKVCache:
         assert len(legacy_calls) == 1
         assert legacy_calls[0][0][1].shape == (1, 4, 3, 8)
 
-    def test_npu_fia_gqa_config_capture_and_prints(
+    def test_npu_fia_gqa_config_capture_and_logs(
         self,
         mocker: MockerFixture,
         loaded_target_classes,
-        capsys: pytest.CaptureFixture[str],
+        caplog: pytest.LogCaptureFixture,
     ) -> None:
+        caplog.set_level(logging.INFO)
         wrapper = _make_npu_kv_wrapper(
             mocker,
             loaded_target_classes,
@@ -1032,7 +1038,7 @@ class TestCodePredictorKVCache:
         wrapper(**inputs)
         wrapper(**inputs)
 
-        output = capsys.readouterr().out
+        output = caplog.text
         assert (
             "[Qwen3-TTS][NPU FIA GQA] enabled "
             "dtype=torch.bfloat16 query_heads=4 kv_heads=2 layout=BNSD"

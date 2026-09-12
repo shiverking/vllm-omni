@@ -610,10 +610,11 @@ class CodePredictorWrapper(nn.Module):
         self._fia_gqa_enabled = False
         self._fia_gqa_configured = False
         if prefix_graphs_requested and not self._prefix_graphs_enabled:
-            print(
+            logger.warning(
                 "[Qwen3-TTS][prefix graph] requested but disabled "
-                f"use_device_graphs={wrapper_config.use_cuda_graphs} is_npu={is_npu}",
-                flush=True,
+                "use_device_graphs=%s is_npu=%s",
+                wrapper_config.use_cuda_graphs,
+                is_npu,
             )
         self._prefix_graph_buckets = self._parse_positive_int_set(
             graph_cfg.get("code_predictor_prefix_graph_buckets")
@@ -628,24 +629,23 @@ class CodePredictorWrapper(nn.Module):
         self._printed_kv_cache_buckets: set[int] = set()
         self._printed_fia_gqa_buckets: set[int] = set()
         if is_npu and self._prefix_graphs_enabled:
-            print(
-                "[Qwen3-TTS][NPU prefix graph] enabled "
-                f"buckets={sorted(self._prefix_graph_buckets) if self._prefix_graph_buckets else 'all'} "
-                f"seq_lens={self._prefix_seq_lens(self._num_groups + 1)}",
-                flush=True,
+            logger.info(
+                "[Qwen3-TTS][NPU prefix graph] enabled buckets=%s seq_lens=%s",
+                sorted(self._prefix_graph_buckets) if self._prefix_graph_buckets else "all",
+                self._prefix_seq_lens(self._num_groups + 1),
             )
         if kv_cache_requested and not self._kv_cache_enabled:
-            print(
+            logger.warning(
                 "[Qwen3-TTS][NPU KV cache] requested but disabled "
-                f"use_device_graphs={wrapper_config.use_cuda_graphs} is_npu={is_npu}",
-                flush=True,
+                "use_device_graphs=%s is_npu=%s",
+                wrapper_config.use_cuda_graphs,
+                is_npu,
             )
         if self._kv_cache_enabled:
-            print(
-                "[Qwen3-TTS][NPU KV cache] enabled "
-                f"buckets={sorted(self._kv_cache_buckets) if self._kv_cache_buckets else 'all'} "
-                f"cache_lens={list(range(2, self._num_groups + 1))}",
-                flush=True,
+            logger.info(
+                "[Qwen3-TTS][NPU KV cache] enabled buckets=%s cache_lens=%s",
+                sorted(self._kv_cache_buckets) if self._kv_cache_buckets else "all",
+                list(range(2, self._num_groups + 1)),
             )
 
     def get_input_embeddings(self) -> nn.ModuleList:
@@ -731,20 +731,18 @@ class CodePredictorWrapper(nn.Module):
         query_heads = int(self.config.num_attention_heads)
         kv_heads = int(self.config.num_key_value_heads)
         if self._fia_gqa_enabled:
-            print(
+            logger.info(
                 "[Qwen3-TTS][NPU FIA GQA] enabled "
-                f"dtype={self._model_dtype} "
-                f"query_heads={query_heads} "
-                f"kv_heads={kv_heads} "
-                "layout=BNSD",
-                flush=True,
+                "dtype=%s query_heads=%d kv_heads=%d layout=BNSD",
+                self._model_dtype,
+                query_heads,
+                kv_heads,
             )
         elif self._model_dtype != torch.bfloat16:
-            print(
+            logger.warning(
                 "[Qwen3-TTS][NPU FIA GQA] dtype fallback "
-                f"dtype={self._model_dtype} "
-                "backend=npu_fusion_attention",
-                flush=True,
+                "dtype=%s backend=npu_fusion_attention",
+                self._model_dtype,
             )
 
     def _setup_compile(self) -> None:
@@ -1063,21 +1061,21 @@ class CodePredictorWrapper(nn.Module):
                 bsz: tuple(caches[0].shape)
                 for bsz, caches in sorted(self._kv_cache_by_bucket.items())
             }
-            print(
+            logger.info(
                 "[Qwen3-TTS][NPU KV cache] capture complete "
-                f"graph_count={len(kv_graph_keys)} "
-                f"buckets={sorted(self._kv_cache_by_bucket)} "
-                f"cache_shapes={cache_shapes} "
-                f"full_fallback_keys={sorted(full_graph_keys)}",
-                flush=True,
+                "graph_count=%d buckets=%s cache_shapes=%s full_fallback_keys=%s",
+                len(kv_graph_keys),
+                sorted(self._kv_cache_by_bucket),
+                cache_shapes,
+                sorted(full_graph_keys),
             )
             if self._fia_gqa_enabled:
-                print(
+                logger.info(
                     "[Qwen3-TTS][NPU FIA GQA] capture complete "
-                    f"graph_count={len(kv_graph_keys)} "
-                    f"query_heads={int(self.config.num_attention_heads)} "
-                    f"kv_heads={int(self.config.num_key_value_heads)}",
-                    flush=True,
+                    "graph_count=%d query_heads=%d kv_heads=%d",
+                    len(kv_graph_keys),
+                    int(self.config.num_attention_heads),
+                    int(self.config.num_key_value_heads),
                 )
         elif self._prefix_graphs_enabled:
             prefix_seq_lens = self._prefix_seq_lens(max_seq)
@@ -1122,11 +1120,11 @@ class CodePredictorWrapper(nn.Module):
         if self._kv_cache_enabled:
             return
         if self._prefix_graphs_enabled:
-            print(
+            logger.info(
                 "[Qwen3-TTS][NPU prefix graph] capture complete "
-                f"prefix_keys={sorted(prefix_graph_keys)} "
-                f"full_fallback_keys={sorted(full_graph_keys)}",
-                flush=True,
+                "prefix_keys=%s full_fallback_keys=%s",
+                sorted(prefix_graph_keys),
+                sorted(full_graph_keys),
             )
         else:
             logger.info("code_predictor: captured NPU graphs for buckets %s", self._bucket_sizes)
@@ -1212,22 +1210,20 @@ class CodePredictorWrapper(nn.Module):
                 cache_len = step + 1
                 graph_entry = self._kv_device_graphs[(padded_bsz, cache_len)]
                 if padded_bsz not in self._printed_kv_cache_buckets:
-                    print(
+                    logger.info(
                         "[Qwen3-TTS][NPU KV cache] active "
-                        f"batch_bucket={padded_bsz} "
-                        "prefill_input_len=2 decode_input_len=1 "
-                        f"max_cache_len={num_groups}",
-                        flush=True,
+                        "batch_bucket=%d prefill_input_len=2 decode_input_len=1 max_cache_len=%d",
+                        padded_bsz,
+                        num_groups,
                     )
                     self._printed_kv_cache_buckets.add(padded_bsz)
                 if self._fia_gqa_enabled and padded_bsz not in self._printed_fia_gqa_buckets:
-                    print(
+                    logger.info(
                         "[Qwen3-TTS][NPU FIA GQA] active "
-                        f"batch_bucket={padded_bsz} "
-                        f"query_heads={int(self.config.num_attention_heads)} "
-                        f"kv_heads={int(self.config.num_key_value_heads)} "
-                        "cache_backed=true",
-                        flush=True,
+                        "batch_bucket=%d query_heads=%d kv_heads=%d cache_backed=true",
+                        padded_bsz,
+                        int(self.config.num_attention_heads),
+                        int(self.config.num_key_value_heads),
                     )
                     self._printed_fia_gqa_buckets.add(padded_bsz)
                 graph_entry[0].replay()
@@ -1246,12 +1242,12 @@ class CodePredictorWrapper(nn.Module):
                         and self._is_npu
                         and padded_bsz not in self._printed_short_prefix_buckets
                     ):
-                        print(
+                        logger.info(
                             "[Qwen3-TTS][NPU prefix graph] short prefix active "
-                            f"batch_bucket={padded_bsz} "
-                            f"seq_len={seq_len} "
-                            f"full_seq_len={max_seq}",
-                            flush=True,
+                            "batch_bucket=%d seq_len=%d full_seq_len=%d",
+                            padded_bsz,
+                            seq_len,
+                            max_seq,
                         )
                         self._printed_short_prefix_buckets.add(padded_bsz)
                 pos_ids = self._bucket_pos_ids.get(graph_key)

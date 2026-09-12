@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from contextlib import nullcontext
 
 import pytest
@@ -135,7 +136,8 @@ def _assert_waveform_close(actual: torch.Tensor, expected: torch.Tensor) -> None
     torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-5)
 
 
-def test_capture_uses_one_pool_and_expected_sparse_shapes(monkeypatch, capsys):
+def test_capture_uses_one_pool_and_expected_sparse_shapes(monkeypatch, caplog):
+    caplog.set_level(logging.INFO)
     fake_npu = _FakeNPU()
     monkeypatch.setattr(torch, "npu", fake_npu, raising=False)
     graph_wrapper = NPUGraphDecoderWrapper(
@@ -158,12 +160,13 @@ def test_capture_uses_one_pool_and_expected_sparse_shapes(monkeypatch, capsys):
     }
     assert set(graph_wrapper.graphs) == expected
     assert fake_npu.graph_pools == [fake_npu.pool] * len(expected)
-    output = capsys.readouterr().out
+    output = caplog.text
     assert "[Qwen3-TTS][NPU Code2Wav graph] enabled" in output
     assert "[Qwen3-TTS][NPU Code2Wav graph] capture complete" in output
 
 
-def test_one_capture_failure_keeps_other_graphs_and_reports_failure(monkeypatch, capsys):
+def test_one_capture_failure_keeps_other_graphs_and_reports_failure(monkeypatch, caplog):
+    caplog.set_level(logging.INFO)
     fake_npu = _FailingFakeNPU(fail_capture_index=2)
     monkeypatch.setattr(torch, "npu", fake_npu, raising=False)
     graph_wrapper = NPUGraphDecoderWrapper(
@@ -173,7 +176,7 @@ def test_one_capture_failure_keeps_other_graphs_and_reports_failure(monkeypatch,
     )
     graph_wrapper.warmup(torch.device("cpu"))
     assert set(graph_wrapper.graphs) == {(1, 25), (1, 97)}
-    output = capsys.readouterr().out
+    output = caplog.text
     assert "failed_keys=[(1, 73)]" in output
 
 
@@ -266,27 +269,29 @@ def test_variable_length_batched_decode_matches_per_request_eager(wrapper):
     _assert_waveform_close(graph[1:2, :, : eager_short.shape[-1]], eager_short)
 
 
-def test_only_fallback_reason_is_printed_once(wrapper, capsys):
+def test_only_fallback_reason_is_logged_once(wrapper, caplog):
+    caplog.set_level(logging.INFO)
     _, graph_wrapper, _ = wrapper
-    capsys.readouterr()
+    caplog.clear()
     graph_wrapper.decode(_codes(1, 25))
     graph_wrapper.decode(_codes(1, 20))
     graph_wrapper.decode(_codes(1, 25))
     graph_wrapper.decode(_codes(1, 20))
-    output = capsys.readouterr().out
+    output = caplog.text
     assert "[Qwen3-TTS][NPU Code2Wav graph] exact hit" not in output
     assert output.count("[Qwen3-TTS][NPU Code2Wav graph] eager fallback") == 1
     assert "eager fallback batch_size=1 frames=20 reason=padding_disabled" in output
 
 
-def test_stats_print_records_exact_hit_probability(wrapper, capsys):
+def test_stats_log_records_exact_hit_probability(wrapper, caplog):
+    caplog.set_level(logging.INFO)
     _, graph_wrapper, _ = wrapper
     graph_wrapper.stats_log_every = 3
-    capsys.readouterr()
+    caplog.clear()
     graph_wrapper.decode(_codes(1, 25))
     graph_wrapper.decode(_codes(1, 20))
     graph_wrapper.decode(_codes(1, 25))
-    output = capsys.readouterr().out
+    output = caplog.text
     assert (
         "stats total=3 exact_hits=2 padded_hits=0 graph_hits=2 "
         "fallbacks=1 exact_hit_rate=66.67% graph_hit_rate=66.67%"
@@ -350,7 +355,8 @@ def test_padding_limit_controls_routing(monkeypatch, max_pad_frames, expected_ke
     assert graph_wrapper._get_graph_key(1, 20) == expected_key
 
 
-def test_padding_limit_fallback_prints_specific_reason(monkeypatch, capsys):
+def test_padding_limit_fallback_logs_specific_reason(monkeypatch, caplog):
+    caplog.set_level(logging.INFO)
     fake_npu = _FakeNPU()
     monkeypatch.setattr(torch, "npu", fake_npu, raising=False)
     graph_wrapper = NPUGraphDecoderWrapper(
@@ -361,9 +367,9 @@ def test_padding_limit_fallback_prints_specific_reason(monkeypatch, capsys):
         max_pad_frames=4,
     )
     graph_wrapper.warmup(torch.device("cpu"))
-    capsys.readouterr()
+    caplog.clear()
     graph_wrapper.decode(_codes(1, 20))
-    assert "eager fallback batch_size=1 frames=20 reason=padding_limit" in capsys.readouterr().out
+    assert "eager fallback batch_size=1 frames=20 reason=padding_limit" in caplog.text
 
 
 def test_failed_capture_is_not_a_padding_bucket(monkeypatch):
@@ -380,16 +386,17 @@ def test_failed_capture_is_not_a_padding_bucket(monkeypatch):
     assert graph_wrapper._get_graph_key(1, 26) == (1, 73)
 
 
-def test_padding_stats_are_split_by_route_without_per_hit_logs(padding_wrapper, capsys):
+def test_padding_stats_are_split_by_route_without_per_hit_logs(padding_wrapper, caplog):
+    caplog.set_level(logging.INFO)
     _, graph_wrapper, _ = padding_wrapper
     graph_wrapper.stats_log_every = 3
-    capsys.readouterr()
+    caplog.clear()
 
     graph_wrapper.decode(_codes(1, 25))
     graph_wrapper.decode(_codes(1, 26))
     graph_wrapper.decode(_codes(3, 26))
     graph_wrapper.decode(_codes(1, 26))
-    output = capsys.readouterr().out
+    output = caplog.text
 
     assert "exact hit" not in output
     assert "padded hit" not in output

@@ -92,11 +92,7 @@ class NPUGraphDecoderWrapper:
             return
         try:
             self._route_log_handle = open(self.route_log_file, "a", encoding="utf-8", buffering=1)
-            print(
-                "[Qwen3-TTS][NPU Code2Wav graph] route log enabled "
-                f"path={self.route_log_file}",
-                flush=True,
-            )
+            logger.info("[Qwen3-TTS][NPU Code2Wav graph] route log enabled path=%s", self.route_log_file)
         except OSError as exc:
             self._disable_route_log(exc)
 
@@ -111,10 +107,10 @@ class NPUGraphDecoderWrapper:
                 pass
         if not self._route_log_error_printed:
             self._route_log_error_printed = True
-            print(
-                "[Qwen3-TTS][NPU Code2Wav graph] route log disabled "
-                f"path={route_log_file} error={exc}",
-                flush=True,
+            logger.warning(
+                "[Qwen3-TTS][NPU Code2Wav graph] route log disabled path=%s error=%s",
+                route_log_file,
+                exc,
             )
         self.route_log_file = None
         self._route_log_window.clear()
@@ -230,15 +226,15 @@ class NPUGraphDecoderWrapper:
         capture_shapes = self._get_capture_shapes()
         self._open_route_log()
         capture_batches = sorted({batch_size for batch_size, _ in capture_shapes})
-        print(
+        logger.info(
             "[Qwen3-TTS][NPU Code2Wav graph] enabled "
-            f"capture_count={len(capture_shapes)} "
-            f"batch_buckets={capture_batches} "
-            f"padding_enabled={self.padding_enabled} "
-            f"max_pad_frames={'unlimited' if self.max_pad_frames == 0 else self.max_pad_frames} "
-            f"non_packed_position_ids=True "
-            f"stats_log_every={self.stats_log_every}",
-            flush=True,
+            "capture_count=%d batch_buckets=%s padding_enabled=%s "
+            "max_pad_frames=%s non_packed_position_ids=True stats_log_every=%d",
+            len(capture_shapes),
+            capture_batches,
+            self.padding_enabled,
+            "unlimited" if self.max_pad_frames == 0 else self.max_pad_frames,
+            self.stats_log_every,
         )
 
         pool = torch.npu.graph_pool_handle()
@@ -281,11 +277,10 @@ class NPUGraphDecoderWrapper:
             batch_size: sorted(sizes) for batch_size, sizes in buckets_by_batch.items()
         }
         self._warmed_up = True
-        print(
-            "[Qwen3-TTS][NPU Code2Wav graph] capture complete "
-            f"graph_count={len(graph_keys)} "
-            f"failed_keys={sorted(failed_keys)}",
-            flush=True,
+        logger.info(
+            "[Qwen3-TTS][NPU Code2Wav graph] capture complete graph_count=%d failed_keys=%s",
+            len(graph_keys),
+            sorted(failed_keys),
         )
 
     def _get_graph_key(self, batch_size: int, actual_size: int) -> tuple[int, int] | None:
@@ -315,20 +310,21 @@ class NPUGraphDecoderWrapper:
             return "padding_limit"
         return "no_graph_bucket"
 
-    def _print_stats(self) -> None:
+    def _log_stats(self) -> None:
         exact_hit_rate = 100.0 * self._stats_exact_hits / self._stats_total if self._stats_total else 0.0
         graph_hits = self._stats_exact_hits + self._stats_padded_hits
         graph_hit_rate = 100.0 * graph_hits / self._stats_total if self._stats_total else 0.0
-        print(
+        logger.info(
             "[Qwen3-TTS][NPU Code2Wav graph] stats "
-            f"total={self._stats_total} "
-            f"exact_hits={self._stats_exact_hits} "
-            f"padded_hits={self._stats_padded_hits} "
-            f"graph_hits={graph_hits} "
-            f"fallbacks={self._stats_fallbacks} "
-            f"exact_hit_rate={exact_hit_rate:.2f}% "
-            f"graph_hit_rate={graph_hit_rate:.2f}%",
-            flush=True,
+            "total=%d exact_hits=%d padded_hits=%d graph_hits=%d fallbacks=%d "
+            "exact_hit_rate=%.2f%% graph_hit_rate=%.2f%%",
+            self._stats_total,
+            self._stats_exact_hits,
+            self._stats_padded_hits,
+            graph_hits,
+            self._stats_fallbacks,
+            exact_hit_rate,
+            graph_hit_rate,
         )
 
     def _record_route(
@@ -353,11 +349,12 @@ class NPUGraphDecoderWrapper:
             # occurrence of each reason to keep production output bounded.
             if reason not in self._printed_fallback_reasons:
                 self._printed_fallback_reasons.add(reason)
-                print(
+                logger.warning(
                     "[Qwen3-TTS][NPU Code2Wav graph] eager fallback "
-                    f"batch_size={request_key[0]} frames={request_key[1]} "
-                    f"reason={reason}",
-                    flush=True,
+                    "batch_size=%d frames=%d reason=%s",
+                    request_key[0],
+                    request_key[1],
+                    reason,
                 )
         self._record_route_log(
             route=route,
@@ -366,12 +363,12 @@ class NPUGraphDecoderWrapper:
             fallback_reason=fallback_reason,
         )
         if self.stats_log_every > 0 and self._stats_total % self.stats_log_every == 0:
-            self._print_stats()
+            self._log_stats()
             self._flush_route_log()
 
     def log_decode_stats(self) -> None:
         if self._stats_total > 0:
-            self._print_stats()
+            self._log_stats()
             self._flush_route_log()
 
     def _decode(self, codes: torch.Tensor, *, clone_graph_output: bool) -> torch.Tensor:
