@@ -593,10 +593,10 @@ class CodePredictorWrapper(nn.Module):
         # wrapper/cache set per execution slot.
         self._kv_cache_by_bucket: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
         graph_cfg = self._stage_connector_extra_config(vllm_config)
-        # Keep the community sampling optimization enabled unless a benchmark
-        # profile explicitly requests the pre-optimization baseline.
-        self._community_optimizations_enabled = self._parse_bool_config(
-            graph_cfg.get("qwen3_tts_community_optimizations", True)
+        # Keep Gumbel-max as the default while allowing an A/B profile to
+        # restore the original softmax + multinomial sampler independently.
+        self._gumbel_sampling_enabled = self._parse_bool_config(
+            graph_cfg.get("code_predictor_gumbel_sampling", True)
         )
         prefix_graphs_requested = self._parse_bool_config(graph_cfg.get("code_predictor_prefix_graphs"))
         kv_cache_requested = self._parse_bool_config(graph_cfg.get("code_predictor_kv_cache"))
@@ -1323,7 +1323,7 @@ class CodePredictorWrapper(nn.Module):
                     remove_mask = (cumulative_probs - sorted_probs) >= s_top_p
                     sorted_logits[remove_mask] = float("-inf")
                     logits = sorted_logits.scatter(1, sorted_idx, sorted_logits)
-                if self._community_optimizations_enabled:
+                if self._gumbel_sampling_enabled:
                     code = self._sample_codes_gumbel(logits, generator=sample_generator)
                 else:
                     code = self._sample_codes_multinomial(logits, generator=sample_generator)
@@ -1334,7 +1334,7 @@ class CodePredictorWrapper(nn.Module):
                     if top_k > 0:
                         topk_vals, _ = scaled.topk(top_k, dim=-1)
                         scaled = scaled.masked_fill(scaled < topk_vals[:, -1:], float("-inf"))
-                    if self._community_optimizations_enabled:
+                    if self._gumbel_sampling_enabled:
                         code = self._sample_codes_gumbel(scaled, generator=sample_generator)
                     else:
                         code = self._sample_codes_multinomial(scaled, generator=sample_generator)

@@ -17,6 +17,12 @@ connectors:
       codec_left_context_frames: 72
       initial_codec_chunk_frames: 1
 
+      # Community optimizations.
+      talker_mtp_graph: true
+      talker_mtp_per_row_generators: true
+      talker_async_output: true
+      code_predictor_gumbel_sampling: true
+
       # MTP: two-token prefill followed by one-token KV-cache decode graphs.
       code_predictor_kv_cache: true
       code_predictor_kv_cache_buckets: [1, 2, 4, 8, 16]

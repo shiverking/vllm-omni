@@ -18,8 +18,11 @@ connectors:
       codec_left_context_frames: 72
       initial_codec_chunk_frames: 1
 
-      # Restore pre-community Talker-MTP execution and multinomial sampling.
-      qwen3_tts_community_optimizations: false
+      # Disable community optimizations independently.
+      talker_mtp_graph: false
+      talker_mtp_per_row_generators: false
+      talker_async_output: false
+      code_predictor_gumbel_sampling: false
 
       # Disable all locally developed acceleration paths.
       code_predictor_kv_cache: false

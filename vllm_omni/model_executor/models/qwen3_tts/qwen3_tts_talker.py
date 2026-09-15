@@ -338,13 +338,19 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         # OmniGPUModelRunner will store talker_mtp output under this key in
         # per-request additional_information.
         self.talker_mtp_output_key = ("codes", "audio")
-        # This benchmark-only switch reconstructs the pre-community execution
-        # path without changing the default behavior of existing deployments.
+        # These independent feature switches keep existing deployments on the
+        # optimized defaults while allowing YAML-only A/B combinations.
         extra_cfg = _stage_connector_extra_config(vllm_config)
-        community_optimizations_enabled = _parse_bool_config(
-            extra_cfg.get("qwen3_tts_community_optimizations", True)
+        talker_mtp_graph_enabled = _parse_bool_config(
+            extra_cfg.get("talker_mtp_graph", True)
         )
-        self.talker_mtp_graph_safe = community_optimizations_enabled
+        talker_mtp_per_row_generators_enabled = _parse_bool_config(
+            extra_cfg.get("talker_mtp_per_row_generators", True)
+        )
+        talker_async_output_enabled = _parse_bool_config(
+            extra_cfg.get("talker_async_output", True)
+        )
+        self.talker_mtp_graph_safe = talker_mtp_graph_enabled
         # talker_mtp samples with per-row generators, so explicitly-seeded
         # requests stay batched instead of one scalar forward per row (#4883).
         # This is only valid while talker_mtp receives the *unpadded* active
@@ -368,11 +374,11 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             self.talker_mtp_graph_safe and cudagraph_mode is not None and cudagraph_mode.has_full_cudagraphs()
         )
         self.talker_mtp_accepts_per_row_generators = (
-            community_optimizations_enabled and not talker_mtp_graph_wrapped
+            talker_mtp_per_row_generators_enabled and not talker_mtp_graph_wrapped
         )
-        self.use_async_omni_output = community_optimizations_enabled
-        self.eager_omni_postprocess_before_async_output = community_optimizations_enabled
-        self.omni_pooler_payload_include_hidden = not community_optimizations_enabled
+        self.use_async_omni_output = talker_async_output_enabled
+        self.eager_omni_postprocess_before_async_output = talker_async_output_enabled
+        self.omni_pooler_payload_include_hidden = not talker_async_output_enabled
         self.model = Qwen3Model(vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model"))
 
         if get_pp_group().is_last_rank:
