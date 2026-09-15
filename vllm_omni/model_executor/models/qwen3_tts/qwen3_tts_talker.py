@@ -40,6 +40,26 @@ logger = init_logger(__name__)
 _TRAILING_TEXT_COMPACT_MIN_FRAMES = 64
 
 
+def _stage_connector_extra_config(vllm_config: VllmConfig) -> dict[str, Any]:
+    model_cfg = getattr(vllm_config, "model_config", None)
+    connector_cfg = getattr(model_cfg, "stage_connector_config", None)
+    if isinstance(connector_cfg, dict):
+        extra_cfg = connector_cfg.get("extra", connector_cfg)
+    else:
+        extra_cfg = getattr(connector_cfg, "extra", None)
+    return extra_cfg if isinstance(extra_cfg, dict) else {}
+
+
+def _parse_bool_config(value: object) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in ("1", "true", "yes", "on")
+    if isinstance(value, int):
+        return bool(value)
+    return False
+
+
 def _has_tts_text_conditioning(info_dict: dict[str, Any], hidden_states: Any | None = None) -> bool:
     text_list = info_dict.get("text")
     if isinstance(text_list, list) and bool(text_list) and bool(text_list[0]):
@@ -318,7 +338,13 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         # OmniGPUModelRunner will store talker_mtp output under this key in
         # per-request additional_information.
         self.talker_mtp_output_key = ("codes", "audio")
-        self.talker_mtp_graph_safe = True
+        # This benchmark-only switch reconstructs the pre-community execution
+        # path without changing the default behavior of existing deployments.
+        extra_cfg = _stage_connector_extra_config(vllm_config)
+        community_optimizations_enabled = _parse_bool_config(
+            extra_cfg.get("qwen3_tts_community_optimizations", True)
+        )
+        self.talker_mtp_graph_safe = community_optimizations_enabled
         # talker_mtp samples with per-row generators, so explicitly-seeded
         # requests stay batched instead of one scalar forward per row (#4883).
         # This is only valid while talker_mtp receives the *unpadded* active
@@ -341,10 +367,12 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         talker_mtp_graph_wrapped = (
             self.talker_mtp_graph_safe and cudagraph_mode is not None and cudagraph_mode.has_full_cudagraphs()
         )
-        self.talker_mtp_accepts_per_row_generators = not talker_mtp_graph_wrapped
-        self.use_async_omni_output = True
-        self.eager_omni_postprocess_before_async_output = True
-        self.omni_pooler_payload_include_hidden = False
+        self.talker_mtp_accepts_per_row_generators = (
+            community_optimizations_enabled and not talker_mtp_graph_wrapped
+        )
+        self.use_async_omni_output = community_optimizations_enabled
+        self.eager_omni_postprocess_before_async_output = community_optimizations_enabled
+        self.omni_pooler_payload_include_hidden = not community_optimizations_enabled
         self.model = Qwen3Model(vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model"))
 
         if get_pp_group().is_last_rank:

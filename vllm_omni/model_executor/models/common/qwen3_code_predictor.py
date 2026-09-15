@@ -593,6 +593,11 @@ class CodePredictorWrapper(nn.Module):
         # wrapper/cache set per execution slot.
         self._kv_cache_by_bucket: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
         graph_cfg = self._stage_connector_extra_config(vllm_config)
+        # Keep the community sampling optimization enabled unless a benchmark
+        # profile explicitly requests the pre-optimization baseline.
+        self._community_optimizations_enabled = self._parse_bool_config(
+            graph_cfg.get("qwen3_tts_community_optimizations", True)
+        )
         prefix_graphs_requested = self._parse_bool_config(graph_cfg.get("code_predictor_prefix_graphs"))
         kv_cache_requested = self._parse_bool_config(graph_cfg.get("code_predictor_kv_cache"))
         fia_gqa_requested = self._parse_bool_config(graph_cfg.get("code_predictor_fia_gqa"))
@@ -861,6 +866,27 @@ class CodePredictorWrapper(nn.Module):
         else:
             u.uniform_(_UNIFORM_EPS, 1.0 - _UNIFORM_EPS, generator=row_generators)
         return (logits.float() - torch.log(-torch.log(u))).argmax(dim=-1, keepdim=True)
+
+    @classmethod
+    def _sample_codes_multinomial(
+        cls, logits: torch.Tensor, generator: _GeneratorLike = None
+    ) -> torch.Tensor:
+        """Use the original softmax + multinomial sampling implementation."""
+        probabilities = F.softmax(logits, dim=-1, dtype=torch.float32)
+        row_generators = cls._normalize_generators(generator, int(logits.shape[0]))
+        if isinstance(row_generators, list):
+            return torch.cat(
+                [
+                    torch.multinomial(
+                        probabilities[row : row + 1],
+                        num_samples=1,
+                        generator=row_generator,
+                    )
+                    for row, row_generator in enumerate(row_generators)
+                ],
+                dim=0,
+            )
+        return torch.multinomial(probabilities, num_samples=1, generator=row_generators)
 
     def _prefix_seq_lens(self, max_seq: int) -> list[int]:
         all_seq_lens = list(range(2, max_seq))
@@ -1272,7 +1298,8 @@ class CodePredictorWrapper(nn.Module):
 
             logits = lm_heads[step - 1](hidden_out[:bsz, hidden_index, :])
 
-            # Sample next code via Gumbel-max.
+            # Sample next code. Production uses Gumbel-max; the explicit
+            # true-baseline profile restores softmax + multinomial below.
             #
             # ``argmax_i(logits_i + Gumbel_i)`` with
             # ``Gumbel_i = -log(-log(u_i)), u_i ~ Uniform(0, 1)`` is
@@ -1285,7 +1312,7 @@ class CodePredictorWrapper(nn.Module):
             # and the helper below can honor either one batch generator or one
             # generator per seeded row.
             if stored_mode:
-                # "stored" mode: top-k -> top-p -> Gumbel-max
+                # "stored" mode: top-k -> top-p -> configured sampler
                 if s_top_k > 0:
                     topk_vals, _ = logits.topk(s_top_k, dim=-1)
                     logits = logits.masked_fill(logits < topk_vals[:, -1:], float("-inf"))
@@ -1296,15 +1323,21 @@ class CodePredictorWrapper(nn.Module):
                     remove_mask = (cumulative_probs - sorted_probs) >= s_top_p
                     sorted_logits[remove_mask] = float("-inf")
                     logits = sorted_logits.scatter(1, sorted_idx, sorted_logits)
-                code = self._sample_codes_gumbel(logits, generator=sample_generator)
+                if self._community_optimizations_enabled:
+                    code = self._sample_codes_gumbel(logits, generator=sample_generator)
+                else:
+                    code = self._sample_codes_multinomial(logits, generator=sample_generator)
             else:
-                # "per_call" mode: temperature-scaled + top-k -> Gumbel-max
+                # "per_call" mode: temperature-scaled + top-k -> sampler
                 if use_sampling:
                     scaled = logits * inv_temperature
                     if top_k > 0:
                         topk_vals, _ = scaled.topk(top_k, dim=-1)
                         scaled = scaled.masked_fill(scaled < topk_vals[:, -1:], float("-inf"))
-                    code = self._sample_codes_gumbel(scaled, generator=sample_generator)
+                    if self._community_optimizations_enabled:
+                        code = self._sample_codes_gumbel(scaled, generator=sample_generator)
+                    else:
+                        code = self._sample_codes_multinomial(scaled, generator=sample_generator)
                 else:
                     code = logits.argmax(dim=-1, keepdim=True)
 
