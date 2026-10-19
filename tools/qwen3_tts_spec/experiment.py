@@ -38,6 +38,52 @@ def read_rows(path):
     return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line]
 
 
+class ReplayProgress:
+    """Host-only progress, emitted outside measured frame calls.
+
+    ETA describes the current stage/round, not unmeasured later stages.
+    No background heartbeat: a blocked device call cannot claim progress.
+    """
+
+    def __init__(self, output, interval=10.0):
+        if not np.isfinite(interval) or interval <= 0:
+            raise ValueError("progress interval must be finite and positive")
+        self.path = output / "replay-progress.log"
+        self.interval = interval
+        self.started = time.monotonic()
+        self.message("Replay started; ETA is for the current stage/round only.")
+
+    @staticmethod
+    def duration(seconds):
+        seconds = max(0, int(seconds))
+        return f"{seconds // 3600:02d}:{seconds // 60 % 60:02d}:{seconds % 60:02d}"
+
+    def message(self, text):
+        line = f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] [replay] {text}"
+        print(line, flush=True)
+        with self.path.open("a", encoding="utf-8") as stream:
+            stream.write(line + "\n")
+
+    def begin(self, stage, total):
+        self.stage, self.total, self.done = stage, total, 0
+        self.stage_started = self.last_output = time.monotonic()
+        self.message(f"{stage}: 0/{total}; ETA=estimating")
+
+    def advance(self, context=""):
+        self.done += 1
+        now = time.monotonic()
+        if self.done != self.total and now - self.last_output < self.interval:
+            return
+        elapsed = now - self.stage_started
+        remaining = elapsed / self.done * (self.total - self.done)
+        self.message(
+            f"{self.stage}: {self.done}/{self.total} ({100 * self.done / self.total:.1f}%); "
+            f"stage_elapsed={self.duration(elapsed)}; ETA~{self.duration(remaining)}; "
+            f"total_elapsed={self.duration(now - self.started)}; {context}"
+        )
+        self.last_output = now
+
+
 def digest(value):
     return hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()
 
@@ -354,7 +400,10 @@ def measured(fn, device):
 
 @torch.inference_mode()
 def replay(args):
+    progress = ReplayProgress(args.output, getattr(args, "progress_interval", 10.0))
+    progress.message("Loading predictor (including device warmup/graph capture).")
     model, spec = load_predictor(args), spec_module()
+    progress.message("Loading held-out frame shards.")
     test_frames = frames(args, "test")
     frozen = json.loads((args.output / "trees.json").read_text(encoding="utf-8"))
     signature = frozen.pop("sha256")
@@ -364,7 +413,13 @@ def replay(args):
     if frozen["dataset_sha256"] != digest(manifest["dataset"]):
         raise ValueError("dataset changed after calibration")
     configs = frozen["configs"]
+    progress.message(
+        f"Loaded {len(test_frames)} independent frames; configs={['reference', *configs]}; "
+        f"performance executions={4 * (1 + 2 * len(configs)) * max(200, len(test_frames))}. "
+        "Correctness includes serial checks of every tree node; ETA may fluctuate."
+    )
     events, diagnostics, mismatches = [], [], []
+    progress.begin("correctness (frame/mode/config checks)", len(test_frames) * 2 * (1 + len(configs)))
     for frame in test_frames:
         for greedy in (True, False):
             inputs = inputs_for(args, model, frame, greedy)
@@ -402,6 +457,10 @@ def replay(args):
                         failure["node_artifact"] = artifact.name
                         # Persist the original failure even if diagnosis itself fails.
                         write_json(args.output / "correctness.json", failure)
+                        progress.message(
+                            f"Node audit FAILED: request={frame['request_id']} frame={frame['frame_id']} "
+                            f"config={name}; running failure diagnostics (including CPU float64)."
+                        )
                         try:
                             failure["node_diagnostics"] = spec.diagnose_node(model, exc.payload)
                         except Exception as diagnostic_error:
@@ -437,6 +496,11 @@ def replay(args):
                         phases=info["timings"],
                     )
                 )
+                progress.advance(
+                    f"completed request={frame['request_id']} frame={frame['frame_id']} "
+                    f"mode={'greedy' if greedy else 'sampling'} config={name} mismatches={len(mismatches)}"
+                )
+    progress.message("Saving correctness events and diagnostics.")
     write_rows(args.output / "events.jsonl", events)
     write_rows(args.output / "diagnostics.jsonl", diagnostics)
     write_json(
@@ -444,7 +508,9 @@ def replay(args):
         dict(passed=not mismatches, mismatches=mismatches, unique_frames=len(test_frames), tree_sha256=signature),
     )
     if mismatches:
+        progress.message("Correctness FAILED; performance testing will not run.")
         raise RuntimeError("code differences found; inspect correctness.json before performance testing")
+    progress.message("Correctness PASSED. Preparing device inputs for performance testing.")
     device = torch.device(args.device)
     api = api_for(device)
     if api:
@@ -452,15 +518,29 @@ def replay(args):
     timing_rows = []
     total = max(200, len(test_frames))
     # Inputs/RNG construction and data transfer are outside frame timers.
-    prepared = [inputs_for(args, model, frame, args.greedy) for frame in test_frames]
+    progress.begin("prepare performance inputs", len(test_frames))
+    prepared = []
+    for frame in test_frames:
+        prepared.append(inputs_for(args, model, frame, args.greedy))
+        progress.advance()
+    group = 0
+    groups = 1 + 2 * len(configs)
     for name, paths in {"reference": [], **configs}.items():
+        progress.begin(f"warmup config={name} (stock + candidate pairs)", 20)
         for i in range(20):
             inp = prepared[i % len(prepared)]
             model(**inp)
             spec.decode(model, **inp, paths=paths)
+            progress.advance()
         # Four rounds per comparator, ABBA with identical frame order.
         for comparator in ("stock",) if name == "reference" else ("stock", "reference"):
+            group += 1
             for round_id, kind in enumerate((comparator, name, name, comparator)):
+                progress.begin(
+                    f"performance group={group}/{groups} config={name} comparator={comparator} "
+                    f"round={round_id + 1}/4 kind={kind}",
+                    total,
+                )
                 for execution in range(total):
                     index = execution % len(prepared)
                     inp = prepared[index]
@@ -506,6 +586,9 @@ def replay(args):
                             else spec.ATTENTION_BACKEND,
                         )
                     )
+                    # Printing/file I/O must remain outside measured() above.
+                    progress.advance()
+    progress.message("Saving timing rows and replay metadata.")
     write_rows(args.output / "timings.jsonl", timing_rows)
     write_json(
         args.output / "replay.json",
@@ -521,6 +604,7 @@ def replay(args):
             sampling="greedy" if args.greedy else "shared_uniforms",
         ),
     )
+    progress.message(f"Replay complete; total_elapsed={progress.duration(time.monotonic() - progress.started)}")
 
 
 def report(args):
@@ -663,6 +747,7 @@ def main():
     parser.add_argument("--prepare", action="store_true")
     parser.add_argument("--e2e-label", choices=("stock", "chain", "tree8", "tree16", "tree32"))
     parser.add_argument("--greedy", action="store_true")
+    parser.add_argument("--progress-interval", type=float, default=10.0, help="replay progress interval in seconds")
     args = parser.parse_args()
     if args.device.startswith("npu"):
         import torch_npu  # noqa: F401

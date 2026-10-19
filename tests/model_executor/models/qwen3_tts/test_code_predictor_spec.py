@@ -20,6 +20,37 @@ from tests.model_executor.models.qwen3_tts.test_code_predictor_dtype import (
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
+def test_replay_progress_throttles_and_resets_stage_eta(tmp_path, monkeypatch, capsys):
+    root = Path(__file__).resolve().parents[4]
+    module_spec = importlib.util.spec_from_file_location(
+        "spec_experiment_progress", root / "tools/qwen3_tts_spec/experiment.py"
+    )
+    cli = importlib.util.module_from_spec(module_spec)
+    module_spec.loader.exec_module(cli)
+    clock = [0.0]
+    monkeypatch.setattr(cli.time, "monotonic", lambda: clock[0])
+    progress = cli.ReplayProgress(tmp_path, interval=10)
+    progress.begin("correctness", 4)
+    capsys.readouterr()
+    clock[0] = 5
+    progress.advance()
+    assert not capsys.readouterr().out
+    clock[0] = 10
+    progress.advance("frame=1")
+    output = capsys.readouterr().out
+    assert "2/4 (50.0%)" in output
+    assert "ETA~00:00:10" in output
+    progress.begin("performance", 1)
+    clock[0] = 11
+    progress.advance()
+    output = capsys.readouterr().out
+    assert "stage_elapsed=00:00:01; ETA~00:00:00; total_elapsed=00:00:11" in output
+    assert "Replay started" in (tmp_path / "replay-progress.log").read_text(encoding="utf-8")
+    for interval in (0, -1, float("nan"), float("inf")):
+        with pytest.raises(ValueError, match="finite and positive"):
+            cli.ReplayProgress(tmp_path, interval)
+
+
 def test_offline_npu_initializes_ascend_before_weight_preparation(monkeypatch):
     root = Path(__file__).resolve().parents[4]
     module_spec = importlib.util.spec_from_file_location(
