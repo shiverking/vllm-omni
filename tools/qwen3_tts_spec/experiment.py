@@ -103,8 +103,28 @@ def spec_module():
     return qwen3_code_predictor_spec
 
 
+def predictor_runtime_config(device):
+    if device.type != "npu":
+        return SimpleNamespace(scheduler_config=SimpleNamespace(max_num_seqs=1))
+
+    from vllm.config import VllmConfig
+    from vllm_ascend.ascend_config import init_ascend_config
+
+    # Offline replay has no worker to initialize Ascend's global configuration.
+    # Use a real, model-free config: Ascend accesses more than scheduler_config,
+    # and a ModelConfig here would unnecessarily reload the full TTS checkpoint.
+    runtime = VllmConfig()
+    runtime.scheduler_config.max_num_seqs = 1
+    init_ascend_config(runtime)
+    return runtime
+
+
 def load_predictor(args):
-    api_for(torch.device(args.device))
+    device = torch.device(args.device)
+    api = api_for(device)
+    if api is not None:
+        api.set_device(device)
+    runtime = predictor_runtime_config(device)
     from vllm_omni.model_executor.models.common.qwen3_code_predictor import (
         CodePredictorWrapper,
         CodePredictorWrapperConfig,
@@ -113,7 +133,7 @@ def load_predictor(args):
     checkpoint = torch.load(args.output / "predictor.pt", map_location="cpu", weights_only=True)
     config = SimpleNamespace(**checkpoint["config"])
     wrapper = CodePredictorWrapper(
-        vllm_config=SimpleNamespace(scheduler_config=SimpleNamespace(max_num_seqs=1)),
+        vllm_config=runtime,
         cp_config=config,
         talker_hidden_size=checkpoint["talker_hidden_size"],
         wrapper_config=CodePredictorWrapperConfig(

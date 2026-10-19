@@ -4,6 +4,7 @@ import importlib
 import itertools
 import json
 import sys
+import types
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -17,6 +18,66 @@ from tests.model_executor.models.qwen3_tts.test_code_predictor_dtype import (
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+def test_offline_npu_initializes_ascend_before_weight_preparation(monkeypatch):
+    root = Path(__file__).resolve().parents[4]
+    module_spec = importlib.util.spec_from_file_location(
+        "spec_experiment_init", root / "tools/qwen3_tts_spec/experiment.py"
+    )
+    cli = importlib.util.module_from_spec(module_spec)
+    module_spec.loader.exec_module(cli)
+    events = []
+    runtime = SimpleNamespace(scheduler_config=SimpleNamespace(max_num_seqs=64), additional_config={})
+    config_module = types.ModuleType("vllm.config")
+    config_module.VllmConfig = lambda: runtime
+    ascend_module = types.ModuleType("vllm_ascend.ascend_config")
+
+    def initialize(config):
+        assert config is runtime
+        assert config.scheduler_config.max_num_seqs == 1
+        events.append("init")
+
+    ascend_module.init_ascend_config = initialize
+    monkeypatch.setitem(sys.modules, "vllm.config", config_module)
+    monkeypatch.setitem(sys.modules, "vllm_ascend.ascend_config", ascend_module)
+    device = SimpleNamespace(type="npu")
+    monkeypatch.setattr(cli.torch, "device", lambda _: device)
+    monkeypatch.setattr(cli, "api_for", lambda _: SimpleNamespace(set_device=lambda _: events.append("device")))
+    monkeypatch.setattr(
+        cli.torch, "load", lambda *a, **kw: dict(config={}, talker_hidden_size=32, dtype="torch.float32", state={})
+    )
+
+    class Wrapper:
+        def __init__(self, *, vllm_config, **kwargs):
+            assert vllm_config is runtime
+            assert events == ["device", "init"]
+
+        def to(self, *args, **kwargs):
+            return self
+
+        def load_state_dict(self, state, strict):
+            assert strict
+
+        def eval(self):
+            return self
+
+        def requires_grad_(self, value):
+            return self
+
+        def _prepare_npu_weights(self):
+            assert "init" in events
+            events.append("prepare")
+
+    predictor_module = types.ModuleType("vllm_omni.model_executor.models.common.qwen3_code_predictor")
+    predictor_module.CodePredictorWrapper = Wrapper
+    predictor_module.CodePredictorWrapperConfig = lambda **kwargs: kwargs
+    monkeypatch.setitem(sys.modules, predictor_module.__name__, predictor_module)
+    cli.load_predictor(SimpleNamespace(device="npu:0", output=Path("unused")))
+    assert events == ["device", "init", "prepare"]
+    cpu_runtime = cli.predictor_runtime_config(SimpleNamespace(type="cpu"))
+    assert cpu_runtime.scheduler_config.max_num_seqs == 1
+    assert events == ["device", "init", "prepare"]
 
 
 @pytest.fixture
