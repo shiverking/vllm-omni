@@ -410,6 +410,7 @@ def replay(args):
                         args.output / "correctness.json",
                         failure,
                     )
+                    print(json.dumps(failure, indent=2, ensure_ascii=False), flush=True)
                     raise
                 codes, info = spec.decode(model, **inputs, paths=paths, detailed=True, profile=True)
                 different = (codes != baseline).cpu().nonzero().tolist()
@@ -502,7 +503,7 @@ def replay(args):
                                 "npu_fusion_attention_sparse_mode2" if device.type == "npu" else "torch_sdpa"
                             )
                             if kind == "stock"
-                            else "explicit_fp32_matmul_softmax",
+                            else spec.ATTENTION_BACKEND,
                         )
                     )
     write_rows(args.output / "timings.jsonl", timing_rows)
@@ -636,7 +637,8 @@ def report(args):
             f"| {name} | {row['speedup']:.3f} | {row['bootstrap95']} | "
             f"{c['p50_ms']:.3f} / {c['p95_ms']:.3f} | {c['calls_per_frame']:.2f} |\n"
         )
-    text += "\nReference/tree attention: explicit FP32 matmul + softmax, eager. Stock uses tag backend/graphs.\n"
+    backends = sorted({r["attention_backend"] for r in rows if r["kind"] != "stock"})
+    text += f"\nReference/tree attention: {backends}, eager. Stock uses tag backend/graphs.\n"
     text += "\nOne host count transfer per tree round is included. Processed positions are a work proxy, not FLOPs.\n"
     text += (
         "\nSee summary.json, diagnostics.jsonl and requests-*.jsonl "

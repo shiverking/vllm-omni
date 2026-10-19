@@ -118,6 +118,31 @@ def test_layout_and_ancestor_closure(research):
             spec.validate_tree(invalid)
 
 
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@torch.inference_mode()
+def test_canonical_attention_preserves_logical_ancestors(research, dtype):
+    model, spec, inputs = research
+    model.to(dtype=dtype)
+    paths = spec.fit_tree([[2, 0, 1], [1, 0, 0]], 16)
+    prefix = spec.initial_prefix(model, inputs["layer0_embed"], inputs["last_talker_hidden"])
+    nodes = [model.model.codec_embedding[len(p) - 1](torch.tensor([[p[-1] + 1]])) for p in paths]
+    packed = torch.cat([prefix, *nodes], dim=1)
+    positions, mask = spec.attention_layout(2, tuple(paths), "cpu", model._num_groups + 1)
+    path = (2, 0)
+    row = 2 + paths.index(path)
+    assert mask.ancestor_indices[row, :4].tolist() == [0, 1, 2 + paths.index((2,)), row]
+    assert mask.ancestor_valid[row].sum() == 4
+    hidden = model.model(packed, positions, mask)
+    branch = [nodes[paths.index(path[:d])] for d in (1, 2)]
+    serial = spec.reference_forward(model, torch.cat([prefix, *branch], dim=1))
+    tolerance = 1e-6 if dtype == torch.float32 else 0.02
+    torch.testing.assert_close(hidden[:, row], serial[:, -1], atol=tolerance, rtol=tolerance)
+    changed = packed.clone()
+    changed[:, 2 + paths.index((1,))] += 100
+    isolated = model.model(changed, positions, mask)
+    torch.testing.assert_close(hidden[:, row], isolated[:, row], atol=0, rtol=0)
+
+
 @torch.inference_mode()
 def test_tree_logits_match_serial_and_no_sibling_leak(research):
     model, spec, inputs = research

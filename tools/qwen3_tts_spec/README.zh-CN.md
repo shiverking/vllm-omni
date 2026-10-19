@@ -112,6 +112,7 @@ logits 对照容差为：FP32 下 `atol=rtol=1e-5`，低精度下为 `2e-2`。**
 原始误差、相同打包长度下的串行误差，以及独立 CPU FP64 树／串行对照误差。
 这些诊断用于区分计算形状相关的数值差异和树结构问题，不会替代原始验收结果。
 如果诊断本身失败，`diagnostic_error` 会记录原因，原始失败信息仍然保留。
+诊断还会记录沿失败分支的逐模块同形状误差；失败 JSON 同时打印到终端。
 
 正确性通过后，性能测量按以下规则执行：
 
@@ -188,7 +189,7 @@ python tools/qwen3_tts_spec/experiment.py report \
 | `requests-*.jsonl` | 各配置完整请求的流式指标；`requests-capture.jsonl` 不用于性能验收 |
 | `summary.json`、`report.md` | 汇总指标和阶段结论 |
 
-`processed_positions` 和 `attention_pairs` 是主干计算量的代理指标。`estimated_matmul_flops` 是主干、attention、预测头和投影层矩阵乘法的理论运算量之和，不包括逐元素算子和硬件补齐开销，**不是实测硬件 FLOPs**。真实耗时包含预测头和 embedding 等开销。
+`processed_positions` 和 `attention_pairs` 是主干计算量的代理指标。`estimated_matmul_flops` 是主干、attention 等价运算、预测头和投影层的理论运算量之和；当前参考 attention 使用乘法／归约而非 matmul 内核。该估计不包括其他逐元素算子和硬件补齐开销，**不是实测硬件 FLOPs**。真实耗时包含祖先收集、预测头和 embedding 等开销。
 
 优先返回：manifest、冻结树、正确性结果、events、diagnostics、timings、replay 元数据、完整请求指标，以及最终报告。tensor 分片可先保留在服务器供定位问题使用，预测器权重文件可能较大。
 
@@ -213,7 +214,7 @@ Bootstrap 以**请求**为重采样单位，将重复执行的帧和配对测量
 - 实验模式明确拒绝大于 1 的 batch，包括预热；关闭外层 MTP 图捕获。原版 AR 回放保留 tag 的预测器内部图机制。
 - draft 前向重算已提交前缀，把最后的隐藏状态送入未来最多三个码本的原有 Head，每个位置取 top-4。
 - 树节点 embedding、输出 Head 和 RoPE 均按真实码本／序列位置选择，不使用打包索引代替真实位置。
-- 树验证采用显式 FP32 attention 矩阵乘法、带 mask 的 softmax 和 value 矩阵乘法。NPU norm／RoPE 仍沿用原有算子。候选节点只能看到已提交前缀、祖先和自身，不能看到兄弟分支。
+- 树验证先按逻辑顺序收集祖先，再使用显式 FP32 乘法／归约及带 mask 的 softmax，上下文归约宽度固定为 `num_code_groups + 1`。后端标识为 `canonical_ancestor_fp32_reduce`，用于避免树中被屏蔽列的物理位置及 FP32 matmul 降精度模式影响参考 attention；额外开销计入耗时。NPU norm／RoPE 仍沿用原有算子。候选节点只能看到已提交前缀、祖先和自身，不能看到兄弟分支。
 - 不使用压缩三角因果 mask 验证树。只缓存固定位置／mask 元数据，不缓存隐藏状态或 KV。当前树路径为 eager，不宣称已完成固定形状树图捕获。
 - 候选树不读取本轮目标随机数。按原目标分布进行 Gumbel 采样；命中则沿树继续，未命中则提交该目标 token 并结束本轮，叶节点可以额外提交一个目标 token。
 - 每个树轮次有一次提交长度从设备到主机的传输，该同步计入耗时；draft 和 verify 的主干调用都计入统计。

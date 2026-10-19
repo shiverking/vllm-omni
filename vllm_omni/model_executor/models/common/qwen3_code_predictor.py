@@ -36,6 +36,16 @@ logger = init_logger(__name__)
 _GeneratorLike = torch.Generator | Sequence[torch.Generator | None] | None
 _UNIFORM_EPS = 1e-20
 
+
+@dataclasses.dataclass(frozen=True)
+class CanonicalAttentionMask:
+    """Research mask with visible keys ordered by their logical prefix position."""
+
+    visibility: torch.Tensor
+    ancestor_indices: torch.Tensor
+    ancestor_valid: torch.Tensor
+
+
 if current_omni_platform.is_npu():
     import torch_npu
 
@@ -279,7 +289,7 @@ class CodePredictorAttention(nn.Module):
         self,
         hidden_states: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
-        attention_mask: torch.Tensor | None = None,
+        attention_mask: torch.Tensor | CanonicalAttentionMask | None = None,
     ) -> torch.Tensor:
         bsz, seq_len, _ = hidden_states.shape
         hidden_shape_q = (bsz, seq_len, self.num_heads, self.head_dim)
@@ -304,7 +314,25 @@ class CodePredictorAttention(nn.Module):
         else:
             q = (q * cos) + (_rotate_half(q) * sin)
             k = (k * cos) + (_rotate_half(k) * sin)
-        if attention_mask is not None:
+        if isinstance(attention_mask, CanonicalAttentionMask):
+            # The same logical prefix must have the same reduction order and
+            # width, regardless of where its ancestors sit in the packed tree.
+            # Explicit FP32 multiply/reduce also avoids reduced-precision FP32
+            # matmul modes. This is an eager correctness-reference backend.
+            k = k.repeat_interleave(self.num_queries_per_kv, dim=1).float()
+            v = v.repeat_interleave(self.num_queries_per_kv, dim=1).float()
+            indices = attention_mask.ancestor_indices
+            width = indices.shape[1]
+            selected_k = k.index_select(2, indices.reshape(-1)).reshape(
+                bsz, self.num_heads, seq_len, width, self.head_dim
+            )
+            selected_v = v.index_select(2, indices.reshape(-1)).reshape(
+                bsz, self.num_heads, seq_len, width, self.head_dim
+            )
+            scores = (q.float().unsqueeze(-2) * selected_k).sum(-1) * self.scaling
+            scores = scores.masked_fill(~attention_mask.ancestor_valid, float("-inf"))
+            attn_out = (scores.softmax(-1).unsqueeze(-1) * selected_v).sum(-2).to(q.dtype)
+        elif attention_mask is not None:
             # Research reference backend: True means visible. In particular,
             # a packed tree must never use the NPU compressed causal mask.
             k = k.repeat_interleave(self.num_queries_per_kv, dim=1)
@@ -375,7 +403,7 @@ class CodePredictorDecoderLayer(nn.Module):
         self,
         hidden_states: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
-        attention_mask: torch.Tensor | None = None,
+        attention_mask: torch.Tensor | CanonicalAttentionMask | None = None,
     ) -> torch.Tensor:
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
@@ -447,7 +475,7 @@ class CodePredictorBaseModel(nn.Module):
         self,
         inputs_embeds: torch.Tensor,
         position_ids: torch.Tensor,
-        attention_mask: torch.Tensor | None = None,
+        attention_mask: torch.Tensor | CanonicalAttentionMask | None = None,
     ) -> torch.Tensor:
         # Run the transformer body in float32 when the model is in fp16.
         # fp16 lacks the dynamic range for stable attention scores and

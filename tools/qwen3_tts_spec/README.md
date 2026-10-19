@@ -23,8 +23,12 @@ complete, performance unverified**.
   passed through the next three original codebook heads, top four each. A chain
   or ancestor-closed rank tree supplies candidate embeddings. Depth determines
   embedding, next head, and RoPE position; packed node index never does.
-- Verification recomputes prefix plus the tree with explicit FP32 attention
-  score matmul, masked softmax, and value matmul. NPU norm/RoPE still use the
+- Verification recomputes prefix plus the tree with canonical ancestor gathers,
+  explicit FP32 multiply/reduce, and masked softmax. Context reduction width is
+  fixed to `num_code_groups + 1`, independent of packed node count. This avoids
+  differences in physical masked-column order and reduced-precision FP32 matmul
+  modes in the reference attention. Backend name: `canonical_ancestor_fp32_reduce`.
+  Its gather/reduction overhead is included in measurements. NPU norm/RoPE still use the
   existing native operators. Prefix rows remain causal; candidate rows see
   prefix, ancestors, and themselves, never siblings. No compressed causal mask
   is used for trees. Fixed metadata masks are cached, but no hidden/KV state is.
@@ -113,6 +117,8 @@ to the same packed length, and an independent CPU float64 tree/serial evaluator.
 These diagnostics help distinguish shape-dependent numerics from topology
 errors; they never replace the original acceptance gate. A `diagnostic_error`
 field preserves secondary diagnostic failures without losing the original error.
+Failures also report module-level same-shape differences when branch mappings
+are available, and print the saved failure JSON to the terminal.
 
 Performance then runs without detailed events/phase timers: twenty warmup
 frames per configuration, four ABBA rounds of at least 200 frames each. Small
@@ -169,7 +175,8 @@ effects are present in both runs. No playback or buffering policy is modified.
 - `timings.jsonl`: complete-frame paired wall/device timing; comparator and
   actual attention backend. `processed_positions` and `attention_pairs` are
   backbone compute proxies. `estimated_matmul_flops` sums analytical backbone,
-  attention, head and projection matmul work; it excludes pointwise operations
+  attention-equivalent, head and projection matmul work; canonical attention uses
+  multiply/reduce instead of matmul kernels. This estimate excludes other pointwise operations
   and physical kernel padding, and is **not a hardware FLOP measurement**.
   Heads/embedding overhead is included in measured time. Explicit reference attention is eager; no
   tree-graph capture or silent graph fallback is claimed.

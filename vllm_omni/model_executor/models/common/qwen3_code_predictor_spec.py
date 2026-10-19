@@ -18,6 +18,31 @@ from functools import lru_cache
 import torch
 import torch.nn.functional as F
 
+ATTENTION_BACKEND = "canonical_ancestor_fp32_reduce"
+
+
+def canonical_mask(mask, width):
+    from .qwen3_code_predictor import CanonicalAttentionMask
+
+    indices, valid = [], []
+    for row in mask.cpu().tolist():
+        ancestors = [i for i, visible in enumerate(row) if visible]
+        if not ancestors or len(ancestors) > width:
+            raise ValueError("invalid canonical attention context width")
+        indices.append(ancestors + [ancestors[0]] * (width - len(ancestors)))
+        valid.append([True] * len(ancestors) + [False] * (width - len(ancestors)))
+    return CanonicalAttentionMask(
+        mask, torch.tensor(indices, device=mask.device), torch.tensor(valid, device=mask.device)
+    )
+
+
+@lru_cache(maxsize=512)
+def attention_layout(prefix_len, paths, device, width):
+    # All host metadata creation/transfers are amortized outside steady-state
+    # timing through warmup. No per-token device-to-host mask inspection.
+    positions, mask = layout(prefix_len, paths, device)
+    return positions, canonical_mask(mask, width)
+
 
 class NodeAuditError(AssertionError):
     """Preserve the failing node instead of losing it in a generic assertion."""
@@ -88,7 +113,9 @@ def diagnose_node(predictor, payload):
     mask = torch.eye(n, dtype=torch.bool, device=device)
     mask[:length, :length] = torch.ones(length, length, dtype=torch.bool, device=device).tril()
     head = predictor.lm_head[payload["next_position"] - 1]
-    padded_logits = head(predictor.model(padded, positions, mask)[:, length - 1]).cpu()
+    padded_logits = head(
+        predictor.model(padded, positions, canonical_mask(mask, predictor._num_groups + 1))[:, length - 1]
+    ).cpu()
     tree64 = _cpu_double_forward(predictor.model, packed, payload["positions"], payload["mask"])
     serial_pos, serial_mask = layout(length, [], "cpu")
     serial64 = _cpu_double_forward(predictor.model, serial, serial_pos, serial_mask)
@@ -104,6 +131,40 @@ def diagnose_node(predictor, payload):
             argmax_right=right.argmax(-1).tolist(),
         )
 
+    traces = [{}, {}]
+    phase = [0]
+    handles = []
+    branch_indices = payload.get("serial_indices")
+    if branch_indices is not None:
+
+        def hook(name):
+            def record(module, args, output):
+                if isinstance(output, torch.Tensor) and output.ndim >= 3 and output.shape[1] == n:
+                    rows = branch_indices if phase[0] == 0 else list(range(length))
+                    traces[phase[0]][name] = output[:, rows].detach().cpu()
+
+            return record
+
+        try:
+            for name, module in predictor.model.named_modules():
+                if name:
+                    handles.append(module.register_forward_hook(hook(name)))
+            predictor.model(
+                packed,
+                payload["positions"].to(device),
+                canonical_mask(payload["mask"].to(device), predictor._num_groups + 1),
+            )
+            phase[0] = 1
+            predictor.model(padded, positions, canonical_mask(mask, predictor._num_groups + 1))
+        finally:
+            for handle in handles:
+                handle.remove()
+    layerwise = {
+        name: {key: value for key, value in difference(left, traces[1][name]).items() if key in ("max_abs", "mean_abs")}
+        for name, left in traces[0].items()
+        if name in traces[1]
+    }
+
     return dict(
         position=payload["position"],
         rank_path=payload["rank_path"],
@@ -111,9 +172,11 @@ def diagnose_node(predictor, payload):
         packed_length=n,
         serial_length=length,
         dtype=str(packed.dtype),
+        attention_backend=ATTENTION_BACKEND,
         original=difference(payload["tree_logits"], payload["serial_logits"]),
         same_shape_serial=difference(payload["tree_logits"], padded_logits),
         cpu_float64=difference(left64, right64),
+        layerwise_same_shape=layerwise,
         note="Diagnostics only. Original tolerance and exact-code gates remain unchanged.",
     )
 
@@ -207,7 +270,7 @@ class PhaseTimer:
 
 
 def reference_forward(predictor, prefix):
-    positions, mask = layout(prefix.shape[1], [], prefix.device)
+    positions, mask = attention_layout(prefix.shape[1], (), str(prefix.device), predictor._num_groups + 1)
     return predictor.model(prefix, positions, mask)
 
 
@@ -314,7 +377,7 @@ def decode(
             root = reference_forward(predictor, prefix)[:, -1]
             calls += 1
             work += prefix.shape[1]
-            attention_pairs += prefix.shape[1] ** 2
+            attention_pairs += prefix.shape[1] * (groups + 1)
             active = [p for p in paths if len(p) <= groups - position]
             depth = max(map(len, active), default=0)
             head_rows += depth
@@ -345,11 +408,11 @@ def decode(
                     for p, code in zip(active, node_codes)
                 ]
                 packed = torch.cat([prefix, *node_embeds], dim=1)
-                pos, mask = layout(prefix.shape[1], active, device)
+                pos, mask = attention_layout(prefix.shape[1], tuple(active), str(device), groups + 1)
                 hidden = predictor.model(packed, pos, mask)
                 calls += 1
                 work += packed.shape[1]
-                attention_pairs += packed.shape[1] ** 2
+                attention_pairs += packed.shape[1] * (groups + 1)
                 if audit:
                     for i, path in enumerate(active):
                         branch = [node_embeds[active.index(path[:d])] for d in range(1, len(path) + 1)]
@@ -368,11 +431,13 @@ def decode(
                                         packed=packed.detach().cpu(),
                                         serial=torch.cat([prefix, *branch], dim=1).detach().cpu(),
                                         positions=pos.cpu(),
-                                        mask=mask.cpu(),
+                                        mask=mask.visibility.cpu(),
                                         position=position,
                                         next_position=next_position,
                                         packed_index=prefix.shape[1] + i,
                                         rank_path=list(path),
+                                        serial_indices=list(range(prefix.shape[1]))
+                                        + [prefix.shape[1] + active.index(path[:d]) for d in range(1, len(path) + 1)],
                                         tree_logits=left.detach().cpu(),
                                         serial_logits=right.detach().cpu(),
                                     ),
@@ -452,7 +517,7 @@ def decode(
         estimated_matmul_flops=matmul_flops(predictor, work, attention_pairs, head_rows, projection_rows),
         audit_max_logit_error=torch.stack(audit_errors).max().cpu().tolist() if audit_errors else None,
         timings=timer.resolve(),
-        attention_backend="explicit_fp32_matmul_softmax",
+        attention_backend=ATTENTION_BACKEND,
         graph="eager",
         host_sync="one_count_transfer_per_tree_round",
     )
