@@ -16,6 +16,106 @@ from contextlib import contextmanager
 from functools import lru_cache
 
 import torch
+import torch.nn.functional as F
+
+
+class NodeAuditError(AssertionError):
+    """Preserve the failing node instead of losing it in a generic assertion."""
+
+    def __init__(self, message, payload):
+        super().__init__(message)
+        self.payload = payload
+
+
+def _cpu_double_forward(model, inputs, positions, mask):
+    """Independent diagnostic evaluator; never used to accept codes or time NPU.
+
+    Avoid platform-dispatched ops so this also runs on CPU inside an Ascend
+    process. Float64 tests the tree topology without low-precision kernels.
+    """
+    x = inputs.cpu().double()
+
+    def norm(value, module):
+        return (
+            value
+            * torch.rsqrt(value.square().mean(-1, keepdim=True) + module.variance_epsilon)
+            * module.weight.cpu().double()
+        )
+
+    def linear(value, module):
+        bias = module.bias.cpu().double() if module.bias is not None else None
+        return F.linear(value, module.weight.cpu().double(), bias)
+
+    cos = model.rotary_emb.cos_cached.cpu()[positions.cpu()].double().unsqueeze(1)
+    sin = model.rotary_emb.sin_cached.cpu()[positions.cpu()].double().unsqueeze(1)
+
+    def rotate(value):
+        half = value.shape[-1] // 2
+        return torch.cat((-value[..., half:], value[..., :half]), dim=-1)
+
+    for layer in model.layers:
+        residual = x
+        attn = layer.self_attn
+        qkv = linear(norm(x, layer.input_layernorm), attn.qkv_proj)
+        q, k, v = qkv.split((attn._q_size, attn._kv_size, attn._kv_size), dim=-1)
+        b, n, _ = x.shape
+        q = norm(q.reshape(b, n, attn.num_heads, attn.head_dim), attn.q_norm).transpose(1, 2)
+        k = norm(k.reshape(b, n, attn.num_kv_heads, attn.head_dim), attn.k_norm).transpose(1, 2)
+        v = v.reshape(b, n, attn.num_kv_heads, attn.head_dim).transpose(1, 2)
+        q, k = q * cos + rotate(q) * sin, k * cos + rotate(k) * sin
+        k = k.repeat_interleave(attn.num_queries_per_kv, dim=1)
+        v = v.repeat_interleave(attn.num_queries_per_kv, dim=1)
+        scores = (q @ k.transpose(-1, -2)) * attn.scaling
+        output = scores.masked_fill(~mask.cpu(), float("-inf")).softmax(-1) @ v
+        x = residual + linear(output.transpose(1, 2).reshape(b, n, -1), attn.o_proj)
+        residual = x
+        gate, up = linear(norm(x, layer.post_attention_layernorm), layer.mlp.gate_up_proj).chunk(2, dim=-1)
+        x = residual + linear(F.silu(gate) * up, layer.mlp.down_proj)
+    return norm(x, model.norm)
+
+
+@torch.inference_mode()
+def diagnose_node(predictor, payload):
+    """Compare compact vs equal-size serial layouts and CPU float64 topology."""
+    device = next(predictor.model.parameters()).device
+    packed = payload["packed"].to(device)
+    serial = payload["serial"].to(device)
+    n, length = packed.shape[1], serial.shape[1]
+    padded = torch.zeros_like(packed)
+    padded[:, :length] = serial
+    positions = torch.zeros(1, n, dtype=torch.long, device=device)
+    positions[:, :length] = torch.arange(length, device=device)
+    mask = torch.eye(n, dtype=torch.bool, device=device)
+    mask[:length, :length] = torch.ones(length, length, dtype=torch.bool, device=device).tril()
+    head = predictor.lm_head[payload["next_position"] - 1]
+    padded_logits = head(predictor.model(padded, positions, mask)[:, length - 1]).cpu()
+    tree64 = _cpu_double_forward(predictor.model, packed, payload["positions"], payload["mask"])
+    serial_pos, serial_mask = layout(length, [], "cpu")
+    serial64 = _cpu_double_forward(predictor.model, serial, serial_pos, serial_mask)
+    left64 = F.linear(tree64[:, payload["packed_index"]], head.weight.cpu().double())
+    right64 = F.linear(serial64[:, -1], head.weight.cpu().double())
+
+    def difference(left, right):
+        delta = (left.double() - right.double()).abs()
+        return dict(
+            max_abs=float(delta.max()),
+            mean_abs=float(delta.mean()),
+            argmax_left=left.argmax(-1).tolist(),
+            argmax_right=right.argmax(-1).tolist(),
+        )
+
+    return dict(
+        position=payload["position"],
+        rank_path=payload["rank_path"],
+        next_position=payload["next_position"],
+        packed_length=n,
+        serial_length=length,
+        dtype=str(packed.dtype),
+        original=difference(payload["tree_logits"], payload["serial_logits"]),
+        same_shape_serial=difference(payload["tree_logits"], padded_logits),
+        cpu_float64=difference(left64, right64),
+        note="Diagnostics only. Original tolerance and exact-code gates remain unchanged.",
+    )
 
 
 def validate_tree(paths):
@@ -259,7 +359,24 @@ def decode(
                             head = predictor.lm_head[next_position - 1]
                             left, right = head(hidden[:, prefix.shape[1] + i]), head(serial)
                             tolerance = 1e-5 if left.dtype == torch.float32 else 2e-2
-                            torch.testing.assert_close(left, right, atol=tolerance, rtol=tolerance)
+                            try:
+                                torch.testing.assert_close(left, right, atol=tolerance, rtol=tolerance)
+                            except AssertionError as exc:
+                                raise NodeAuditError(
+                                    str(exc),
+                                    dict(
+                                        packed=packed.detach().cpu(),
+                                        serial=torch.cat([prefix, *branch], dim=1).detach().cpu(),
+                                        positions=pos.cpu(),
+                                        mask=mask.cpu(),
+                                        position=position,
+                                        next_position=next_position,
+                                        packed_index=prefix.shape[1] + i,
+                                        rank_path=list(path),
+                                        tree_logits=left.detach().cpu(),
+                                        serial_logits=right.detach().cpu(),
+                                    ),
+                                ) from exc
                             audit_errors.append((left - right).abs().max().detach())
                 # Row zero is the real prefix. Each other row predicts after
                 # a complete candidate path, using its real codebook head.

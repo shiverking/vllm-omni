@@ -221,6 +221,29 @@ def test_fit_uses_complete_path_frequency(research):
 
 
 @torch.inference_mode()
+def test_node_failure_preserves_inputs_and_diagnoses_topology(research, monkeypatch):
+    model, spec, inputs = research
+
+    def fail(*args, **kwargs):
+        raise AssertionError("simulated device logit mismatch")
+
+    monkeypatch.setattr(torch.testing, "assert_close", fail)
+    with pytest.raises(spec.NodeAuditError, match="simulated") as error:
+        spec.decode(model, **inputs, paths=[(0,), (1,), (0, 0)], audit=True)
+    payload = error.value.payload
+    assert payload["position"] == 1
+    assert payload["rank_path"] == [0]
+    assert payload["packed"].device.type == "cpu"
+    result = spec.diagnose_node(model, payload)
+    assert result["cpu_float64"]["max_abs"] < 1e-10
+    assert result["same_shape_serial"]["max_abs"] < 1e-5
+    # A deliberately invalid visibility mask must not pass the FP64 diagnosis.
+    corrupted = dict(payload, mask=torch.ones_like(payload["mask"]))
+    result = spec.diagnose_node(model, corrupted)
+    assert result["cpu_float64"]["max_abs"] > 1e-5
+
+
+@torch.inference_mode()
 def test_projection_and_input_dtype(research):
     model, spec, inputs = research
     model.talker_config.hidden_size = 48

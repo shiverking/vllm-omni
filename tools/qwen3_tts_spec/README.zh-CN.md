@@ -107,6 +107,12 @@ python tools/qwen3_tts_spec/experiment.py report \
 
 logits 对照容差为：FP32 下 `atol=rtol=1e-5`，低精度下为 `2e-2`。**不论 logits 容差如何，两种采样模式的 codes 都必须完全一致**。发现差异会保存诊断信息并停止性能测试，不能通过放宽 codes 要求来忽略数值问题。
 
+节点 logits 检查失败时，工具额外保存 `node_audit_failure.pt`，并在
+`correctness.json` 的 `node_diagnostics` 中记录失败位置、排名路径、dtype、
+原始误差、相同打包长度下的串行误差，以及独立 CPU FP64 树／串行对照误差。
+这些诊断用于区分计算形状相关的数值差异和树结构问题，不会替代原始验收结果。
+如果诊断本身失败，`diagnostic_error` 会记录原因，原始失败信息仍然保留。
+
 正确性通过后，性能测量按以下规则执行：
 
 1. 每种配置预热 20 帧。

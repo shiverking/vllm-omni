@@ -386,15 +386,29 @@ def replay(args):
                 try:
                     _, audit = spec.decode(model, **inputs, paths=paths, audit=True)
                 except AssertionError as exc:
+                    failure = dict(
+                        passed=False,
+                        node_logit_failure=str(exc),
+                        request_id=frame["request_id"],
+                        frame_id=frame["frame_id"],
+                        config=name,
+                        greedy=greedy,
+                        prior_code_mismatches=mismatches,
+                        tree_sha256=signature,
+                    )
+                    if isinstance(exc, spec.NodeAuditError):
+                        artifact = args.output / "node_audit_failure.pt"
+                        torch.save(exc.payload, artifact)
+                        failure["node_artifact"] = artifact.name
+                        # Persist the original failure even if diagnosis itself fails.
+                        write_json(args.output / "correctness.json", failure)
+                        try:
+                            failure["node_diagnostics"] = spec.diagnose_node(model, exc.payload)
+                        except Exception as diagnostic_error:
+                            failure["diagnostic_error"] = repr(diagnostic_error)
                     write_json(
                         args.output / "correctness.json",
-                        dict(
-                            passed=False,
-                            node_logit_failure=str(exc),
-                            request_id=frame["request_id"],
-                            frame_id=frame["frame_id"],
-                            config=name,
-                        ),
+                        failure,
                     )
                     raise
                 codes, info = spec.decode(model, **inputs, paths=paths, detailed=True, profile=True)

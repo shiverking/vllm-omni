@@ -107,6 +107,13 @@ against serial evaluation of the same prefix. Logit audit tolerance is
 in both modes regardless of tolerance. Any mismatch stops performance work and
 records diagnostics. Do not relax the code gate to hide a numerical difference.
 
+Node audit failures also save `node_audit_failure.pt`. The `node_diagnostics`
+field in `correctness.json` compares the original logits, a serial prefix padded
+to the same packed length, and an independent CPU float64 tree/serial evaluator.
+These diagnostics help distinguish shape-dependent numerics from topology
+errors; they never replace the original acceptance gate. A `diagnostic_error`
+field preserves secondary diagnostic failures without losing the original error.
+
 Performance then runs without detailed events/phase timers: twenty warmup
 frames per configuration, four ABBA rounds of at least 200 frames each. Small
 datasets repeat with distinct execution IDs and an explicit unique-frame count.
