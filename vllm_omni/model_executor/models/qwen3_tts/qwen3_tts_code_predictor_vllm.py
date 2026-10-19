@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import inspect
+import os
 from collections.abc import Iterable
 
 import torch
@@ -48,6 +50,20 @@ class Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM(CodePredictorWrapp
         # Store talker_config for backward compat (accessed by some callers)
         self.talker_config = talker_config
         self._vllm_config = vllm_config
+        self.research = None
+        if os.environ.get("VLLM_OMNI_TTS_SPEC_CONFIG"):
+            from vllm_omni.model_executor.models.common.qwen3_code_predictor_research import ResearchSession
+
+            self.research = ResearchSession(os.environ["VLLM_OMNI_TTS_SPEC_CONFIG"])
+
+    def forward(self, *args, **kwargs):
+        if getattr(self, "research", None) is None:
+            return super().forward(*args, **kwargs)
+        bound = inspect.signature(super().forward).bind(*args, **kwargs)
+        bound.apply_defaults()
+        values = dict(bound.arguments)
+        inputs = [values.pop(key) for key in ("layer0_code", "layer0_embed", "last_talker_hidden")]
+        return self.research.forward(self, super().forward, *inputs, values)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Load weights with vllm config context (required for VocabParallelEmbedding)."""

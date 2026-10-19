@@ -472,6 +472,9 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
                 talker_config=self.talker_config,
                 prefix="code_predictor",
             )
+        if self.code_predictor.research is not None:
+            # Variable-length tree traversal and collection are eager only.
+            self.talker_mtp_graph_safe = False
 
         # Constant logit mask: allow only codec ids [1, codebook_vocab_size) plus codec EOS.
         # Register the *disallowed* form so compute_logits doesn't recompute ~mask per step.

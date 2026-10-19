@@ -279,6 +279,7 @@ class CodePredictorAttention(nn.Module):
         self,
         hidden_states: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        attention_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         bsz, seq_len, _ = hidden_states.shape
         hidden_shape_q = (bsz, seq_len, self.num_heads, self.head_dim)
@@ -300,10 +301,20 @@ class CodePredictorAttention(nn.Module):
         if current_omni_platform.is_npu():
             q = torch_npu.npu_rotary_mul(q, cos, sin)
             k = torch_npu.npu_rotary_mul(k, cos, sin)
-            attn_out = self._forward_npu_attention(q, k, v, bsz, seq_len)
         else:
             q = (q * cos) + (_rotate_half(q) * sin)
             k = (k * cos) + (_rotate_half(k) * sin)
+        if attention_mask is not None:
+            # Research reference backend: True means visible. In particular,
+            # a packed tree must never use the NPU compressed causal mask.
+            k = k.repeat_interleave(self.num_queries_per_kv, dim=1)
+            v = v.repeat_interleave(self.num_queries_per_kv, dim=1)
+            scores = (q.float() @ k.float().transpose(-1, -2)) * self.scaling
+            scores = scores.masked_fill(~attention_mask, float("-inf"))
+            attn_out = (scores.softmax(dim=-1) @ v.float()).to(q.dtype)
+        elif current_omni_platform.is_npu():
+            attn_out = self._forward_npu_attention(q, k, v, bsz, seq_len)
+        else:
             attn_out = F.scaled_dot_product_attention(
                 q,
                 k,
@@ -364,10 +375,14 @@ class CodePredictorDecoderLayer(nn.Module):
         self,
         hidden_states: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        attention_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
-        hidden_states = self.self_attn(hidden_states, position_embeddings)
+        if attention_mask is None:
+            hidden_states = self.self_attn(hidden_states, position_embeddings)
+        else:
+            hidden_states = self.self_attn(hidden_states, position_embeddings, attention_mask)
         if current_omni_platform.is_npu():
             hidden_states, _, residual = torch_npu.npu_add_rms_norm(
                 hidden_states,
@@ -432,6 +447,7 @@ class CodePredictorBaseModel(nn.Module):
         self,
         inputs_embeds: torch.Tensor,
         position_ids: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         # Run the transformer body in float32 when the model is in fp16.
         # fp16 lacks the dynamic range for stable attention scores and
@@ -450,7 +466,10 @@ class CodePredictorBaseModel(nn.Module):
         with torch.amp.autocast(inputs_embeds.device.type, enabled=use_fp32, dtype=torch.float32):
             position_embeddings = self.rotary_emb(hidden_states, position_ids)
             for layer in self.layers:
-                hidden_states = layer(hidden_states, position_embeddings)
+                if attention_mask is None:
+                    hidden_states = layer(hidden_states, position_embeddings)
+                else:
+                    hidden_states = layer(hidden_states, position_embeddings, attention_mask)
             hidden_states = self.norm(hidden_states)
         return hidden_states.to(input_dtype)
 
