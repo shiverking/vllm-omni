@@ -137,7 +137,18 @@ def diagnose(args):
 
             return record
 
+        def input_hook(name):
+            def record(module, inputs):
+                # o_proj's input is the reshaped fusion-attention result.
+                # Observe it before GEMM so an output mismatch cannot be
+                # incorrectly attributed to the projection itself.
+                trace[name + ".input"] = inputs[0].index_select(1, branch_idx).detach().cpu()
+
+            return record
+
         for name, module in model.model.named_modules():
+            if name.endswith("self_attn.o_proj"):
+                handles.append(module.register_forward_pre_hook(input_hook(name)))
             handles.append(module.register_forward_hook(hook(name)))
         try:
             hidden = model.model(values, pos, visibility)
