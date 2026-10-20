@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import dataclasses
 from collections.abc import Iterable, Sequence
+from contextlib import nullcontext
 
 import torch
 import torch.nn as nn
@@ -285,7 +286,7 @@ class CodePredictorAttention(nn.Module):
             sync=True,
         )[0]
 
-    def _forward_npu_ancestor_attention(self, q, k, v, mask):
+    def _forward_npu_ancestor_attention(self, q, k, v, mask, timer=None):
         """Batch queries with contiguous ancestor KV, using cached indices."""
         bsz, heads, seq_len, dim = q.shape
         width = mask.ancestor_indices.shape[1]
@@ -301,12 +302,15 @@ class CodePredictorAttention(nn.Module):
                 .contiguous()
             )
 
-        blocked = (~mask.ancestor_valid)[None].expand(bsz, -1, -1)
-        blocked = blocked.reshape(bsz * seq_len, 1, 1, width).contiguous()
+        with timer.phase("attention_gather_nested") if timer is not None else nullcontext():
+            blocked = (~mask.ancestor_valid)[None].expand(bsz, -1, -1)
+            blocked = blocked.reshape(bsz * seq_len, 1, 1, width).contiguous()
+            query = q.transpose(1, 2).reshape(bsz * seq_len, heads, 1, dim).contiguous()
+            keys, values = gather(k), gather(v)
         result = torch_npu.npu_fusion_attention(
-            q.transpose(1, 2).reshape(bsz * seq_len, heads, 1, dim).contiguous(),
-            gather(k),
-            gather(v),
+            query,
+            keys,
+            values,
             heads,
             "BNSD",
             pse=None,
@@ -331,6 +335,7 @@ class CodePredictorAttention(nn.Module):
         hidden_states: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
         attention_mask: torch.Tensor | CanonicalAttentionMask | None = None,
+        kv_context=None,
     ) -> torch.Tensor:
         bsz, seq_len, _ = hidden_states.shape
         hidden_shape_q = (bsz, seq_len, self.num_heads, self.head_dim)
@@ -355,8 +360,10 @@ class CodePredictorAttention(nn.Module):
         else:
             q = (q * cos) + (_rotate_half(q) * sin)
             k = (k * cos) + (_rotate_half(k) * sin)
+        if kv_context is not None:
+            k, v = kv_context.stage(k, v)
         if isinstance(attention_mask, CanonicalAttentionMask) and current_omni_platform.is_npu():
-            attn_out = self._forward_npu_ancestor_attention(q, k, v, attention_mask)
+            attn_out = self._forward_npu_ancestor_attention(q, k, v, attention_mask, getattr(kv_context, "timer", None))
         elif isinstance(attention_mask, CanonicalAttentionMask):
             # The same logical prefix must have the same reduction order and
             # width, regardless of where its ancestors sit in the packed tree.
@@ -447,10 +454,13 @@ class CodePredictorDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
         attention_mask: torch.Tensor | CanonicalAttentionMask | None = None,
+        kv_context=None,
     ) -> torch.Tensor:
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
-        if attention_mask is None:
+        if kv_context is not None:
+            hidden_states = self.self_attn(hidden_states, position_embeddings, attention_mask, kv_context)
+        elif attention_mask is None:
             hidden_states = self.self_attn(hidden_states, position_embeddings)
         else:
             hidden_states = self.self_attn(hidden_states, position_embeddings, attention_mask)
@@ -519,6 +529,7 @@ class CodePredictorBaseModel(nn.Module):
         inputs_embeds: torch.Tensor,
         position_ids: torch.Tensor,
         attention_mask: torch.Tensor | CanonicalAttentionMask | None = None,
+        kv_contexts=None,
     ) -> torch.Tensor:
         # Run the transformer body in float32 when the model is in fp16.
         # fp16 lacks the dynamic range for stable attention scores and
@@ -536,8 +547,10 @@ class CodePredictorBaseModel(nn.Module):
         hidden_states = inputs_embeds
         with torch.amp.autocast(inputs_embeds.device.type, enabled=use_fp32, dtype=torch.float32):
             position_embeddings = self.rotary_emb(hidden_states, position_ids)
-            for layer in self.layers:
-                if attention_mask is None:
+            for index, layer in enumerate(self.layers):
+                if kv_contexts is not None:
+                    hidden_states = layer(hidden_states, position_embeddings, attention_mask, kv_contexts[index])
+                elif attention_mask is None:
                     hidden_states = layer(hidden_states, position_embeddings)
                 else:
                     hidden_states = layer(hidden_states, position_embeddings, attention_mask)

@@ -16,6 +16,11 @@ class ResearchSession:
     def __init__(self, filename):
         self.config = json.loads(Path(filename).read_text(encoding="utf-8"))
         self.mode = self.config["mode"]
+        self.engine = self.config.get("engine", "current")
+        if self.engine not in ("current", "pipeline_eager", "pipeline_graph"):
+            raise ValueError("unknown research execution engine")
+        if self.engine != "current" and self.mode != "tree":
+            raise ValueError("pipeline research requires a frozen tree")
         if self.mode not in ("collect", "tree", "reference"):
             raise ValueError("research mode must be collect, tree or reference")
         self.paths = validate_tree(self.config.get("paths", []))
@@ -29,6 +34,35 @@ class ResearchSession:
                 raise ValueError("frozen tree signature changed")
             if self.paths not in [validate_tree(p) for p in frozen["configs"].values()]:
                 raise ValueError("live tree is not one of the calibrated frozen trees")
+            if self.engine != "current":
+                from .qwen3_code_predictor_pipeline import CANDIDATE_LAYOUT
+
+                if frozen.get("candidate_layout") != CANDIDATE_LAYOUT:
+                    raise ValueError("pipeline requires known-tail/next-three calibration")
+                certificate_path = self.config.get("correctness")
+                if not certificate_path:
+                    raise ValueError("pipeline full requests require a sampled correctness certificate")
+                certificate = json.loads(Path(certificate_path).read_text(encoding="utf-8"))
+                binding = certificate.get("binding", {})
+                names = [name for name, paths in frozen["configs"].items() if validate_tree(paths) == self.paths]
+                if (
+                    not certificate.get("passed")
+                    or certificate.get("stage") != "complete"
+                    or binding.get("tree_sha256") != signature
+                    or binding.get("source") != frozen["source"]
+                    or not any(f"{name}/{self.engine}" in certificate.get("engines", []) for name in names)
+                ):
+                    raise ValueError("pipeline correctness certificate does not match the frozen tree/engine")
+                root = Path(__file__).resolve().parents[4]
+                for relative, checksum in binding.get("code", {}).items():
+                    if hashlib.sha256((root / relative).read_bytes()).hexdigest() != checksum:
+                        raise ValueError("pipeline code changed since correctness check")
+                self.verified_sampling_modes = certificate["binding"]["sampling"]
+                self.verified_sampling_parameters = certificate["binding"]["sampling_parameters"]
+                self.verified_predictor = certificate["predictor"]
+                self.pipeline_executors = {}
+            elif frozen.get("candidate_layout"):
+                raise ValueError("current engine cannot consume pipeline candidate layout")
         self.frame = 0
         self.request = None
         self.exported = False
@@ -54,6 +88,36 @@ class ResearchSession:
                     device=layer0_code.device,
                     generator=generator,
                 )
+            if self.engine != "current":
+                from .qwen3_code_predictor_pipeline import PipelineExecutor
+
+                sample = kwargs.get("do_sample", True)
+                mode = "sampling" if sample else "greedy"
+                if mode not in self.verified_sampling_modes:
+                    raise ValueError("requested sampling mode was not checked")
+                key = (sample, kwargs.get("temperature", 0.9), kwargs.get("top_k", 50))
+                parameters = json.dumps(
+                    dict(do_sample=sample, temperature=key[1], top_k=key[2], top_p=kwargs.get("top_p", 1.0)),
+                    sort_keys=True,
+                )
+                shape = dict(
+                    groups=predictor._num_groups,
+                    hidden_size=predictor.config.hidden_size,
+                    vocab_size=predictor.config.vocab_size,
+                    dtype=str(next(predictor.parameters()).dtype),
+                )
+                if parameters not in self.verified_sampling_parameters or shape != self.verified_predictor:
+                    raise ValueError("pipeline sampling parameters or predictor shape/dtype were not checked")
+                if key not in self.pipeline_executors:
+                    self.pipeline_executors[key] = PipelineExecutor(
+                        predictor,
+                        self.paths,
+                        execution="graph" if self.engine == "pipeline_graph" else "eager",
+                        do_sample=key[0],
+                        temperature=key[1],
+                        top_k=key[2],
+                    )
+                return self.pipeline_executors[key].decode(**inputs, **kwargs)[0]
             return decode(predictor, **inputs, **kwargs, paths=self.paths)[0]
         # Collection is explicitly not a performance run. Control is read once
         # per frame; tensors are saved once per complete frame, never per token.
