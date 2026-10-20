@@ -20,6 +20,26 @@ from tests.model_executor.models.qwen3_tts.test_code_predictor_dtype import (
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
+def test_fusion_diagnostic_padding_keeps_rope_positions_in_bounds(monkeypatch):
+    root = Path(__file__).resolve().parents[4]
+    monkeypatch.syspath_prepend(str(root / "tools/qwen3_tts_spec"))
+    module_spec = importlib.util.spec_from_file_location(
+        "fusion_diagnostic_test", root / "tools/qwen3_tts_spec/diagnose_fusion.py"
+    )
+    diagnostic = importlib.util.module_from_spec(module_spec)
+    module_spec.loader.exec_module(diagnostic)
+    positions = diagnostic.padded_position_ids(13, 43, "cpu")
+    assert torch.equal(positions[:, :13], torch.arange(13)[None])
+    assert torch.count_nonzero(positions[:, 13:]) == 0
+    # Reproduce the 17-entry RoPE cache lookup which previously failed at 17.
+    cache = torch.randn(17, 8)
+    embedded = cache[positions]
+    assert embedded.shape == (1, 43, 8)
+    assert torch.equal(embedded[:, :13], cache[:13][None])
+    with pytest.raises(ValueError):
+        diagnostic.padded_position_ids(14, 13, "cpu")
+
+
 def test_replay_progress_throttles_and_resets_stage_eta(tmp_path, monkeypatch, capsys):
     root = Path(__file__).resolve().parents[4]
     module_spec = importlib.util.spec_from_file_location(

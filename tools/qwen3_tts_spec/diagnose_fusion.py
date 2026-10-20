@@ -65,6 +65,15 @@ def difference(left, right):
     return dict(exact_equal=torch.equal(left, right), max_abs=float(delta.max()), mean_abs=float(delta.mean()))
 
 
+def padded_position_ids(length, total, device):
+    """Padding is physical storage, not additional logical RoPE positions."""
+    if not 0 < length <= total:
+        raise ValueError("expected 0 < logical length <= padded length")
+    positions = torch.zeros((1, total), dtype=torch.long, device=device)
+    positions[:, :length] = torch.arange(length, device=device)
+    return positions
+
+
 @torch.inference_mode()
 def diagnose(args):
     import torch_npu  # noqa: F401
@@ -100,7 +109,7 @@ def diagnose(args):
             padded_mask[:length, :length],
             list(range(length)),
         ),
-        "serial_padded": (padded, torch.arange(n, device=args.device)[None], padded_mask, list(range(length))),
+        "serial_padded": (padded, padded_position_ids(length, n, args.device), padded_mask, list(range(length))),
         "tree": (packed, positions, mask, indices),
         "tree_compact": (
             packed.index_select(1, permutation),
@@ -110,6 +119,12 @@ def diagnose(args):
         ),
     }
     traces, logits = {}, {}
+    # Fail on the host before any forward can launch an invalid RoPE lookup.
+    rope_size = model.model.rotary_emb.cos_cached.shape[0]
+    for label, (_, pos, _, _) in cases.items():
+        cpu_positions = pos.cpu()
+        if int(cpu_positions.min()) < 0 or int(cpu_positions.max()) >= rope_size:
+            raise ValueError(f"{label}: logical positions exceed RoPE cache size {rope_size}")
     for label, (values, pos, visibility, branch) in cases.items():
         print(f"Forward: {label}, length={values.shape[1]}", flush=True)
         trace, handles = {}, []
