@@ -11,7 +11,32 @@ import experiment as exp
 import torch
 
 
-def install_probe(model):
+def compact_ancestor_qkv(q, k, v, visible, width):
+    """Diagnostic-only gather: one batch element per query, fixed KV width."""
+    batch, heads, seq, dim = q.shape
+    indices, valid = [], []
+    for row in visible.cpu().tolist():
+        ancestors = [i for i, allowed in enumerate(row) if allowed]
+        if not 0 < len(ancestors) <= width:
+            raise ValueError("ancestor count outside fixed KV width")
+        indices.append(ancestors + [0] * (width - len(ancestors)))
+        valid.append([True] * len(ancestors) + [False] * (width - len(ancestors)))
+    index = torch.tensor(indices, device=q.device).reshape(-1)
+
+    def gather(value):
+        return (
+            value.index_select(2, index)
+            .reshape(batch, heads, seq, width, dim)
+            .permute(0, 2, 1, 3, 4)
+            .reshape(batch * seq, heads, width, dim)
+        )
+
+    visibility = torch.tensor(valid, dtype=torch.bool, device=q.device)
+    visibility = visibility[None].expand(batch, -1, -1).reshape(batch * seq, 1, 1, width)
+    return q.transpose(1, 2).reshape(batch * seq, heads, 1, dim), gather(k), gather(v), visibility
+
+
+def install_probe(model, compact_kv=False):
     """Process-local explicit-mask backend; never changes stock attention."""
     import torch_npu
 
@@ -34,6 +59,8 @@ def install_probe(model):
             k = k.repeat_interleave(self.num_queries_per_kv, dim=1)
             v = v.repeat_interleave(self.num_queries_per_kv, dim=1)
             visible = getattr(attention_mask, "visibility", attention_mask)
+            if compact_kv:
+                q, k, v, visible = compact_ancestor_qkv(q, k, v, visible, model._num_groups + 1)
             attention = torch_npu.npu_fusion_attention(
                 q.contiguous(),
                 k.contiguous(),
@@ -55,7 +82,11 @@ def install_probe(model):
                 gen_mask_parallel=True,
                 sync=True,
             )[0]
-            return self.o_proj(attention.transpose(1, 2).reshape(batch, seq, -1))
+            if compact_kv:
+                attention = attention.reshape(batch, seq, self.num_heads * self.head_dim)
+            else:
+                attention = attention.transpose(1, 2).reshape(batch, seq, -1)
+            return self.o_proj(attention)
 
         module.forward = MethodType(forward, module)
 
@@ -81,7 +112,7 @@ def diagnose(args):
     payload = torch.load(args.output / "fusion_model_probe_node_failure.pt", map_location="cpu", weights_only=True)
     print("Loading predictor for four single-node forwards...", flush=True)
     model = exp.load_predictor(args)
-    install_probe(model)
+    install_probe(model, args.compact_kv)
     packed = payload["packed"].to(args.device)
     serial = payload["serial"].to(args.device)
     positions = payload["positions"].to(args.device)
@@ -198,14 +229,17 @@ def diagnose(args):
         "tree": difference(logits["tree"], payload["tree_logits"]),
         "serial": difference(logits["serial"], payload["serial_logits"]),
     }
-    exp.write_json(args.output / "fusion_layout_diagnostic.json", report)
-    torch.save(dict(traces=traces, logits=logits), args.output / "fusion_layout_diagnostic.pt")
+    report["compact_kv"] = args.compact_kv
+    stem = "fusion_compact_kv_diagnostic" if args.compact_kv else "fusion_layout_diagnostic"
+    exp.write_json(args.output / f"{stem}.json", report)
+    torch.save(dict(traces=traces, logits=logits), args.output / f"{stem}.pt")
     print(json.dumps(report["saved_failure_reproduction"]), flush=True)
-    print("Saved fusion_layout_diagnostic.json and .pt. Diagnostic only; no acceptance gates changed.", flush=True)
+    print(f"Saved {stem}.json and .pt. Diagnostic only; no acceptance gates changed.", flush=True)
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(__doc__)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--device", default="npu:0")
+    parser.add_argument("--compact-kv", action="store_true", help="probe batched queries with contiguous ancestor KV")
     diagnose(parser.parse_args())

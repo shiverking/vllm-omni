@@ -38,6 +38,20 @@ def test_fusion_diagnostic_padding_keeps_rope_positions_in_bounds(monkeypatch):
     assert torch.equal(embedded[:, :13], cache[:13][None])
     with pytest.raises(ValueError):
         diagnostic.padded_position_ids(14, 13, "cpu")
+    q = torch.randn(2, 3, 4, 8)
+    k, v = torch.randn_like(q), torch.randn_like(q)
+    visible = torch.tensor([[1, 0, 0, 0], [1, 1, 0, 0], [1, 0, 1, 0], [1, 1, 0, 1]], dtype=torch.bool)
+    cq, ck, cv, mask = diagnostic.compact_ancestor_qkv(q, k, v, visible, 5)
+    assert cq.shape == (8, 3, 1, 8)
+    assert ck.shape == cv.shape == (8, 3, 5, 8)
+    for batch in range(2):
+        for node in range(4):
+            row = batch * 4 + node
+            ancestors = visible[node].nonzero().flatten()
+            assert torch.equal(cq[row, :, 0], q[batch, :, node])
+            assert torch.equal(ck[row, :, : len(ancestors)], k[batch].index_select(1, ancestors))
+            assert torch.equal(cv[row, :, : len(ancestors)], v[batch].index_select(1, ancestors))
+            assert int(mask[row].sum()) == len(ancestors)
 
 
 def test_replay_progress_throttles_and_resets_stage_eta(tmp_path, monkeypatch, capsys):
