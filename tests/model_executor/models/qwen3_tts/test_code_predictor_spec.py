@@ -488,6 +488,33 @@ def test_research_artifact_pipeline(research, tmp_path, monkeypatch):
     assert (tmp_path / "correctness.json").read_bytes() == saved_correctness
     with pytest.raises(FileExistsError):
         quick.run(quick_args)
+    quick_args.results = tmp_path / "functional"
+    quick_args.functional_only = True
+    with monkeypatch.context() as guarded:
+
+        def forbid_timing(*a, **kw):
+            raise AssertionError("functional-only mode must not enter performance timing")
+
+        guarded.setattr(cli, "measured", forbid_timing)
+        quick.run(quick_args)
+    functional = json.loads((quick_args.results / "summary.json").read_text(encoding="utf-8"))
+    assert functional["performance_evaluated"] is False
+    assert functional["checks"] == 20 * 2 * 5
+    assert len(functional["groups"]) == 10
+    assert not (quick_args.results / "timings.jsonl").exists()
+    events = cli.read_rows(quick_args.results / "events.jsonl")
+    for event in events:
+        assert len(event["committed_codes"]) == event["committed"]
+        assert event["accepted_codes"] == event["committed_codes"][: event["accepted"]]
+        assert event["extra_target_count"] in (0, 1)
+    counts = quick.summarize_events(
+        [dict(config="tree16", greedy=True, accepted=a, committed=c) for a, c in [(0, 1), (1, 2), (2, 3), (2, 2)]]
+    )["tree16/greedy"]
+    assert counts["accepted_length_histogram"] == {0: 1, 1: 1, 2: 2}
+    assert counts["committed_length_histogram"] == {1: 1, 2: 2, 3: 1}
+    assert counts["accepted_ge2_fraction"] == 0.5
+    assert counts["committed_ge2_fraction"] == 0.75
+    quick_args.functional_only = False
 
     def mismatch(*a, **kw):
         codes, info = no_audit(*a, **kw)

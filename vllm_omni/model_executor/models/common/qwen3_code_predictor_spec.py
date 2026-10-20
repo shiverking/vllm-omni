@@ -350,6 +350,7 @@ def decode(
     top_k=50,
     top_p=1.0,
     detailed=False,
+    record_events=False,
     profile=False,
     audit=False,
     **unused,
@@ -495,7 +496,7 @@ def decode(
                     embed = predictor.model.codec_embedding[position + d - 1](committed[:, d : d + 1])
                     prefix = torch.cat((prefix, predictor.small_to_mtp_projection(embed)), dim=1)
             position += count
-        if detailed:
+        if detailed or record_events:
             events.append(
                 dict(
                     position=start_position,
@@ -514,7 +515,18 @@ def decode(
                     ),
                 )
             )
-    return torch.cat(codes, dim=1), dict(
+    output_codes = torch.cat(codes, dim=1)
+    if record_events:
+        # One frame-level transfer for examples; no per-token logging/sync and
+        # no hidden-state retention needed by the functional-only probe.
+        frame_codes = output_codes.cpu().tolist()[0]
+        for event in events:
+            start, count = event["position"], event["committed"]
+            committed_codes = frame_codes[start : start + count]
+            event["committed_codes"] = committed_codes
+            event["accepted_codes"] = committed_codes[: event["accepted"]]
+            event["extra_target_count"] = count - event["accepted"]
+    return output_codes, dict(
         events=events,
         states=calibration,
         backbone_calls=calls,
@@ -523,7 +535,7 @@ def decode(
         estimated_matmul_flops=matmul_flops(predictor, work, attention_pairs, head_rows, projection_rows),
         audit_max_logit_error=torch.stack(audit_errors).max().cpu().tolist() if audit_errors else None,
         timings=timer.resolve(),
-        attention_backend=ATTENTION_BACKEND,
+        attention_backend=attention_backend(device),
         graph="eager",
         host_sync="one_count_transfer_per_tree_round",
     )

@@ -4,6 +4,7 @@
 
 import argparse
 import json
+from collections import Counter
 from pathlib import Path
 
 import experiment as exp
@@ -67,17 +68,20 @@ def run(args):
 
 
 def execute(args, progress, status):
+    functional = getattr(args, "functional_only", False)
     frozen = json.loads((args.output / "trees.json").read_text(encoding="utf-8"))
     signature = frozen.pop("sha256")
     manifest = json.loads((args.output / "manifest.json").read_text(encoding="utf-8"))
     if exp.digest(frozen) != signature or frozen["dataset_sha256"] != exp.digest(manifest["dataset"]):
         raise ValueError("frozen tree or dataset digest changed")
     configs = {"reference": [], "chain": frozen["configs"]["chain"], "tree16": frozen["configs"]["tree16"]}
+    if functional:
+        configs = {"reference": [], **frozen["configs"]}
     progress.message("Loading fixed sampled frames and predictor; using the integrated backend, no diagnostic patch.")
     selected = select_request_frames(exp.frames(args, "test"), args.frames_per_request)
     if not selected:
         raise ValueError("no sampled test frames")
-    if args.executions_per_round < len(selected):
+    if not functional and args.executions_per_round < len(selected):
         raise ValueError("executions-per-round must cover every selected frame at least once")
     model, spec = exp.load_predictor(args), exp.spec_module()
     device = torch.device(args.device)
@@ -95,13 +99,14 @@ def execute(args, progress, status):
         unique_requests=len({f["request_id"] for f in selected}),
         frames_per_request=args.frames_per_request,
         configs=configs,
-        warmup_per_config=args.warmup,
-        executions_per_round=args.executions_per_round,
+        warmup_per_config=0 if functional else args.warmup,
+        executions_per_round=0 if functional else args.executions_per_round,
+        functional_only=functional,
         sampling="greedy" if args.greedy else "shared_uniforms",
         source_manifest=manifest,
     )
     exp.write_json(args.results / "manifest.json", metadata)
-    checks = []
+    checks, events = [], []
     progress.begin("sampled code correctness (no serial node audit)", len(selected) * 2 * len(configs))
     for frame in selected:
         for greedy in (True, False):
@@ -121,7 +126,7 @@ def execute(args, progress, status):
                 exp.write_json(args.results / "correctness.json", dict(passed=False, node_audit=False, checks=checks))
                 raise RuntimeError("stock replay differs from captured codes; performance not started")
             for name, paths in configs.items():
-                codes, _ = spec.decode(model, **inputs, paths=paths)
+                codes, info = spec.decode(model, **inputs, paths=paths, record_events=functional)
                 row = dict(
                     request_id=frame["request_id"],
                     frame_id=frame["frame_id"],
@@ -130,6 +135,23 @@ def execute(args, progress, status):
                     code_equal=torch.equal(codes, stock),
                 )
                 checks.append(row)
+                if functional:
+                    frame_events = [
+                        dict(
+                            request_id=frame["request_id"],
+                            frame_id=frame["frame_id"],
+                            greedy=greedy,
+                            config=name,
+                            round=i,
+                            code_equal=row["code_equal"],
+                            **event,
+                        )
+                        for i, event in enumerate(info["events"])
+                    ]
+                    # Buffered decoder events are written only after a frame/config completes.
+                    with (args.results / "events.jsonl").open("a", encoding="utf-8") as stream:
+                        stream.write("".join(json.dumps(event) + "\n" for event in frame_events))
+                    events.extend(frame_events)
                 if not row["code_equal"]:
                     row.update(
                         positions=(codes != stock).nonzero().cpu().tolist(),
@@ -147,6 +169,10 @@ def execute(args, progress, status):
             args.results / "correctness.json", dict(passed=False, partial=True, node_audit=False, checks=checks)
         )
     exp.write_json(args.results / "correctness.json", dict(passed=True, node_audit=False, checks=checks))
+    if functional:
+        finish_functional(args, events, checks, metadata, status)
+        progress.message(f"Functional-only probe complete: {args.results / 'report.md'}; no performance runs.")
+        return
     progress.message("Sampled codes PASSED. Preparing inputs and warming all four configurations.")
     prepared = [exp.inputs_for(args, model, frame, args.greedy) for frame in selected]
 
@@ -241,6 +267,108 @@ def execute(args, progress, status):
     progress.message(f"Sampled experiment complete: {args.results / 'report.md'}")
 
 
+def summarize_events(events):
+    groups = {}
+    for name, greedy in sorted({(r["config"], r["greedy"]) for r in events}):
+        rows = [r for r in events if r["config"] == name and r["greedy"] == greedy]
+        rounds = len(rows)
+        key = f"{name}/{'greedy' if greedy else 'sampling'}"
+        accepted = Counter(r["accepted"] for r in rows)
+        committed = Counter(r["committed"] for r in rows)
+        groups[key] = dict(
+            rounds=rounds,
+            accepted_length_histogram=dict(sorted(accepted.items())),
+            committed_length_histogram=dict(sorted(committed.items())),
+            accepted_ge2_rounds=sum(r["accepted"] >= 2 for r in rows),
+            committed_ge2_rounds=sum(r["committed"] >= 2 for r in rows),
+            accepted_ge2_fraction=sum(r["accepted"] >= 2 for r in rows) / rounds,
+            committed_ge2_fraction=sum(r["committed"] >= 2 for r in rows) / rounds,
+            mean_accepted=sum(r["accepted"] for r in rows) / rounds,
+            mean_committed=sum(r["committed"] for r in rows) / rounds,
+            accepted_ge2_examples=[r for r in rows if r["accepted"] >= 2][:3],
+            committed_ge2_examples=[r for r in rows if r["committed"] >= 2][:3],
+        )
+    return groups
+
+
+def finish_functional(args, events, checks, metadata, status):
+    groups = summarize_events(events)
+    # Require actual tree progress in both sampling modes, not merely a deep
+    # candidate topology or a successful chain/reference run.
+    multi = all(
+        any(r["config"].startswith("tree") and r["greedy"] == greedy and r["committed"] >= 2 for r in events)
+        for greedy in (True, False)
+    )
+    multiple_candidates = all(
+        any(r["config"].startswith("tree") and r["greedy"] == greedy and r["accepted"] >= 2 for r in events)
+        for greedy in (True, False)
+    )
+    verdict = "抽样功能验证通过" if multi else "抽样输出一致性通过，但未在两种模式均观察到树验证多 token 推进"
+    summary = dict(
+        scope="sampled_functional_only",
+        verdict=verdict,
+        sampled_code_correctness=True,
+        multi_token_tree_progress_both_modes=multi,
+        consecutive_candidate_hits_ge2_both_modes=multiple_candidates,
+        unique_frames=metadata["unique_frames"],
+        checks=len(checks),
+        groups=groups,
+        node_audit=False,
+        performance_evaluated=False,
+        full_acceptance=False,
+        definitions={
+            "accepted": "从当前前缀起连续命中的候选 token 数，不含失配目标 token 或叶后额外 token",
+            "committed": "本轮实际提交 token 数，包含候选命中及可能的额外目标 token",
+            "fraction_denominator": "该配置/采样模式的全部轮次，包含帧尾轮次",
+        },
+    )
+    exp.write_json(args.results / "summary.json", summary)
+    lines = [
+        "# 零训练树状投机：抽样功能验证",
+        "",
+        verdict,
+        "",
+        f"独立帧：{metadata['unique_frames']}；codes 检查：{len(checks)} 项通过。未运行性能测试或全量节点审计。",
+        "",
+        "接受长度仅计连续候选命中；提交长度还可能包含一个失配或叶后目标 token。占比分母包含帧尾在内的全部轮次。",
+        "",
+        "| 配置/模式 | 轮次 | 连续命中长度分布 | 提交长度分布 | 命中≥2占比 | 提交≥2占比 |",
+        "|---|---:|---|---|---:|---:|",
+    ]
+    for name, row in groups.items():
+        lines.append(
+            f"| {name} | {row['rounds']} | {row['accepted_length_histogram']} | "
+            f"{row['committed_length_histogram']} | {row['accepted_ge2_fraction']:.2%} | "
+            f"{row['committed_ge2_fraction']:.2%} |"
+        )
+    lines.extend(["", "## 实际命中样例", ""])
+    for name, row in groups.items():
+        examples = row["accepted_ge2_examples"] or row["committed_ge2_examples"]
+        for event in examples[:2]:
+            lines.append(
+                f"- {name}：{event['request_id']}/frame={event['frame_id']}，"
+                f"起始码本位置={event['position']}，连续命中={event['accepted']}，提交={event['committed']}；"
+                f"命中 codes={event['accepted_codes']}，提交 codes={event['committed_codes']}。"
+            )
+    lines.extend(
+        [
+            "",
+            "通过条件：所有抽样 codes 与 stock 一致，且 greedy、随机模式均至少观察到一种树配置单轮提交≥2。",
+            f"更严格的连续候选命中≥2是否在两种模式都出现：{multiple_candidates}。",
+            "该结论仅覆盖本次抽样功能目标，不代表全量正确性、加速或完整请求验收通过。",
+        ]
+    )
+    (args.results / "report.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    status.update(
+        status="complete",
+        scope="sampled_functional_only",
+        verdict=verdict,
+        sampled_code_correctness=True,
+        total_timed_executions=0,
+    )
+    exp.write_json(args.results / "status.json", status)
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(__doc__)
     parser.add_argument("--output", type=Path, required=True, help="existing capture directory (read only)")
@@ -251,6 +379,9 @@ if __name__ == "__main__":
     parser.add_argument("--executions-per-round", type=int, default=200)
     parser.add_argument("--progress-interval", type=float, default=10.0)
     parser.add_argument("--greedy", action="store_true", help="time greedy instead of shared-uniform sampling")
+    parser.add_argument(
+        "--functional-only", action="store_true", help="record acceptance events for all trees; no timing"
+    )
     parser.add_argument("--vllm-repo", type=Path, default=exp.ROOT.parent / "vllm")
     parser.add_argument("--ascend-repo", type=Path, default=exp.ROOT.parent / "vllm-ascend")
     args = parser.parse_args()
