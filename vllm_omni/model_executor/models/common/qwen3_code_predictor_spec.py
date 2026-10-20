@@ -375,6 +375,7 @@ def decode(
     timer = PhaseTimer(device, profile)
     events, calibration = [], []
     calls, work, attention_pairs = 0, 0, 0
+    root_calls, verification_calls = 0, 0
     head_rows, projection_rows = 0, 2
     audit_errors = []
     position = 1
@@ -383,6 +384,7 @@ def decode(
         with timer.phase("draft"):
             root = reference_forward(predictor, prefix)[:, -1]
             calls += 1
+            root_calls += 1
             work += prefix.shape[1]
             attention_pairs += prefix.shape[1] * (groups + 1)
             active = [p for p in paths if len(p) <= groups - position]
@@ -418,6 +420,7 @@ def decode(
                 pos, mask = attention_layout(prefix.shape[1], tuple(active), str(device), groups + 1)
                 hidden = predictor.model(packed, pos, mask)
                 calls += 1
+                verification_calls += 1
                 work += packed.shape[1]
                 attention_pairs += packed.shape[1] * (groups + 1)
                 if audit:
@@ -530,6 +533,8 @@ def decode(
         events=events,
         states=calibration,
         backbone_calls=calls,
+        root_backbone_calls=root_calls,
+        verification_backbone_calls=verification_calls,
         processed_positions=work,
         attention_pairs=attention_pairs,
         estimated_matmul_flops=matmul_flops(predictor, work, attention_pairs, head_rows, projection_rows),

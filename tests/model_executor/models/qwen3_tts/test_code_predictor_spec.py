@@ -189,6 +189,22 @@ def test_layout_and_ancestor_closure(research):
 
 
 @torch.inference_mode()
+def test_backbone_counters_match_executed_forwards(research):
+    predictor, spec, inputs = research
+    for paths in ([], [(0,)], [(0,), (1,), (0, 0), (0, 0, 0)]):
+        actual_calls = []
+        handle = predictor.model.register_forward_hook(lambda *unused: actual_calls.append(1))
+        try:
+            _, info = spec.decode(predictor, **inputs, paths=paths, record_events=True)
+        finally:
+            handle.remove()
+        assert info["backbone_calls"] == len(actual_calls)
+        assert info["root_backbone_calls"] == len(info["events"])
+        assert info["verification_backbone_calls"] == sum(e["nodes"] > 0 for e in info["events"])
+        assert info["root_backbone_calls"] + info["verification_backbone_calls"] == len(actual_calls)
+
+
+@torch.inference_mode()
 def test_npu_ancestor_attention_packs_queries_and_masks(research, monkeypatch):
     predictor, spec, _ = research
     attention = predictor.model.layers[0].self_attn
@@ -480,10 +496,17 @@ def test_research_artifact_pipeline(research, tmp_path, monkeypatch):
         return original_decode(*a, **kw)
 
     monkeypatch.setattr(spec, "decode", no_audit)
+    quick_args.configs = ["tree8", "tree16", "tree32"]
     quick.run(quick_args)
     quick_summary = json.loads((quick_args.results / "summary.json").read_text(encoding="utf-8"))
-    assert quick_summary["total_timed_executions"] == 400
-    assert len(quick_summary["performance"]) == 5
+    assert quick_summary["total_timed_executions"] == 560
+    assert len(quick_summary["performance"]) == 7
+    assert quick_summary["performance_pass_threshold"] is None
+    for comparison in quick_summary["performance"].values():
+        candidate = comparison["candidate"]
+        assert candidate["calls_per_frame"] == pytest.approx(
+            candidate["root_calls_per_frame"] + candidate["verification_calls_per_frame"]
+        )
     assert quick_summary["node_audit"] is False
     assert (tmp_path / "correctness.json").read_bytes() == saved_correctness
     with pytest.raises(FileExistsError):

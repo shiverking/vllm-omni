@@ -31,6 +31,8 @@ def summarize(rows):
                 device_p50_ms=float(np.median(devices)) if devices else None,
                 device_p95_ms=float(np.quantile(devices, 0.95)) if devices else None,
                 calls_per_frame=float(np.mean([r["backbone_calls"] for r in items])),
+                root_calls_per_frame=float(np.mean([r["root_backbone_calls"] for r in items])),
+                verification_calls_per_frame=float(np.mean([r["verification_backbone_calls"] for r in items])),
                 effective_tokens_per_call=sum(r["residual_tokens"] for r in items)
                 / sum(r["backbone_calls"] for r in items),
             )
@@ -40,11 +42,15 @@ def summarize(rows):
         b = np.array([sum(r["wall_ms"] for r in candidate if r["request_id"] == rid) for rid in requests])
         picks = np.random.default_rng(20261020).integers(0, len(requests), size=(2000, len(requests)))
         ratios = a[picks].sum(1) / b[picks].sum(1)
+        baseline_metrics, candidate_metrics = metrics(baseline), metrics(candidate)
         results[f"{config}/{comparator}"] = dict(
             speedup=float(a.sum() / b.sum()),
             exploratory_request_bootstrap95=np.quantile(ratios, [0.025, 0.975]).tolist(),
-            baseline=metrics(baseline),
-            candidate=metrics(candidate),
+            baseline=baseline_metrics,
+            candidate=candidate_metrics,
+            total_call_reduction_fraction=1
+            - candidate_metrics["calls_per_frame"] / baseline_metrics["calls_per_frame"],
+            wall_time_reduction_fraction=float(1 - b.sum() / a.sum()),
         )
     return results
 
@@ -75,6 +81,10 @@ def execute(args, progress, status):
     if exp.digest(frozen) != signature or frozen["dataset_sha256"] != exp.digest(manifest["dataset"]):
         raise ValueError("frozen tree or dataset digest changed")
     configs = {"reference": [], "chain": frozen["configs"]["chain"], "tree16": frozen["configs"]["tree16"]}
+    requested = getattr(args, "configs", None)
+    if requested:
+        configs = {"reference": []}
+        configs.update({name: frozen["configs"][name] for name in requested if name != "reference"})
     if functional:
         configs = {"reference": [], **frozen["configs"]}
     progress.message("Loading fixed sampled frames and predictor; using the integrated backend, no diagnostic patch.")
@@ -173,7 +183,7 @@ def execute(args, progress, status):
         finish_functional(args, events, checks, metadata, status)
         progress.message(f"Functional-only probe complete: {args.results / 'report.md'}; no performance runs.")
         return
-    progress.message("Sampled codes PASSED. Preparing inputs and warming all four configurations.")
+    progress.message(f"Sampled codes PASSED. Preparing inputs and warming {len(configs) + 1} configurations.")
     prepared = [exp.inputs_for(args, model, frame, args.greedy) for frame in selected]
 
     def decode(kind, inputs):
@@ -215,6 +225,8 @@ def execute(args, progress, status):
                     device_ms=event,
                     residual_tokens=model._num_groups - 1,
                     backbone_calls=model._num_groups - 1 if kind == "stock" else result[1]["backbone_calls"],
+                    root_backbone_calls=model._num_groups - 1 if kind == "stock" else result[1]["root_backbone_calls"],
+                    verification_backbone_calls=0 if kind == "stock" else result[1]["verification_backbone_calls"],
                     attention_backend=("npu_fusion_attention_sparse_mode2" if device.type == "npu" else "torch_sdpa")
                     if kind == "stock"
                     else spec.attention_backend(device),
@@ -232,6 +244,8 @@ def execute(args, progress, status):
         unique_frames=len(selected),
         total_timed_executions=len(rows),
         performance=summarize(rows),
+        performance_pass_threshold=None,
+        sampling="greedy" if args.greedy else "shared_uniforms",
         attention_backend=spec.attention_backend(device),
         peak_memory_bytes=api.max_memory_allocated() if api else None,
         graph=dict(stock_buckets=list(model._device_graphs), reference="eager", tree="eager"),
@@ -259,6 +273,33 @@ def execute(args, progress, status):
             "",
             f"实验 attention：`{summary['attention_backend']}`。加速比大于 1 表示候选更快。",
             "CPU 运行仅用于工具验证，不能证明 NPU 加速。性能轮关闭逐节点审计和详细事件采集。",
+        ]
+    )
+    lines.extend(
+        [
+            "",
+            "## 总调用次数与完整帧耗时变化",
+            "",
+            "不设置性能通过门槛；减少比例为正表示减少，为负表示增加。"
+            "调用指 Code Predictor 主干前向，包含候选生成成本，非 Python 外层调用次数。",
+            "",
+            "| 配置/对照 | 基线调用/帧 | 候选前缀或draft调用/帧 | 候选树验证调用/帧 | "
+            "总调用减少比例 | 墙钟耗时减少比例 |",
+            "|---|---:|---:|---:|---:|---:|",
+        ]
+    )
+    for name, item in summary["performance"].items():
+        c = item["candidate"]
+        lines.append(
+            f"| {name} | {item['baseline']['calls_per_frame']:.2f} | {c['root_calls_per_frame']:.2f} | "
+            f"{c['verification_calls_per_frame']:.2f} | {item['total_call_reduction_fraction']:.2%} | "
+            f"{item['wall_time_reduction_fraction']:.2%} |"
+        )
+    lines.extend(
+        [
+            "",
+            f"计时采样模式：{summary['sampling']}。完整帧计时包含候选生成、验证、采样及前缀更新。",
+            "基线和候选的设备事件 p50/p95、墙钟 p50/p95 均保存在 summary.json。",
         ]
     )
     (args.results / "report.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -375,6 +416,12 @@ if __name__ == "__main__":
     parser.add_argument("--results", type=Path, required=True, help="new directory for sampled results")
     parser.add_argument("--device", default="npu:0")
     parser.add_argument("--frames-per-request", type=int, default=3)
+    parser.add_argument(
+        "--configs",
+        nargs="+",
+        choices=("reference", "chain", "tree8", "tree16", "tree32"),
+        help="performance configs; reference is always included; functional-only checks all configs",
+    )
     parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument("--executions-per-round", type=int, default=200)
     parser.add_argument("--progress-interval", type=float, default=10.0)
