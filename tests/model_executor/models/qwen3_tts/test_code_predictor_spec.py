@@ -455,6 +455,53 @@ def test_research_artifact_pipeline(research, tmp_path, monkeypatch):
     assert summary["replay"]["executions_per_round"] == 200
     assert len(summary["performance"]) == 9
     assert (tmp_path / "report.md").exists()
+    # Sampled exploration uses the real integrated decoder, never full replay
+    # or serial-node audit, and must not overwrite the source run's artifacts.
+    monkeypatch.syspath_prepend(str(root / "tools/qwen3_tts_spec"))
+    quick_spec = importlib.util.spec_from_file_location(
+        "quick_spec_test", root / "tools/qwen3_tts_spec/quick_experiment.py"
+    )
+    quick = importlib.util.module_from_spec(quick_spec)
+    quick_spec.loader.exec_module(quick)
+    monkeypatch.setattr(quick, "exp", cli)
+    saved_correctness = (tmp_path / "correctness.json").read_bytes()
+    quick_args = SimpleNamespace(
+        **vars(args),
+        results=tmp_path / "quick",
+        frames_per_request=1,
+        warmup=1,
+        executions_per_round=20,
+        progress_interval=10,
+    )
+    original_decode = spec.decode
+
+    def no_audit(*a, **kw):
+        assert not kw.get("audit") and not kw.get("detailed") and not kw.get("profile")
+        return original_decode(*a, **kw)
+
+    monkeypatch.setattr(spec, "decode", no_audit)
+    quick.run(quick_args)
+    quick_summary = json.loads((quick_args.results / "summary.json").read_text(encoding="utf-8"))
+    assert quick_summary["total_timed_executions"] == 400
+    assert len(quick_summary["performance"]) == 5
+    assert quick_summary["node_audit"] is False
+    assert (tmp_path / "correctness.json").read_bytes() == saved_correctness
+    with pytest.raises(FileExistsError):
+        quick.run(quick_args)
+
+    def mismatch(*a, **kw):
+        codes, info = no_audit(*a, **kw)
+        codes = codes.clone()
+        codes[:, -1] = (codes[:, -1] + 1) % 64
+        return codes, info
+
+    monkeypatch.setattr(spec, "decode", mismatch)
+    quick_args.results = tmp_path / "quick-failed"
+    with pytest.raises(RuntimeError, match="code mismatch"):
+        quick.run(quick_args)
+    assert not (quick_args.results / "timings.jsonl").exists()
+    assert json.loads((quick_args.results / "status.json").read_text())["status"] == "failed"
+    monkeypatch.setattr(spec, "decode", original_decode)
     # A failed later correctness run must invalidate older timing artifacts.
     cli.write_json(tmp_path / "correctness.json", {"passed": False})
     cli.report(args)
