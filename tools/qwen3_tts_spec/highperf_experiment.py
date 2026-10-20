@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import argparse
+import gc
 import hashlib
 import json
 import time
@@ -89,6 +90,16 @@ def selected_frames(args):
     return selected
 
 
+def fixed_probe_frames(frames):
+    chosen = []
+    for rid, number in (("smoke011", 0), ("smoke011", 2), ("smoke030", None)):
+        found = [f for f in frames if f["request_id"] == rid and (number is None or f["frame_id"] == number)]
+        if not found:
+            raise ValueError(f"required small-check frame missing: {rid}/{number}")
+        chosen.append(max(found, key=lambda f: f["frame_id"]))
+    return chosen
+
+
 def binding(args, frozen, selected):
     return dict(
         source=frozen["source"],
@@ -97,6 +108,7 @@ def binding(args, frozen, selected):
         frames=frame_fingerprints(args),
         selected_frames=[identity(f) for f in selected],
         sampling=list(modes(args)),
+        graph_scope=getattr(args, "graph_scope", "step"),
         sampling_parameters=sorted(
             {
                 json.dumps(
@@ -201,10 +213,12 @@ def stock_eager(model):
 
 
 class Engines:
-    def __init__(self, model, frozen, configs, progress=None):
+    def __init__(self, model, frozen, configs, progress=None, graph_scope="step"):
         self.model, self.frozen, self.configs = model, frozen, configs
         self.runners = {}
         self.progress = progress
+        self.graph_scope = graph_scope
+        self.released_graphs = {}
 
     def runner(self, name, inputs):
         mode = bool(inputs["do_sample"])
@@ -224,6 +238,7 @@ class Engines:
                 do_sample=mode,
                 temperature=inputs.get("temperature", 0.9),
                 top_k=inputs.get("top_k", 50),
+                graph_scope=self.graph_scope,
             )
             if self.progress:
                 self.runners[key].capture_progress = lambda p, n, total: self.progress.message(
@@ -271,15 +286,43 @@ class Engines:
 
     def graph_info(self):
         return {
-            f"{name}/{'sampling' if sample else 'greedy'}": dict(
+            **self.released_graphs,
+            **{
+                f"{name}/{'sampling' if sample else 'greedy'}": dict(
+                    **runner.capture_metadata(),
+                    graphs=len(runner.graphs),
+                    cache=runner.cache,
+                    execution=runner.execution,
+                )
+                for (name, sample), runner in self.runners.items()
+            },
+        }
+
+    def release_graphs(self):
+        """Never retain greedy, sampling and all tree budgets' graphs together."""
+        removed = 0
+        for key, runner in list(self.runners.items()):
+            if runner.execution != "graph":
+                continue
+            name, sample = key
+            record = dict(
+                **runner.capture_metadata(),
                 graphs=len(runner.graphs),
-                capture_seconds=runner.capture_seconds,
-                capture_error=runner.capture_error,
                 cache=runner.cache,
                 execution=runner.execution,
+                released=True,
+                resident_graphs=0,
             )
-            for (name, sample), runner in self.runners.items()
-        }
+            runner.close()
+            self.released_graphs[f"{name}/{'sampling' if sample else 'greedy'}"] = record
+            del self.runners[key]
+            removed += record["graphs"]
+        if removed:
+            gc.collect()
+            if next(self.model.parameters()).device.type == "npu":
+                torch.npu.empty_cache()
+            if self.progress:
+                self.progress.message(f"已在计时区间外释放 {removed} 张流水图；不跨采样模式驻留。")
 
 
 def current_configs(args):
@@ -292,26 +335,58 @@ def current_configs(args):
 
 
 def save_failure(args, engines, engine, inputs, expected, error, context):
-    payload = dict(
+    # capture_end can leave the device/stream poisoned. Persist the original
+    # exception *before* any device read and never snapshot a failed capture.
+    chain, seen, cause = [], set(), error
+    while cause is not None and id(cause) not in seen:
+        seen.add(id(cause))
+        chain.append(repr(cause))
+        cause = cause.__cause__ or cause.__context__
+    metadata = dict(
         context=context,
-        inputs={k: v.detach().cpu() if torch.is_tensor(v) else v for k, v in inputs.items()},
-        expected=expected.detach().cpu() if expected is not None else None,
         error=repr(error),
+        exception_chain=chain,
+        source_capture=str(getattr(args, "input", "")),
+        graphs=engines.graph_info(),
+        input_metadata={
+            k: dict(shape=list(v.shape), dtype=str(v.dtype), device=str(v.device)) if torch.is_tensor(v) else repr(v)
+            for k, v in inputs.items()
+        },
     )
-    if engine != "cached_ar" and engine.endswith("/current") and hasattr(error, "payload"):
-        payload["node"] = error.payload
-    elif engine == "cached_ar" or "/pipeline_" in engine:
-        runner = engines.runners.get((engine, bool(inputs["do_sample"])))
-        if runner:
-            payload["pipeline"] = runner.snapshot()
+    exp.write_json(args.results / "failure.json", metadata)
+    payload = dict(metadata)
+    runner = engines.runners.get((engine, bool(inputs.get("do_sample", True))))
+    unsafe = getattr(error, "device_snapshot_unsafe", False) or bool(runner and runner.capture_error)
+    if unsafe:
+        payload["device_snapshot_skipped"] = "capture failed; synchronous D2H may also fail"
+    else:
+        try:
+            payload["inputs"] = {k: v.detach().cpu() if torch.is_tensor(v) else v for k, v in inputs.items()}
+            payload["expected"] = expected.detach().cpu() if expected is not None else None
+            if engine.endswith("/current") and hasattr(error, "payload"):
+                payload["node"] = error.payload
+            elif runner:
+                payload["pipeline"] = runner.snapshot()
+        except Exception as snapshot_error:
+            # The original exception remains the one re-raised by the caller.
+            metadata["snapshot_error"] = repr(snapshot_error)
+            payload["snapshot_error"] = repr(snapshot_error)
+    if unsafe:
+        metadata["device_snapshot_skipped"] = payload["device_snapshot_skipped"]
+    exp.write_json(args.results / "failure.json", metadata)
     torch.save(payload, args.results / "failure.pt")
 
 
 @torch.inference_mode()
 def check(args, progress):
     frozen = frozen_trees(args)
-    selected = selected_frames(args)
+    test_frames = exp.frames(args, "test")
+    tiny = fixed_probe_frames(test_frames)
+    probe_only = getattr(args, "probe_only", False)
+    selected = tiny if probe_only else selected_frames(args)
     configs, old_hash = current_configs(args)
+    requested = getattr(args, "configs", ["tree16"])
+    configs = {name: configs[name] for name in requested}
     result = dict(
         passed=False,
         binding=binding(args, frozen, selected),
@@ -323,20 +398,13 @@ def check(args, progress):
     exp.write_json(args.results / "correctness.json", result)
     exp.write_json(args.results / "manifest.json", result["binding"])
     model = exp.load_predictor(args)
-    engines = Engines(model, frozen, configs, progress)
+    engines = Engines(model, frozen, configs, progress, getattr(args, "graph_scope", "step"))
     result["predictor"] = dict(
         groups=model._num_groups,
         hidden_size=model.config.hidden_size,
         vocab_size=model.config.vocab_size,
         dtype=str(next(model.parameters()).dtype),
     )
-    test_frames = exp.frames(args, "test")
-    tiny = []
-    for rid, number in (("smoke011", 0), ("smoke011", 2), ("smoke030", None)):
-        found = [f for f in test_frames if f["request_id"] == rid and (number is None or f["frame_id"] == number)]
-        if not found:
-            raise ValueError(f"required small-check frame missing: {rid}/{number}")
-        tiny.append(max(found, key=lambda f: f["frame_id"]))
     first_per_request = {
         f["request_id"]: min(x["frame_id"] for x in selected if x["request_id"] == f["request_id"]) for f in selected
     }
@@ -348,13 +416,14 @@ def check(args, progress):
     ]
     if graph:
         stages.append(("small_graph", [n for n in all_names if "graph" in n], tiny))
-    stages.extend(
-        [
-            ("sampled_cached_ar", ["cached_ar"], selected),
-            ("sampled_eager", [n for n in all_names if n != "cached_ar" and "graph" not in n], selected),
-        ]
-    )
-    if graph:
+    if not probe_only:
+        stages.extend(
+            [
+                ("sampled_cached_ar", ["cached_ar"], selected),
+                ("sampled_eager", [n for n in all_names if n != "cached_ar" and "graph" not in n], selected),
+            ]
+        )
+    if graph and not probe_only:
         stages.append(("sampled_graph", [n for n in all_names if "graph" in n], selected))
     events = []
     for stage, names, frames in stages:
@@ -406,13 +475,14 @@ def check(args, progress):
                     events.extend(dict(**context, **event) for event in info["events"])
                     progress.advance(str(context))
                 exp.write_json(args.results / "correctness.json", result)
+            engines.release_graphs()
     result.update(
         passed=True,
         stage="complete",
         engines=all_names,
         configs=list(configs),
         graphs=engines.graph_info(),
-        scope="sampled_frame_correctness",
+        scope="fixed_probe_only" if probe_only else "sampled_frame_correctness",
     )
     exp.write_rows(args.results / "events.jsonl", events)
     result["events_sha256"] = file_hash(args.results / "events.jsonl")
@@ -420,6 +490,7 @@ def check(args, progress):
     (args.results / "report.md").write_text(
         f"# 树流水抽样正确性\n\n{len(selected)} 个独立帧，{len(result['checks'])} 项检查通过。\n\n"
         f"NPU graph 检查：{'已执行' if graph else '未执行；CPU 结果不能证明 NPU 正确性'}。\n\n"
+        f"检查范围：{'仅固定 3 帧预检，不能用于 bench' if probe_only else '抽样帧检查'}。\n\n"
         "尚未运行完整请求；该结果不是性能结论。\n",
         encoding="utf-8",
     )
@@ -428,6 +499,8 @@ def check(args, progress):
 def require_certificate(certificate, expected_binding, old_hash, names, configs):
     if not certificate.get("passed") or certificate.get("stage") != "complete":
         raise ValueError("correctness certificate is incomplete or failed")
+    if certificate.get("scope") != "sampled_frame_correctness":
+        raise ValueError("probe-only certificate cannot authorize performance testing")
     if certificate.get("binding") != expected_binding or certificate.get("current_tree_sha256") != old_hash:
         raise ValueError("correctness artifact does not match code/model/trees/frames/device/environment/sampling")
     if not set(names).issubset(certificate.get("engines", [])) or not set(configs).issubset(
@@ -448,7 +521,9 @@ def bench(args, progress):
     certificate = json.loads(args.correctness.read_text(encoding="utf-8"))
     fingerprint = binding(args, frozen, selected)
     model = exp.load_predictor(args)
-    engines = Engines(model, frozen, {k: configs[k] for k in args.configs}, progress)
+    engines = Engines(
+        model, frozen, {k: configs[k] for k in args.configs}, progress, getattr(args, "graph_scope", "step")
+    )
     names = [n for n in engines.names(args.device.startswith("npu")) if n != "cached_ar"]
     require_certificate(certificate, fingerprint, old_hash, names, args.configs)
     events_path = args.correctness.parent / "events.jsonl"
@@ -587,6 +662,7 @@ def bench(args, progress):
             )
             profiles.append(dict(sampling=mode, **identity(frame), **info))
             progress.advance()
+        engines.release_graphs()
     exp.write_rows(args.results / "profiles.jsonl", profiles)
     exp.write_json(
         args.results / "graphs.json",
@@ -609,6 +685,7 @@ def report(args, progress):
         performance_pass_threshold=None,
         scope="sampled_frames_not_complete_requests",
         device=manifest["binding"]["device"],
+        graph_scope=manifest["binding"]["graph_scope"],
         modes={},
     )
     lines = [
@@ -617,6 +694,7 @@ def report(args, progress):
         "不设置性能通过门槛；分别观察功能、调用次数和耗时。",
         "",
         f"设备：{output['device']}。独立帧：{len(manifest['binding']['selected_frames'])}。",
+        f"图范围：{output['graph_scope']}。step 为整轮图；backbone 为 prefill＋共享主干图，其他步骤为 eager。",
         "CPU 运行只验证工具；NPU 结论必须来自真实 NPU 数据。",
         "",
         "| 模式／配置／对照 | 总调用/帧 | prefill/draft/AR/验证/补算 | 调用减少 | 墙钟 p50/p95 ms | 加速比 | 95%区间 |",
@@ -714,9 +792,19 @@ def parser():
             command.add_argument("--trees", type=Path, required=True)
             command.add_argument("--frames-per-request", type=int, default=3)
             command.add_argument("--sampling", choices=("both", "greedy", "sampling"), default="both")
+            command.add_argument(
+                "--graph-scope",
+                choices=("backbone", "step"),
+                default="step",
+                help="backbone captures two small graphs; step captures each complete position",
+            )
+            command.add_argument("--configs", nargs="+", choices=("tree8", "tree16", "tree32"), default=["tree16"])
+        if name == "check":
+            command.add_argument(
+                "--probe-only", action="store_true", help="only fixed 3 frames; cannot authorize bench"
+            )
         if name == "bench":
             command.add_argument("--correctness", type=Path, required=True)
-            command.add_argument("--configs", nargs="+", choices=("tree8", "tree16", "tree32"), default=["tree16"])
             command.add_argument("--warmup", type=int, default=20)
             command.add_argument("--executions-per-round", type=int, default=60)
     return root

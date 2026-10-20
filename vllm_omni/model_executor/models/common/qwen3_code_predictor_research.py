@@ -48,6 +48,7 @@ class ResearchSession:
                 if (
                     not certificate.get("passed")
                     or certificate.get("stage") != "complete"
+                    or certificate.get("scope") != "sampled_frame_correctness"
                     or binding.get("tree_sha256") != signature
                     or binding.get("source") != frozen["source"]
                     or not any(f"{name}/{self.engine}" in certificate.get("engines", []) for name in names)
@@ -60,6 +61,7 @@ class ResearchSession:
                 self.verified_sampling_modes = certificate["binding"]["sampling"]
                 self.verified_sampling_parameters = certificate["binding"]["sampling_parameters"]
                 self.verified_predictor = certificate["predictor"]
+                self.graph_scope = binding["graph_scope"]
                 self.pipeline_executors = {}
             elif frozen.get("candidate_layout"):
                 raise ValueError("current engine cannot consume pipeline candidate layout")
@@ -116,6 +118,7 @@ class ResearchSession:
                         do_sample=key[0],
                         temperature=key[1],
                         top_k=key[2],
+                        graph_scope=self.graph_scope,
                     )
                 return self.pipeline_executors[key].decode(**inputs, **kwargs)[0]
             return decode(predictor, **inputs, **kwargs, paths=self.paths)[0]

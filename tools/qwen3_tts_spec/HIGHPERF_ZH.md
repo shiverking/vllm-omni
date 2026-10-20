@@ -40,6 +40,8 @@ python tools/qwen3_tts_spec/highperf_experiment.py check \
   --results /softwarePlatform/y00899301/qwen3_tts_spec_highperf_check01 \
   --device npu:0 \
   --frames-per-request 3 \
+  --configs tree16 \
+  --graph-scope step \
   --sampling both \
   --vllm-repo /vllm-workspace/vllm \
   --ascend-repo /vllm-workspace/vllm-ascend
@@ -51,6 +53,7 @@ python tools/qwen3_tts_spec/highperf_experiment.py bench \
   --results /softwarePlatform/y00899301/qwen3_tts_spec_highperf_bench01 \
   --device npu:0 \
   --configs tree16 \
+  --graph-scope step \
   --frames-per-request 3 \
   --warmup 20 \
   --executions-per-round 60 \
@@ -63,20 +66,50 @@ cat /softwarePlatform/y00899301/qwen3_tts_spec_highperf_bench01/report.md
 
 三条命令顺序执行，任何一步失败都先处理失败，不继续计时。
 check 先检查 smoke011 的第 0、2 帧和 smoke030 的最后一帧，再检查抽样集合。
-包含缓存串行 AR、eager 无缓存／有缓存树、NPU graph，以及旧 current 对照。
+默认只检查 tree16，包含缓存串行 AR、eager 无缓存／有缓存树、NPU graph，以及旧 current 对照。
 固定小样本逐节点审计；60 帧中每个请求第一帧的 tree16 也执行节点审计。
 两种采样模式都要求 codec codes 与 stock 完全一致，且 sampling 必须复现原始捕获 codes。
 不放宽节点 logits 容差：FP32 为 1e-5，低精度为 0.02。
 
 bench 核验代码、模型文件、数据、树、环境、设备、采样模式和检查帧集合。
 更换这些内容后重新运行 check。graph 捕获失败会停止并保存错误，不静默降级。
-可将 --configs tree16 改为 --configs tree8 tree16 tree32 测试全部预算；不能据此重新调整树形状。
+可在 check 和 bench 中使用 --configs tree8 tree16 tree32 测试全部预算；不能据此重新调整树形状。
+每种采样模式完成后，在计时区间外 reset 并释放其流水图，避免 greedy 和 sampling 的所有图累计驻留。
+
+## 图资源不足后的短预检
+
+已有校准结果可继续使用，无需重新采集或校准。先用新结果目录只检查三个固定帧：
+
+```bash
+python tools/qwen3_tts_spec/highperf_experiment.py check \
+  --input /softwarePlatform/y00899301/qwen3_tts_zero_train_spec_run01 \
+  --trees /softwarePlatform/y00899301/qwen3_tts_spec_highperf_calibration01/trees.json \
+  --results /softwarePlatform/y00899301/qwen3_tts_spec_highperf_probe02 \
+  --device npu:0 \
+  --configs tree16 \
+  --graph-scope step \
+  --sampling both \
+  --probe-only \
+  --vllm-repo /vllm-workspace/vllm \
+  --ascend-repo /vllm-workspace/vllm-ascend
+```
+
+probe-only 不进入 60 帧阶段，其结果明确标记为 fixed_probe_only，不能用于 bench 或完整请求。
+短预检通过后，去掉 --probe-only，换新结果目录执行完整的抽样检查。
+
+--graph-scope step 是默认的整轮图，每个执行器最多 15 张图。
+--graph-scope backbone 是显式的低资源对照，每个执行器只捕获 prefill 与共享主干两张图；
+位置／祖先索引通过固定缓冲区更新，draft、采样、选择、KV 提交在 eager 中运行。
+两者都保持每轮一次主干前向；报告记录真实图范围。check 和 bench 的 graph-scope 必须一致。
+捕获失败不会自动切换 scope 或切回 eager。
 
 ## 产物与解释
 
 - 校准：trees.json、manifest.json、两种内部研究 engine 的配置模板。
 - 检查：correctness.json、events.jsonl、manifest.json、中文 report.md。
-- 失败：status.json、未通过的 correctness.json、failure.pt；其中包含输入、KV、节点信息和图状态。
+- 失败：status.json、未通过的 correctness.json、failure.json 和 failure.pt。
+  首先保存主机侧原始异常链、图范围／位置及捕获前内存记录；捕获失败后不再执行设备到主机拷贝。
+  健康设备上的数值差异另存输入、KV 与节点信息；诊断快照失败不会覆盖原始错误。
 - 计时：timings.jsonl、summary.json、graphs.json、memory.json、profiles.jsonl、中文 report.md。
 - 进度：replay-progress.log，包含阶段进度、耗时与阶段 ETA；捕获图时逐位置输出状态。
 

@@ -18,6 +18,12 @@ from . import qwen3_code_predictor_spec as spec
 CANDIDATE_LAYOUT = "known_tail_plus_next3_v1"
 
 
+class PipelineCaptureError(RuntimeError):
+    """The device may still be capturing: diagnostics must not copy tensors."""
+
+    device_snapshot_unsafe = True
+
+
 @dataclass
 class LayerKV:
     """K is already normalized and rotated. Storage stays in KV-head layout."""
@@ -71,14 +77,26 @@ class PipelineExecutor:
     """
 
     def __init__(
-        self, predictor, paths=(), *, cache=True, execution="eager", do_sample=True, temperature=0.9, top_k=50
+        self,
+        predictor,
+        paths=(),
+        *,
+        cache=True,
+        execution="eager",
+        do_sample=True,
+        temperature=0.9,
+        top_k=50,
+        graph_scope="step",
     ):
         if execution not in ("eager", "graph"):
             raise ValueError("execution must be eager or graph")
+        if graph_scope not in ("step", "backbone"):
+            raise ValueError("graph_scope must be step or backbone")
         self.predictor = predictor
         self.paths = tuple(spec.validate_tree(paths))
         self.cache = cache
         self.execution = execution
+        self.graph_scope = graph_scope
         self.do_sample, self.temperature, self.top_k = do_sample, temperature, top_k
         parameter = next(predictor.model.parameters())
         self.device, self.dtype = parameter.device, parameter.dtype
@@ -107,6 +125,14 @@ class PipelineExecutor:
             self.layers.append(LayerKV(parameter.new_zeros(shape), parameter.new_zeros(shape), self.capacity))
         # Metadata is built before timing, never by reading a device mask.
         self.layouts = {p: self._layout(p) for p in range(1, self.groups - 1)}
+        if self.layouts:
+            meta = self.layouts[1]
+            self.graph_positions = torch.zeros_like(meta["positions"])
+            self.graph_mask = type(meta["mask"])(
+                torch.zeros_like(meta["mask"].visibility),
+                torch.zeros_like(meta["mask"].ancestor_indices),
+                torch.zeros_like(meta["mask"].ancestor_valid),
+            )
         self.prefill_positions = torch.arange(2, device=self.device)[None]
         prefill_mask = torch.ones(2, 2, dtype=torch.bool, device=self.device).tril()
         self.prefill_mask = spec.canonical_mask(prefill_mask, self.capacity)
@@ -119,6 +145,8 @@ class PipelineExecutor:
         self.graphs = {}
         self.capture_seconds = 0.0
         self.capture_error = None
+        self.capture_position = None
+        self.capture_memory = []
         self.capture_progress = None
         self.prepared = False
         self.timer = spec.PhaseTimer(self.device, False)
@@ -224,7 +252,11 @@ class PipelineExecutor:
                 embed = predictor.model.codec_embedding[position + len(path) - 1](code)
                 self.query[:, i + 1 : i + 2].copy_(predictor.small_to_mtp_projection(embed))
         with self.timer.phase("backbone_inclusive"):
-            if self.cache:
+            if self.execution == "graph" and self.graph_scope == "backbone":
+                self._stage_graph_layout(meta)
+                self.graphs["backbone"].replay()
+                hidden = self.last_hidden
+            elif self.cache:
                 hidden = predictor.model(self.query, meta["positions"], meta["mask"], self.layers)
             else:
                 self.packed[:, : self.capacity].copy_(self.prefix)
@@ -274,6 +306,50 @@ class PipelineExecutor:
                     old.copy_(torch.where(accepted >= d, value, old))
         self.last_hidden.copy_(hidden)
 
+    def _stage_graph_layout(self, meta):
+        self.graph_positions.copy_(meta["positions"])
+        self.graph_mask.ancestor_indices.copy_(meta["mask"].ancestor_indices)
+        self.graph_mask.ancestor_valid.copy_(meta["mask"].ancestor_valid)
+
+    def _backbone(self):
+        hidden = self.predictor.model(self.query, self.graph_positions, self.graph_mask, self.layers)
+        self.last_hidden.copy_(hidden)
+
+    def capture_metadata(self):
+        """Host attributes only; safe even after capture_end has failed."""
+        return dict(
+            scope=self.graph_scope,
+            count=len(self.graphs),
+            position=self.capture_position,
+            capture_seconds=self.capture_seconds,
+            error=self.capture_error,
+            memory_before_capture=self.capture_memory,
+            cache_bytes=sum(t.numel() * t.element_size() for layer in self.layers for t in (layer.keys, layer.values)),
+        )
+
+    def close(self):
+        """Release healthy graph resources at an explicit, untimed boundary."""
+        if self.capture_error:
+            raise RuntimeError("failed capture must exit its process; do not synchronize/reset the damaged stream")
+        if not self.graphs:
+            return
+        if self.device.type == "npu":
+            torch.npu.synchronize()
+        for graph in self.graphs.values():
+            graph.reset()
+        self.graphs.clear()
+        self.prepared = False
+
+    def _memory_before_capture(self, position):
+        row = dict(position=position)
+        for name in ("memory_allocated", "memory_reserved", "mem_get_info"):
+            try:
+                value = getattr(torch.npu, name)()
+                row[name] = list(value) if isinstance(value, tuple) else value
+            except Exception as exc:
+                row[name] = repr(exc)
+        self.capture_memory.append(row)
+
     def _stage_inputs(self, inputs):
         if inputs["layer0_code"].shape[0] != 1:
             raise ValueError("pipeline supports exactly one request")
@@ -303,23 +379,32 @@ class PipelineExecutor:
         if self.execution == "graph":
             started = time.perf_counter()
             pool = torch.npu.graph_pool_handle()
+            positions = (0, "backbone") if self.graph_scope == "backbone" and self.layouts else (0, *self.layouts)
             try:
-                for position in (0, *self.layouts):
-                    fn = self._prefill if position == 0 else lambda p=position: self._step(p)
+                for position in positions:
+                    self.capture_position = position
+                    if position == "backbone":
+                        self._stage_graph_layout(self.layouts[1])
+                        fn = self._backbone
+                    else:
+                        fn = self._prefill if position == 0 else lambda p=position: self._step(p)
                     for _ in range(2):
                         self._prefill()
                         fn()
                     torch.npu.synchronize()
+                    self._memory_before_capture(position)
                     graph = torch.npu.NPUGraph()
                     with torch.npu.graph(graph, pool=pool):
                         fn()
                     self.graphs[position] = graph
                     if self.capture_progress is not None:
-                        self.capture_progress(position, len(self.graphs), len(self.layouts) + 1)
+                        self.capture_progress(position, len(self.graphs), len(positions))
                 torch.npu.synchronize()
             except Exception as exc:
                 self.capture_error = repr(exc)
-                raise RuntimeError(f"pipeline NPU graph capture failed at position {position}") from exc
+                raise PipelineCaptureError(
+                    f"pipeline NPU graph capture failed at position {position}, scope={self.graph_scope}: {exc}"
+                ) from exc
             finally:
                 self.capture_seconds = time.perf_counter() - started
         self.prepared = True
@@ -333,7 +418,7 @@ class PipelineExecutor:
             pending=self.pending.detach().cpu(),
             keys=[layer.keys.detach().cpu() for layer in self.layers],
             values=[layer.values.detach().cpu() for layer in self.layers],
-            graph=dict(count=len(self.graphs), capture_seconds=self.capture_seconds, error=self.capture_error),
+            graph=self.capture_metadata(),
             last_debug=self.last_debug,
             last_position=self.last_position,
             query=self.query.detach().cpu(),
@@ -389,7 +474,9 @@ class PipelineExecutor:
         events, audit_max = [], 0.0
         while position < self.groups - 1:
             self.last_position = position
-            self.graphs[position].replay() if self.execution == "graph" else self._step(position)
+            self.graphs[position].replay() if self.execution == "graph" and self.graph_scope == "step" else self._step(
+                position
+            )
             calls += 1
             count, accepted = self.state.cpu().tolist()  # one round-boundary synchronization
             if audit:
@@ -425,4 +512,5 @@ class PipelineExecutor:
             timings=self.timer.resolve(),
             attention_backend=spec.attention_backend(self.device),
             candidate_layout=CANDIDATE_LAYOUT,
+            graph_scope=self.graph_scope if self.execution == "graph" else None,
         )

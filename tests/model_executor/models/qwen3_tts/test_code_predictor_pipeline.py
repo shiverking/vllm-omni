@@ -227,7 +227,7 @@ def test_highperf_artifact_pipeline_and_certificate_binding(research, tmp_path, 
     cli.require_certificate(
         certificate, certificate["binding"], certificate["current_tree_sha256"], ["tree16/pipeline_eager"], ["tree16"]
     )
-    for field in ("code", "source", "frames", "sampling", "device"):
+    for field in ("code", "source", "frames", "sampling", "device", "graph_scope"):
         modified = dict(certificate["binding"], **{field: "changed"})
         with pytest.raises(ValueError, match="does not match"):
             cli.require_certificate(certificate, modified, certificate["current_tree_sha256"], [], [])
@@ -263,6 +263,16 @@ def test_highperf_artifact_pipeline_and_certificate_binding(research, tmp_path, 
             local["last_talker_hidden"],
             dict(temperature=0.5, sample_uniforms=local["sample_uniforms"]),
         )
+    # A short graph probe never grants the 60-frame performance certificate.
+    args.results, args.probe_only = tmp_path / "probe", True
+    cli.run(args)
+    probe = json.loads((args.results / "correctness.json").read_text())
+    assert probe["passed"] and probe["scope"] == "fixed_probe_only"
+    assert len(probe["binding"]["selected_frames"]) == 3
+    assert all(row["stage"].startswith("small_") for row in probe["checks"])
+    with pytest.raises(ValueError, match="probe-only"):
+        cli.require_certificate(probe, probe["binding"], probe["current_tree_sha256"], [], [])
+    args.probe_only = False
     # A changed output must stop immediately and preserve the actual KV state.
     original_decode = cli.Engines.decode
 
@@ -341,3 +351,151 @@ def test_pipeline_low_precision_and_upstream_dtype_alignment(research, dtype):
     actual, info = runner.decode(**inputs, audit=True)
     assert torch.equal(actual, model(**inputs))
     assert info["audit_max_logit_error"] <= 0.02
+
+
+@torch.inference_mode()
+def test_backbone_graph_reuses_two_graphs_for_all_positions(research, monkeypatch):
+    """CPU graph stand-in verifies scheduling/metadata, not actual NPU kernels."""
+    from contextlib import contextmanager
+
+    model, spec, inputs = research
+    runner = pipeline_module().PipelineExecutor(model, spec.fit_tree([[0, 0, 0]], 16), graph_scope="backbone")
+    runner.execution = "graph"
+    captured, reset = [], []
+
+    class Graph:
+        def replay(self):
+            self.fn()
+
+        def reset(self):
+            reset.append(self)
+
+    @contextmanager
+    def capture(graph, **kwargs):
+        captured.append(runner.capture_position)
+        graph.fn = runner._prefill if runner.capture_position == 0 else runner._backbone
+        yield
+
+    monkeypatch.setattr(
+        torch,
+        "npu",
+        SimpleNamespace(
+            graph_pool_handle=lambda: None,
+            synchronize=lambda: None,
+            NPUGraph=Graph,
+            graph=capture,
+            memory_allocated=lambda: 100,
+            memory_reserved=lambda: 200,
+            mem_get_info=lambda: (300, 400),
+        ),
+        raising=False,
+    )
+    runner.prepare(inputs)
+    assert captured == [0, "backbone"]
+    assert len(runner.graphs) == 2
+    for offset in (0, 7, -3, 0):
+        local = dict(inputs, layer0_embed=inputs["layer0_embed"] + offset)
+        calls = []
+        handle = model.model.register_forward_hook(lambda *_: calls.append(1))
+        actual, info = runner.decode(**local, audit=True)
+        handle.remove()
+        assert len(calls) == info["backbone_calls"] + info["audit_backbone_calls"]
+        assert torch.equal(actual, model(**local))
+        assert info["graph_scope"] == "backbone"
+    assert runner.capture_metadata()["memory_before_capture"][0]["mem_get_info"] == [300, 400]
+    runner.close()
+    assert len(reset) == 2 and not runner.graphs and not runner.prepared
+
+
+def load_highperf_cli(monkeypatch):
+    root = Path(__file__).resolve().parents[4]
+    monkeypatch.syspath_prepend(str(root / "tools/qwen3_tts_spec"))
+    module_spec = importlib.util.spec_from_file_location(
+        "highperf_failure_test", root / "tools/qwen3_tts_spec/highperf_experiment.py"
+    )
+    cli = importlib.util.module_from_spec(module_spec)
+    module_spec.loader.exec_module(cli)
+    return cli
+
+
+def test_capture_failure_diagnostics_never_read_the_damaged_device(research, monkeypatch, tmp_path):
+    model, _, inputs = research
+    cli = load_highperf_cli(monkeypatch)
+    engines = cli.Engines(model, {}, {})
+    runner = pipeline_module().PipelineExecutor(model)
+    runner.capture_error = "allocation failure 207001"
+    runner.capture_position = 3
+    engines.runners[("tree32/pipeline_graph", True)] = runner
+    error = pipeline_module().PipelineCaptureError("capture failed tree32 sampling position 3")
+    error.__cause__ = RuntimeError("original allocation error 207001")
+    reads = []
+
+    def poisoned_cpu(tensor, *args, **kwargs):
+        reads.append(1)
+        raise RuntimeError("stream is still captured; secondary error 107030")
+
+    with monkeypatch.context() as guarded:
+        guarded.setattr(torch.Tensor, "cpu", poisoned_cpu)
+        cli.save_failure(
+            SimpleNamespace(results=tmp_path),
+            engines,
+            "tree32/pipeline_graph",
+            inputs,
+            inputs["layer0_code"],
+            error,
+            dict(stage="small_graph", frame_id=0),
+        )
+    assert not reads
+    data = json.loads((tmp_path / "failure.json").read_text())
+    assert "207001" in data["exception_chain"][-1]
+    assert data["device_snapshot_skipped"]
+    assert data["graphs"]["tree32/pipeline_graph/sampling"]["position"] == 3
+    saved = torch.load(tmp_path / "failure.pt", weights_only=True)
+    assert saved["device_snapshot_skipped"]
+    assert "inputs" not in saved
+
+
+def test_snapshot_failure_does_not_replace_original_error(research, monkeypatch, tmp_path):
+    model, _, inputs = research
+    cli = load_highperf_cli(monkeypatch)
+    engines = cli.Engines(model, {}, {})
+
+    def poisoned_cpu(tensor, *args, **kwargs):
+        raise RuntimeError("secondary snapshot error")
+
+    with monkeypatch.context() as guarded:
+        guarded.setattr(torch.Tensor, "cpu", poisoned_cpu)
+        cli.save_failure(
+            SimpleNamespace(results=tmp_path),
+            engines,
+            "stock_graph",
+            inputs,
+            None,
+            ValueError("original numerical mismatch"),
+            {},
+        )
+    data = json.loads((tmp_path / "failure.json").read_text())
+    assert "original numerical mismatch" in data["error"]
+    assert "secondary snapshot error" in data["snapshot_error"]
+
+
+def test_graph_sets_are_released_between_sampling_modes(research, monkeypatch):
+    model, _, _ = research
+    cli = load_highperf_cli(monkeypatch)
+    engines = cli.Engines(model, {}, {})
+    released = []
+
+    class Graph:
+        def reset(self):
+            released.append(1)
+
+    for mode in (False, True):
+        for config in ("tree8", "tree16", "tree32"):
+            runner = pipeline_module().PipelineExecutor(model)
+            runner.execution = "graph"
+            runner.graphs = {p: Graph() for p in range(15)}
+            engines.runners[(f"{config}/pipeline_graph", mode)] = runner
+    engines.release_graphs()
+    assert len(released) == 90
+    assert not engines.runners
+    assert all(record["released"] and record["resident_graphs"] == 0 for record in engines.graph_info().values())
