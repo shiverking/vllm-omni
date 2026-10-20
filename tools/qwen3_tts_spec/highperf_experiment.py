@@ -109,6 +109,7 @@ def binding(args, frozen, selected):
         selected_frames=[identity(f) for f in selected],
         sampling=list(modes(args)),
         graph_scope=getattr(args, "graph_scope", "step"),
+        pipeline_optimization=getattr(args, "pipeline_optimization", "optimized"),
         sampling_parameters=sorted(
             {
                 json.dumps(
@@ -213,11 +214,12 @@ def stock_eager(model):
 
 
 class Engines:
-    def __init__(self, model, frozen, configs, progress=None, graph_scope="step"):
+    def __init__(self, model, frozen, configs, progress=None, graph_scope="step", pipeline_optimization="optimized"):
         self.model, self.frozen, self.configs = model, frozen, configs
         self.runners = {}
         self.progress = progress
         self.graph_scope = graph_scope
+        self.pipeline_optimization = pipeline_optimization
         self.released_graphs = {}
 
     def runner(self, name, inputs):
@@ -239,6 +241,7 @@ class Engines:
                 temperature=inputs.get("temperature", 0.9),
                 top_k=inputs.get("top_k", 50),
                 graph_scope=self.graph_scope,
+                optimization=self.pipeline_optimization,
             )
             if self.progress:
                 self.runners[key].capture_progress = lambda p, n, total: self.progress.message(
@@ -398,7 +401,11 @@ def check(args, progress):
     exp.write_json(args.results / "correctness.json", result)
     exp.write_json(args.results / "manifest.json", result["binding"])
     model = exp.load_predictor(args)
-    engines = Engines(model, frozen, configs, progress, getattr(args, "graph_scope", "step"))
+    optimization = getattr(args, "pipeline_optimization", "optimized")
+    engines = Engines(model, frozen, configs, progress, getattr(args, "graph_scope", "step"), optimization)
+    baseline = Engines(
+        model, frozen, configs, graph_scope=getattr(args, "graph_scope", "step"), pipeline_optimization="baseline"
+    )
     result["predictor"] = dict(
         groups=model._num_groups,
         hidden_size=model.config.hidden_size,
@@ -410,27 +417,38 @@ def check(args, progress):
     }
     graph = args.device.startswith("npu")
     all_names = engines.names(graph)
-    stages = [
+    small_stages = [
         ("small_cached_ar", ["cached_ar"], tiny),
         ("small_eager", [n for n in all_names if n != "cached_ar" and "graph" not in n], tiny),
     ]
     if graph:
-        stages.append(("small_graph", [n for n in all_names if "graph" in n], tiny))
+        small_stages.append(("small_graph", [n for n in all_names if "graph" in n], tiny))
+    variants = pipeline().OPTIMIZATIONS if optimization == "optimized" else (optimization,)
+    stages = [(*stage, variant) for variant in variants for stage in small_stages]
     if not probe_only:
         stages.extend(
             [
-                ("sampled_cached_ar", ["cached_ar"], selected),
-                ("sampled_eager", [n for n in all_names if n != "cached_ar" and "graph" not in n], selected),
+                ("sampled_cached_ar", ["cached_ar"], selected, optimization),
+                (
+                    "sampled_eager",
+                    [n for n in all_names if n != "cached_ar" and "graph" not in n],
+                    selected,
+                    optimization,
+                ),
             ]
         )
     if graph and not probe_only:
-        stages.append(("sampled_graph", [n for n in all_names if "graph" in n], selected))
+        stages.append(("sampled_graph", [n for n in all_names if "graph" in n], selected, optimization))
     events = []
-    for stage, names, frames in stages:
+    trace_changes, graph_records = [], {}
+    for stage, names, frames, variant in stages:
+        if engines.pipeline_optimization != variant:
+            engines = Engines(model, frozen, configs, progress, getattr(args, "graph_scope", "step"), variant)
         result["stage"] = stage
-        progress.begin(stage, len(frames) * len(names) * len(modes(args)))
+        progress.begin(f"{stage} optimization={variant}", len(frames) * len(names) * len(modes(args)))
         for mode in modes(args):
             for frame in frames:
+                baseline_info = {}
                 inputs = exp.inputs_for(args, model, frame, greedy=mode == "greedy")
                 expected = model(**inputs)
                 # Establish that the stock path still reproduces the capture.
@@ -440,7 +458,9 @@ def check(args, progress):
                     )
                     raise RuntimeError("stock sampling differs from captured codes")
                 for name in names:
-                    context = dict(stage=stage, engine=name, sampling=mode, **identity(frame))
+                    context = dict(
+                        stage=stage, engine=name, sampling=mode, pipeline_optimization=variant, **identity(frame)
+                    )
                     audit = (name == "cached_ar" and stage.startswith("small")) or (
                         "pipeline" in name
                         and (
@@ -458,9 +478,37 @@ def check(args, progress):
                                 f"codec codes differ: expected={expected.cpu().tolist()}, "
                                 f"actual={actual.cpu().tolist()}"
                             )
+                        if "pipeline_" in name and variant != "baseline":
+                            config = name.split("/")[0]
+                            if config not in baseline_info:
+                                base_codes, base_info = baseline.decode(
+                                    f"{config}/pipeline_eager", inputs, record_events=True
+                                )
+                                if not torch.equal(expected, base_codes):
+                                    raise AssertionError("baseline pipeline codes differ from stock")
+                                baseline_info[config] = base_info
+                            reference = baseline_info[config]["events"]
+                            path_keys = ("position", "committed", "accepted", "accepted_path")
+                            paths_equal = [{k: e[k] for k in path_keys} for e in reference] == [
+                                {k: e[k] for k in path_keys} for e in info["events"]
+                            ]
+                            draft_equal = [e["draft_candidates"] for e in reference] == [
+                                e["draft_candidates"] for e in info["events"]
+                            ]
+                            if not paths_equal or not draft_equal:
+                                trace_changes.append(
+                                    dict(
+                                        **context,
+                                        paths_equal=paths_equal,
+                                        draft_equal=draft_equal,
+                                        baseline=reference,
+                                        candidate=info["events"],
+                                    )
+                                )
                     except Exception as exc:
                         save_failure(args, engines, name, inputs, expected, exc, context)
                         exp.write_rows(args.results / "events.jsonl", events)
+                        exp.write_rows(args.results / "candidate-path-changes.jsonl", trace_changes)
                         result.update(failure=context, error=repr(exc), graphs=engines.graph_info())
                         exp.write_json(args.results / "correctness.json", result)
                         raise
@@ -476,21 +524,26 @@ def check(args, progress):
                     progress.advance(str(context))
                 exp.write_json(args.results / "correctness.json", result)
             engines.release_graphs()
+            graph_records.update({f"{variant}/{k}": v for k, v in engines.graph_info().items()})
     result.update(
         passed=True,
         stage="complete",
         engines=all_names,
         configs=list(configs),
-        graphs=engines.graph_info(),
+        graphs=graph_records,
+        candidate_or_path_changes=len(trace_changes),
         scope="fixed_probe_only" if probe_only else "sampled_frame_correctness",
     )
     exp.write_rows(args.results / "events.jsonl", events)
+    exp.write_rows(args.results / "candidate-path-changes.jsonl", trace_changes)
     result["events_sha256"] = file_hash(args.results / "events.jsonl")
     exp.write_json(args.results / "correctness.json", result)
     (args.results / "report.md").write_text(
         f"# 树流水抽样正确性\n\n{len(selected)} 个独立帧，{len(result['checks'])} 项检查通过。\n\n"
         f"NPU graph 检查：{'已执行' if graph else '未执行；CPU 结果不能证明 NPU 正确性'}。\n\n"
         f"检查范围：{'仅固定 3 帧预检，不能用于 bench' if probe_only else '抽样帧检查'}。\n\n"
+        f"优化档位：{optimization}；小检查档位：{', '.join(variants)}。\n\n"
+        f"相对 baseline 的候选／接受路径变化：{len(trace_changes)} 项，详见 candidate-path-changes.jsonl。\n\n"
         "尚未运行完整请求；该结果不是性能结论。\n",
         encoding="utf-8",
     )
@@ -522,7 +575,12 @@ def bench(args, progress):
     fingerprint = binding(args, frozen, selected)
     model = exp.load_predictor(args)
     engines = Engines(
-        model, frozen, {k: configs[k] for k in args.configs}, progress, getattr(args, "graph_scope", "step")
+        model,
+        frozen,
+        {k: configs[k] for k in args.configs},
+        progress,
+        getattr(args, "graph_scope", "step"),
+        getattr(args, "pipeline_optimization", "optimized"),
     )
     names = [n for n in engines.names(args.device.startswith("npu")) if n != "cached_ar"]
     require_certificate(certificate, fingerprint, old_hash, names, args.configs)
@@ -545,6 +603,7 @@ def bench(args, progress):
             warmup=args.warmup,
             executions_per_round=args.executions_per_round,
             performance_pass_threshold=None,
+            candidate_or_path_changes=certificate.get("candidate_or_path_changes", 0),
         ),
     )
     api = exp.api_for(torch.device(args.device))
@@ -678,6 +737,105 @@ def bench(args, progress):
     report(args, progress)
 
 
+@torch.inference_mode()
+def profile(args, progress):
+    """Six-frame native graph traces; never used as formal latency results."""
+    if not args.device.startswith("npu"):
+        raise ValueError("native graph profiling requires NPU; CPU cannot validate its performance")
+    if len(args.configs) != 1:
+        raise ValueError("profile one tree budget per process")
+    if args.warmup < 1:
+        raise ValueError("profile warmup must be positive")
+    frozen, selected = frozen_trees(args), selected_frames(args)
+    configs, old_hash = current_configs(args)
+    certificate = json.loads(args.correctness.read_text(encoding="utf-8"))
+    fingerprint = binding(args, frozen, selected)
+    config = args.configs[0]
+    require_certificate(certificate, fingerprint, old_hash, ["stock_graph", f"{config}/pipeline_graph"], [config])
+    import torch_npu
+
+    probe = [f for f in selected if f["request_id"] in sorted({f["request_id"] for f in selected})[:2]]
+    probe = select_request_frames(probe, 3)
+    if len(probe) != 6:
+        raise ValueError("profiling requires two requests with first/middle/last frames (6 distinct frames)")
+    variants = pipeline().OPTIMIZATIONS if args.pipeline_optimization == "optimized" else (args.pipeline_optimization,)
+    exp.write_json(
+        args.results / "manifest.json",
+        dict(
+            binding=fingerprint,
+            scope="six_frame_graph_diagnostic_not_benchmark",
+            frames=[identity(f) for f in probe],
+            optimizations=list(variants),
+            warmup=args.warmup,
+            correctness_sha256=file_hash(args.correctness),
+        ),
+    )
+    model = exp.load_predictor(args)
+    graphs = {}
+    for mode in modes(args):
+        prepared = [exp.inputs_for(args, model, f, greedy=mode == "greedy") for f in probe]
+        expected = [model(**inputs).cpu() for inputs in prepared]
+        for variant in ("stock", *variants):
+            label = "stock_graph" if variant == "stock" else variant
+            engines = Engines(
+                model,
+                frozen,
+                {config: configs[config]},
+                progress,
+                getattr(args, "graph_scope", "step"),
+                "baseline" if variant == "stock" else variant,
+            )
+            name = "stock_graph" if variant == "stock" else f"{config}/pipeline_graph"
+            progress.begin(f"{mode}/{label} 预热（捕获不进入 profiler）", args.warmup)
+            try:
+                for i in range(args.warmup):
+                    engines.decode(name, prepared[i % len(prepared)])
+                    progress.advance()
+                torch.npu.synchronize()
+                outputs = []
+                progress.begin(f"{mode}/{label} 六帧 profiling", len(probe))
+                with torch_npu.profiler.profile(
+                    activities=[torch_npu.profiler.ProfilerActivity.CPU, torch_npu.profiler.ProfilerActivity.NPU],
+                    record_shapes=False,
+                    profile_memory=False,
+                    with_stack=False,
+                    on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(str(args.results / mode / label)),
+                    experimental_config=torch_npu.profiler._ExperimentalConfig(
+                        export_type=torch_npu.profiler.ExportType.Text,
+                        profiler_level=torch_npu.profiler.ProfilerLevel.Level1,
+                    ),
+                ) as profiler:
+                    for i, inputs in enumerate(prepared):
+                        with torch.profiler.record_function(f"{mode}/{label}/frame{i}"):
+                            outputs.append(engines.decode(name, inputs)[0])
+                        profiler.step()
+                    torch.npu.synchronize()
+                # Comparisons and progress writes stay outside the trace.
+                for i, actual in enumerate(outputs):
+                    if not torch.equal(actual.cpu(), expected[i]):
+                        raise AssertionError(f"profile codes differ: {mode}/{label}/{identity(probe[i])}")
+                    progress.advance()
+            except Exception as exc:
+                save_failure(
+                    args,
+                    engines,
+                    name,
+                    prepared[min(i, len(prepared) - 1)],
+                    None,
+                    exc,
+                    dict(stage="native_profile", sampling=mode, pipeline_optimization=variant),
+                )
+                raise
+            engines.release_graphs()
+            graphs[f"{mode}/{label}"] = engines.graph_info()
+            exp.write_json(args.results / "graphs.json", graphs)
+    (args.results / "report.md").write_text(
+        "# 六帧图执行诊断\n\nstock 与四档流水的 trace、kernel_details.csv、op_statistic.csv 分目录保存。\n\n"
+        "捕获和预热在 profiler 外；未进行逐节点审计。该结果不替代无 profiler 的 ABBA 性能测试。\n",
+        encoding="utf-8",
+    )
+
+
 def report(args, progress):
     rows = exp.read_rows(args.results / "timings.jsonl")
     manifest = json.loads((args.results / "manifest.json").read_text(encoding="utf-8"))
@@ -686,6 +844,8 @@ def report(args, progress):
         scope="sampled_frames_not_complete_requests",
         device=manifest["binding"]["device"],
         graph_scope=manifest["binding"]["graph_scope"],
+        pipeline_optimization=manifest["binding"].get("pipeline_optimization", "baseline"),
+        candidate_or_path_changes=manifest.get("candidate_or_path_changes", 0),
         modes={},
     )
     lines = [
@@ -695,6 +855,9 @@ def report(args, progress):
         "",
         f"设备：{output['device']}。独立帧：{len(manifest['binding']['selected_frames'])}。",
         f"图范围：{output['graph_scope']}。step 为整轮图；backbone 为 prefill＋共享主干图，其他步骤为 eager。",
+        f"流水优化档位：{output['pipeline_optimization']}。",
+        f"正确性轮相对 baseline 的候选／接受路径变化：{output['candidate_or_path_changes']} 项。"
+        "存在变化时，调用数差异包含路径变化贡献，不能全部归为执行优化收益。",
         "CPU 运行只验证工具；NPU 结论必须来自真实 NPU 数据。",
         "",
         "| 模式／配置／对照 | 总调用/帧 | prefill/draft/AR/验证/补算 | 调用减少 | 墙钟 p50/p95 ms | 加速比 | 95%区间 |",
@@ -778,7 +941,7 @@ def report(args, progress):
 def parser():
     root = argparse.ArgumentParser(__doc__)
     commands = root.add_subparsers(dest="command", required=True)
-    for name in ("calibrate", "check", "bench", "report"):
+    for name in ("calibrate", "check", "bench", "profile", "report"):
         command = commands.add_parser(name)
         command.add_argument("--results", type=Path, required=True)
         command.add_argument("--progress-interval", type=float, default=10)
@@ -793,6 +956,11 @@ def parser():
             command.add_argument("--frames-per-request", type=int, default=3)
             command.add_argument("--sampling", choices=("both", "greedy", "sampling"), default="both")
             command.add_argument(
+                "--pipeline-optimization",
+                choices=("baseline", "kv_commit", "batched", "optimized"),
+                default="optimized",
+            )
+            command.add_argument(
                 "--graph-scope",
                 choices=("backbone", "step"),
                 default="step",
@@ -803,10 +971,11 @@ def parser():
             command.add_argument(
                 "--probe-only", action="store_true", help="only fixed 3 frames; cannot authorize bench"
             )
-        if name == "bench":
+        if name in ("bench", "profile"):
             command.add_argument("--correctness", type=Path, required=True)
             command.add_argument("--warmup", type=int, default=20)
-            command.add_argument("--executions-per-round", type=int, default=60)
+            if name == "bench":
+                command.add_argument("--executions-per-round", type=int, default=60)
     return root
 
 

@@ -4,6 +4,86 @@
 固定使用原来的 10 条校准请求与 20 条测试请求；默认每条测试请求取首、中、末三帧。
 训练、残差重采样和播放调度不在本次实验内。
 
+## Profiling 开销修复版
+
+本轮直接复用 `qwen3_tts_spec_highperf_calibration01/trees.json`，无需重新 collect 或 calibrate。
+新增 `--pipeline-optimization`，默认 `optimized`：
+
+| 档位 | 行为 |
+|---|---|
+| baseline | 原流水：逐节点 Head、逐位置提交 KV、先扩展 GQA 再 gather |
+| kv_commit | 一次计算路径有效 mask，每层批量 gather／选择／提交 KV |
+| batched | 追加按码本分组 Head、候选 embedding 复用和共享 projection 批处理 |
+| optimized | 追加先按 KV heads gather，再生成原有连续祖先布局；预计算 blocked mask |
+
+固定形状和每轮一次主机状态回传保留。默认 AR、current 及正确性参考 attention 不变。
+批量 Head 的随机数按码本位置广播，不增加节点随机数；节点审计检查实际批量 Head logits。
+
+`optimized` 的小检查自动依次覆盖四档；后续 60 帧只检查所选档位。
+每档每种采样模式结束后释放 NPU 图，不把四档图同时留在设备。
+优化档位绑定正确性证书；旧版本、其他档位或 probe-only 证书不能用于 bench。
+`candidate-path-changes.jsonl` 记录与 baseline 不同的候选排名和接受路径。
+有变化时报告单独提示，不能将调用次数变化全部归因于执行优化。
+出现 codes 或节点审计差异立即停止，`failure.pt` 保存当轮候选、实际 Head logits、KV 和布局。
+
+先运行固定三帧预检：
+
+```bash
+cd /softwarePlatform/y00899301/vllm_debug_omni/vllm-omni-tts
+
+python tools/qwen3_tts_spec/highperf_experiment.py check \
+  --input /softwarePlatform/y00899301/qwen3_tts_zero_train_spec_run01 \
+  --trees /softwarePlatform/y00899301/qwen3_tts_spec_highperf_calibration01/trees.json \
+  --results /softwarePlatform/y00899301/qwen3_tts_spec_optimized_probe01 \
+  --device npu:0 --configs tree16 --sampling both \
+  --pipeline-optimization optimized --probe-only \
+  --vllm-repo /vllm-workspace/vllm \
+  --ascend-repo /vllm-workspace/vllm-ascend
+```
+
+预检通过后依次进行 60 帧检查和无 profiler 的正式计时：
+
+```bash
+python tools/qwen3_tts_spec/highperf_experiment.py check \
+  --input /softwarePlatform/y00899301/qwen3_tts_zero_train_spec_run01 \
+  --trees /softwarePlatform/y00899301/qwen3_tts_spec_highperf_calibration01/trees.json \
+  --results /softwarePlatform/y00899301/qwen3_tts_spec_optimized_check01 \
+  --device npu:0 --configs tree16 --frames-per-request 3 --sampling both \
+  --pipeline-optimization optimized \
+  --vllm-repo /vllm-workspace/vllm \
+  --ascend-repo /vllm-workspace/vllm-ascend
+
+python tools/qwen3_tts_spec/highperf_experiment.py bench \
+  --input /softwarePlatform/y00899301/qwen3_tts_zero_train_spec_run01 \
+  --trees /softwarePlatform/y00899301/qwen3_tts_spec_highperf_calibration01/trees.json \
+  --correctness /softwarePlatform/y00899301/qwen3_tts_spec_optimized_check01/correctness.json \
+  --results /softwarePlatform/y00899301/qwen3_tts_spec_optimized_bench01 \
+  --device npu:0 --configs tree16 --frames-per-request 3 --sampling both \
+  --pipeline-optimization optimized --warmup 20 --executions-per-round 60 \
+  --vllm-repo /vllm-workspace/vllm \
+  --ascend-repo /vllm-workspace/vllm-ascend
+```
+
+单独采集前两个测试请求首／中／末共六帧的原生图 profiling：
+
+```bash
+python tools/qwen3_tts_spec/highperf_experiment.py profile \
+  --input /softwarePlatform/y00899301/qwen3_tts_zero_train_spec_run01 \
+  --trees /softwarePlatform/y00899301/qwen3_tts_spec_highperf_calibration01/trees.json \
+  --correctness /softwarePlatform/y00899301/qwen3_tts_spec_optimized_check01/correctness.json \
+  --results /softwarePlatform/y00899301/qwen3_tts_spec_optimized_profile01 \
+  --device npu:0 --configs tree16 --frames-per-request 3 --sampling both \
+  --pipeline-optimization optimized --warmup 20 \
+  --vllm-repo /vllm-workspace/vllm \
+  --ascend-repo /vllm-workspace/vllm-ascend
+```
+
+采集范围为 stock graph 和四档流水，按采样模式／档位分别输出。
+捕获、预热、codes 比较和进度写盘均在 profiler 区间外；只在整段采集结束时设备同步。
+该诊断不执行逐节点审计，也不作为正式延迟或纯 kernel 时间结论。
+图本身保留原有每轮状态同步；修改提交方式不增加主干调用。
+所有结果目录必须不存在。完整请求配置可显式设置 `pipeline_optimization`，并使用匹配档位证书。
+
 ## 数据流与对照
 
 首次 prefill 产生 c₁；下一轮把已输出但尚未处理的尾 token 作为确定根节点，

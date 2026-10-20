@@ -62,6 +62,9 @@ class ResearchSession:
                 self.verified_sampling_parameters = certificate["binding"]["sampling_parameters"]
                 self.verified_predictor = certificate["predictor"]
                 self.graph_scope = binding["graph_scope"]
+                self.pipeline_optimization = self.config.get("pipeline_optimization", "optimized")
+                if binding.get("pipeline_optimization") != self.pipeline_optimization:
+                    raise ValueError("pipeline optimization was not checked by this correctness certificate")
                 self.pipeline_executors = {}
             elif frozen.get("candidate_layout"):
                 raise ValueError("current engine cannot consume pipeline candidate layout")
@@ -119,6 +122,7 @@ class ResearchSession:
                         temperature=key[1],
                         top_k=key[2],
                         graph_scope=self.graph_scope,
+                        optimization=self.pipeline_optimization,
                     )
                 return self.pipeline_executors[key].decode(**inputs, **kwargs)[0]
             return decode(predictor, **inputs, **kwargs, paths=self.paths)[0]

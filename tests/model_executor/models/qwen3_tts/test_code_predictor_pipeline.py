@@ -23,13 +23,16 @@ def pipeline_module():
 @pytest.mark.parametrize("cache", [False, True])
 @pytest.mark.parametrize("greedy", [False, True])
 @pytest.mark.parametrize("budget", [0, 8, 16, 32])
+@pytest.mark.parametrize("optimization", ["baseline", "kv_commit", "batched", "optimized"])
 @torch.inference_mode()
-def test_pipeline_matches_ar_nodes_and_actual_calls(research, cache, greedy, budget):
+def test_pipeline_matches_ar_nodes_and_actual_calls(research, cache, greedy, budget, optimization):
     model, spec, inputs = research
     paths = spec.fit_tree([[0, 0, 0], [1, 2, 1]], budget) if budget else ()
     inputs = dict(inputs, do_sample=not greedy)
     expected = model(**inputs)
-    runner = pipeline_module().PipelineExecutor(model, paths, cache=cache, do_sample=not greedy)
+    runner = pipeline_module().PipelineExecutor(
+        model, paths, cache=cache, do_sample=not greedy, optimization=optimization
+    )
     calls = []
     handle = model.model.register_forward_hook(lambda *_: calls.append(1))
     actual, info = runner.decode(**inputs, audit=True, record_events=True)
@@ -46,6 +49,94 @@ def test_pipeline_matches_ar_nodes_and_actual_calls(research, cache, greedy, bud
     again, _ = runner.decode(**inputs)
     assert torch.equal(actual, again)
     assert not info["graph_replays"]
+
+
+@pytest.mark.parametrize("cache", [False, True])
+@pytest.mark.parametrize("position", [1, -3, -2])
+@pytest.mark.parametrize("accepted", [0, 1, 2, 3])
+@torch.inference_mode()
+def test_bulk_commit_preserves_every_cache_slot(research, cache, position, accepted):
+    model, spec, _ = research
+    if position < 0:
+        position += model._num_groups
+    paths = spec.fit_tree([[0, 0, 0], [1, 2, 1]], 8)
+    runners = [
+        pipeline_module().PipelineExecutor(model, paths, cache=cache, optimization=o) for o in ("baseline", "kv_commit")
+    ]
+    left, right = runners
+    for layer_l, layer_r in zip(left.layers, right.layers):
+        for a, b in zip((layer_l.keys, layer_l.values), (layer_r.keys, layer_r.values)):
+            a.copy_(torch.randn_like(a))
+            b.copy_(a)
+    left.query.copy_(torch.randn_like(left.query))
+    right.query.copy_(left.query)
+    left.prefix.copy_(torch.randn_like(left.prefix))
+    right.prefix.copy_(left.prefix)
+    for runner in runners:
+        runner.path_buffer.copy_(torch.tensor([0, 2, 4, 6]))
+        runner._commit(position, torch.tensor(accepted))
+    assert torch.equal(left.prefix, right.prefix)
+    for layer_l, layer_r in zip(left.layers, right.layers):
+        assert torch.equal(layer_l.keys, layer_r.keys)
+        assert torch.equal(layer_l.values, layer_r.values)
+
+
+@pytest.mark.parametrize("greedy", [False, True])
+@torch.inference_mode()
+def test_batching_reduces_real_auxiliary_module_calls(research, greedy):
+    model, spec, inputs = research
+    paths = spec.fit_tree([[0, 0, 0], [1, 2, 1]], 16)
+    inputs = dict(inputs, do_sample=not greedy)
+    results = []
+    for optimization in ("baseline", "batched"):
+        calls = {"head": 0, "embedding": 0, "projection": 0, "backbone": 0}
+        handles = []
+
+        def count(kind):
+            def hook(*_):
+                calls[kind] += 1
+
+            return hook
+
+        for kind, modules in (
+            ("head", model.lm_head),
+            ("embedding", model.model.codec_embedding),
+            ("projection", [model.small_to_mtp_projection]),
+            ("backbone", [model.model]),
+        ):
+            handles.extend(m.register_forward_hook(count(kind)) for m in modules)
+        runner = pipeline_module().PipelineExecutor(model, paths, do_sample=not greedy, optimization=optimization)
+        try:
+            codes, info = runner.decode(**inputs, record_events=True)
+        finally:
+            for handle in handles:
+                handle.remove()
+        if optimization == "batched":
+            assert calls["head"] == 1 + sum(
+                max(map(len, runner.layouts[e["position"] - 1]["active"]), default=0)
+                + len(runner.layouts[e["position"] - 1]["head_groups"])
+                for e in info["events"]
+            )
+            assert calls["projection"] == 2 + len(info["events"])
+        results.append((codes, info, calls))
+    assert torch.equal(results[0][0], results[1][0])
+    assert results[0][1]["events"] == results[1][1]["events"]
+    for kind in ("head", "embedding", "projection"):
+        assert results[1][2][kind] < results[0][2][kind]
+    assert results[1][2]["backbone"] == results[0][2]["backbone"]
+
+
+def test_audit_uses_actual_batched_logits(research):
+    model, spec, inputs = research
+    runner = pipeline_module().PipelineExecutor(model, spec.fit_tree([[0, 0, 0]], 8), do_sample=False)
+    with torch.inference_mode():
+        runner.decode(**dict(inputs, do_sample=False))
+        runner.debug_tensors[runner.last_position]["logits"][0].add_(1)
+        with pytest.raises(AssertionError):
+            runner._audit(runner.last_position, runner.last_hidden)
+        snapshot = runner.snapshot()
+    assert snapshot["optimization"] == "optimized"
+    assert snapshot["step_outputs"]["logits"]
 
 
 @pytest.mark.parametrize("groups", [2, 3, 4])
@@ -198,6 +289,13 @@ def test_highperf_artifact_pipeline_and_certificate_binding(research, tmp_path, 
     cli.run(args)
     certificate = json.loads((checked / "correctness.json").read_text())
     assert certificate["passed"]
+    assert certificate["binding"]["pipeline_optimization"] == "optimized"
+    assert {r["pipeline_optimization"] for r in certificate["checks"] if r["stage"].startswith("small")} == set(
+        cli.pipeline().OPTIMIZATIONS
+    )
+    assert {r["pipeline_optimization"] for r in certificate["checks"] if r["stage"].startswith("sampled")} == {
+        "optimized"
+    }
     assert not certificate["graph_supported"]
     assert any(r["node_audit"] and r["stage"] == "sampled_eager" for r in certificate["checks"])
     bench_args = SimpleNamespace(
@@ -227,7 +325,7 @@ def test_highperf_artifact_pipeline_and_certificate_binding(research, tmp_path, 
     cli.require_certificate(
         certificate, certificate["binding"], certificate["current_tree_sha256"], ["tree16/pipeline_eager"], ["tree16"]
     )
-    for field in ("code", "source", "frames", "sampling", "device", "graph_scope"):
+    for field in ("code", "source", "frames", "sampling", "device", "graph_scope", "pipeline_optimization"):
         modified = dict(certificate["binding"], **{field: "changed"})
         with pytest.raises(ValueError, match="does not match"):
             cli.require_certificate(certificate, modified, certificate["current_tree_sha256"], [], [])
@@ -241,6 +339,11 @@ def test_highperf_artifact_pipeline_and_certificate_binding(research, tmp_path, 
         session_module.ResearchSession(live_config)
     config = json.loads(live_config.read_text())
     config["correctness"] = str(checked / "correctness.json")
+    config["pipeline_optimization"] = "baseline"
+    cli.exp.write_json(live_config, config)
+    with pytest.raises(ValueError, match="optimization was not checked"):
+        session_module.ResearchSession(live_config)
+    config["pipeline_optimization"] = "optimized"
     cli.exp.write_json(live_config, config)
     live = session_module.ResearchSession(live_config)
     local = dict(inputs, sample_uniforms=spec.frame_uniforms(17, "live", 0, 3, 64, "cpu"))
@@ -499,3 +602,91 @@ def test_graph_sets_are_released_between_sampling_modes(research, monkeypatch):
     assert len(released) == 90
     assert not engines.runners
     assert all(record["released"] and record["resident_graphs"] == 0 for record in engines.graph_info().values())
+
+
+def test_native_profile_exports_variants_outside_capture_and_releases_graphs(monkeypatch, tmp_path):
+    import sys
+
+    cli = load_highperf_cli(monkeypatch)
+    selected = [dict(request_id=f"r{r}", frame_id=f) for r in range(2) for f in range(3)]
+    fingerprint = dict(device="npu:0", pipeline_optimization="optimized")
+    certificate = dict(
+        passed=True,
+        stage="complete",
+        scope="sampled_frame_correctness",
+        binding=fingerprint,
+        current_tree_sha256="old",
+        engines=["stock_graph", "tree16/pipeline_graph"],
+        configs=["tree16"],
+    )
+    correctness = tmp_path / "correctness.json"
+    correctness.write_text(json.dumps(certificate))
+    monkeypatch.setattr(cli, "frozen_trees", lambda _: {"configs": {"tree16": []}})
+    monkeypatch.setattr(cli, "selected_frames", lambda _: selected)
+    monkeypatch.setattr(cli, "current_configs", lambda _: ({"tree16": []}, "old"))
+    monkeypatch.setattr(cli, "binding", lambda *_: fingerprint)
+    monkeypatch.setattr(
+        cli, "pipeline", lambda: SimpleNamespace(OPTIMIZATIONS=("baseline", "kv_commit", "batched", "optimized"))
+    )
+    monkeypatch.setattr(cli.exp, "load_predictor", lambda _: lambda **inputs: inputs["codes"])
+    monkeypatch.setattr(cli.exp, "inputs_for", lambda _a, _m, f, **_kw: dict(codes=torch.tensor([[f["frame_id"]]])))
+    state = dict(active=False, sessions=0, steps=0, releases=0, warmups=0)
+
+    class Engines:
+        def __init__(self, *_):
+            pass
+
+        def decode(self, _name, inputs):
+            if not state["active"]:
+                state["warmups"] += 1
+            return inputs["codes"].clone(), {}
+
+        def release_graphs(self):
+            state["releases"] += 1
+
+        def graph_info(self):
+            return {"released": True}
+
+    class Profiler:
+        def __init__(self, **kwargs):
+            assert not kwargs["record_shapes"]
+            state["sessions"] += 1
+
+        def __enter__(self):
+            state["active"] = True
+            return self
+
+        def __exit__(self, *_):
+            state["active"] = False
+
+        def step(self):
+            state["steps"] += 1
+
+    monkeypatch.setattr(cli, "Engines", Engines)
+    monkeypatch.setattr(torch, "npu", SimpleNamespace(synchronize=lambda: None), raising=False)
+    monkeypatch.setitem(
+        sys.modules,
+        "torch_npu",
+        SimpleNamespace(
+            profiler=SimpleNamespace(
+                profile=Profiler,
+                ProfilerActivity=SimpleNamespace(CPU=0, NPU=1),
+                tensorboard_trace_handler=lambda path: path,
+                _ExperimentalConfig=lambda **kw: kw,
+                ExportType=SimpleNamespace(Text=0),
+                ProfilerLevel=SimpleNamespace(Level1=1),
+            )
+        ),
+    )
+    args = SimpleNamespace(
+        device="npu:0",
+        configs=["tree16"],
+        pipeline_optimization="optimized",
+        warmup=2,
+        sampling="both",
+        correctness=correctness,
+        results=tmp_path,
+    )
+    cli.profile(args, cli.exp.ReplayProgress(tmp_path, 10))
+    assert state == dict(active=False, sessions=10, steps=60, releases=10, warmups=20)
+    assert json.loads((tmp_path / "manifest.json").read_text())["scope"] == "six_frame_graph_diagnostic_not_benchmark"

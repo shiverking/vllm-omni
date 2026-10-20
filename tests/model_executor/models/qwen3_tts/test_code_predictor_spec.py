@@ -245,6 +245,44 @@ def test_npu_ancestor_attention_packs_queries_and_masks(research, monkeypatch):
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 @torch.inference_mode()
+def test_kv_first_fusion_inputs_are_bitwise_identical(research, monkeypatch, dtype):
+    from dataclasses import replace
+
+    predictor, spec, _ = research
+    attention = predictor.model.layers[0].self_attn
+    module = sys.modules[type(attention).__module__]
+    _, visible = spec.layout(3, [(0,), (1,), (0, 2)], "cpu")
+    mask = spec.canonical_mask(visible, predictor._num_groups + 1)
+    batch, seq = 2, visible.shape[0]
+    q = torch.randn(batch, attention.num_heads, seq, attention.head_dim, dtype=dtype)
+    k = torch.randn(batch, attention.num_kv_heads, seq, attention.head_dim, dtype=dtype)
+    v = torch.randn_like(k)
+    # Padding includes ignored keys; comparisons cover all rows and slots.
+    blocked = (~mask.ancestor_valid)[None].expand(batch, -1, -1).reshape(batch * seq, 1, 1, -1).contiguous()
+    optimized = replace(mask, gather_kv_first=True, blocked=blocked)
+    calls = []
+
+    def fusion(qp, kp, vp, heads, layout, **kwargs):
+        calls.append(
+            (
+                [x.clone() for x in (qp, kp, vp, kwargs["atten_mask"])],
+                [x.stride() for x in (qp, kp, vp, kwargs["atten_mask"])],
+                heads,
+                layout,
+            )
+        )
+        return (qp,)
+
+    monkeypatch.setattr(module, "torch_npu", SimpleNamespace(npu_fusion_attention=fusion), raising=False)
+    for variant in (mask, optimized):
+        attention._forward_npu_ancestor_attention(q, k, v, variant)
+    assert calls[0][1:] == calls[1][1:]
+    for left, right in zip(calls[0][0], calls[1][0]):
+        assert torch.equal(left, right)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@torch.inference_mode()
 def test_canonical_attention_preserves_logical_ancestors(research, dtype):
     model, spec, inputs = research
     model.to(dtype=dtype)

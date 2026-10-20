@@ -9,13 +9,14 @@ No host decision or cache inspection occurs inside a captured step.
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import torch
 
 from . import qwen3_code_predictor_spec as spec
 
 CANDIDATE_LAYOUT = "known_tail_plus_next3_v1"
+OPTIMIZATIONS = ("baseline", "kv_commit", "batched", "optimized")
 
 
 class PipelineCaptureError(RuntimeError):
@@ -87,11 +88,16 @@ class PipelineExecutor:
         temperature=0.9,
         top_k=50,
         graph_scope="step",
+        optimization="optimized",
     ):
         if execution not in ("eager", "graph"):
             raise ValueError("execution must be eager or graph")
         if graph_scope not in ("step", "backbone"):
             raise ValueError("graph_scope must be step or backbone")
+        if optimization not in OPTIMIZATIONS:
+            raise ValueError(f"unknown pipeline optimization: {optimization}")
+        self.optimization = optimization
+        self.batched = optimization in ("batched", "optimized")
         self.predictor = predictor
         self.paths = tuple(spec.validate_tree(paths))
         self.cache = cache
@@ -115,6 +121,10 @@ class PipelineExecutor:
         self.prefix = parameter.new_zeros(1, self.capacity, hidden)
         self.query = parameter.new_zeros(1, self.query_size, hidden)
         self.last_hidden = torch.zeros_like(self.query)
+        embed_dim = predictor.model.codec_embedding[0].weight.shape[-1]
+        self.embedding_pack = parameter.new_zeros(1, self.query_size, embed_dim)
+        self.debug_tensors = {}
+        self.executed_positions = []
         self.packed = parameter.new_zeros(1, self.capacity + self.query_size, hidden)
         self.state = self.codes.new_zeros(2)
         self.path_buffer = self.codes.new_zeros(4)
@@ -128,19 +138,23 @@ class PipelineExecutor:
         if self.layouts:
             meta = self.layouts[1]
             self.graph_positions = torch.zeros_like(meta["positions"])
-            self.graph_mask = type(meta["mask"])(
-                torch.zeros_like(meta["mask"].visibility),
-                torch.zeros_like(meta["mask"].ancestor_indices),
-                torch.zeros_like(meta["mask"].ancestor_valid),
+            self.graph_mask = self._optimize_mask(
+                type(meta["mask"])(
+                    torch.zeros_like(meta["mask"].visibility),
+                    torch.zeros_like(meta["mask"].ancestor_indices),
+                    torch.zeros_like(meta["mask"].ancestor_valid),
+                )
             )
         self.prefill_positions = torch.arange(2, device=self.device)[None]
         prefill_mask = torch.ones(2, 2, dtype=torch.bool, device=self.device).tril()
-        self.prefill_mask = spec.canonical_mask(prefill_mask, self.capacity)
+        self.prefill_mask = self._optimize_mask(spec.canonical_mask(prefill_mask, self.capacity))
         # Cached prefill writes to the temporary area, whose first row is capacity.
-        self.cached_prefill_mask = type(self.prefill_mask)(
-            self.prefill_mask.visibility,
-            self.prefill_mask.ancestor_indices + self.capacity,
-            self.prefill_mask.ancestor_valid,
+        self.cached_prefill_mask = self._optimize_mask(
+            type(self.prefill_mask)(
+                self.prefill_mask.visibility,
+                self.prefill_mask.ancestor_indices + self.capacity,
+                self.prefill_mask.ancestor_valid,
+            )
         )
         self.graphs = {}
         self.capture_seconds = 0.0
@@ -152,6 +166,15 @@ class PipelineExecutor:
         self.timer = spec.PhaseTimer(self.device, False)
         self.last_debug = {}
         self.last_position = None
+
+    def _optimize_mask(self, mask):
+        if self.optimization != "optimized":
+            return mask
+        return replace(
+            mask,
+            gather_kv_first=True,
+            blocked=(~mask.ancestor_valid).reshape(-1, 1, 1, mask.ancestor_valid.shape[-1]).contiguous(),
+        )
 
     def _layout(self, position):
         active = tuple(p for p in self.paths if position + len(p) < self.groups)
@@ -180,10 +203,12 @@ class PipelineExecutor:
         visible = torch.zeros(1, self.query_size, self.capacity + self.query_size, dtype=torch.bool)
         for i, row in enumerate(rows):
             visible[0, i, row] = True
-        mask = mask_type(
-            visible.to(self.device),
-            torch.tensor(indices, device=self.device),
-            torch.tensor(valid, device=self.device),
+        mask = self._optimize_mask(
+            mask_type(
+                visible.to(self.device),
+                torch.tensor(indices, device=self.device),
+                torch.tensor(valid, device=self.device),
+            )
         )
         # No-cache control recomputes fixed prefix slots followed by the same tree.
         dense_rows = []
@@ -193,9 +218,29 @@ class PipelineExecutor:
         full_mask = torch.zeros(self.capacity + self.query_size, self.capacity + self.query_size, dtype=torch.bool)
         for i, row in enumerate(dense_rows):
             full_mask[i, row] = True
-        dense_mask = spec.canonical_mask(full_mask.to(self.device), self.capacity)
+        dense_mask = self._optimize_mask(spec.canonical_mask(full_mask.to(self.device), self.capacity))
         full_positions = list(range(position + 1)) + [0] * (self.capacity - position - 1) + positions
         parents = [0 if len(p) == 1 else active.index(p[:-1]) + 1 for p in active]
+        depth = max(map(len, active), default=0)
+        embedding_groups, query_map, offset = [], [0], 1
+        for d in range(1, depth + 1):
+            ranks = sorted({p[-1] for p in active if len(p) == d})
+            embedding_groups.append((d, torch.tensor(ranks, device=self.device), offset))
+            offset += len(ranks)
+        for path in active:
+            d = len(path)
+            ranks = sorted({p[-1] for p in active if len(p) == d})
+            query_map.append(embedding_groups[d - 1][2] + ranks.index(path[-1]))
+        head_groups, grouped_nodes = [], []
+        for d in range(depth + 1):
+            target = position + d + 1
+            nodes = [0] if d == 0 else [i + 1 for i, p in enumerate(active) if len(p) == d]
+            if target < self.groups and nodes:
+                head_groups.append((target, torch.tensor(nodes, device=self.device)))
+                grouped_nodes.extend(nodes)
+        # Terminal nodes are never sampled. Their placeholder draws remain zero.
+        terminal = [i for i in range(len(active) + 1) if i not in grouped_nodes]
+        prediction_order = grouped_nodes + terminal
         return dict(
             active=active,
             positions=torch.tensor([positions], device=self.device),
@@ -203,6 +248,15 @@ class PipelineExecutor:
             full_positions=torch.tensor([full_positions], device=self.device),
             full_mask=dense_mask,
             parents=torch.tensor(parents, device=self.device, dtype=torch.long),
+            embedding_groups=embedding_groups,
+            embedding_count=offset,
+            query_map=torch.tensor(query_map, device=self.device),
+            head_groups=head_groups,
+            prediction_restore=torch.tensor(
+                [prediction_order.index(i) for i in range(len(active) + 1)], device=self.device
+            ),
+            terminal_count=len(terminal),
+            commit_offsets=torch.arange(min(depth + 1, self.capacity - position - 1), device=self.device),
         )
 
     def _sample(self, logits, position):
@@ -244,13 +298,23 @@ class PipelineExecutor:
             ]
             self.query.zero_()
             embed = predictor.model.codec_embedding[position - 1](self.pending)
-            self.query[:, :1].copy_(predictor.small_to_mtp_projection(embed))
             node_codes = []
-            for i, path in enumerate(active):
-                code = candidates[len(path) - 1][:, path[-1] : path[-1] + 1]
-                node_codes.append(code)
-                embed = predictor.model.codec_embedding[position + len(path) - 1](code)
-                self.query[:, i + 1 : i + 2].copy_(predictor.small_to_mtp_projection(embed))
+            if self.batched:
+                self.embedding_pack[:, :1].copy_(embed)
+                for d, ranks, offset in meta["embedding_groups"]:
+                    codes = candidates[d - 1].index_select(1, ranks)
+                    values = predictor.model.codec_embedding[position + d - 1](codes)
+                    self.embedding_pack[:, offset : offset + len(ranks)].copy_(values)
+                projected = predictor.small_to_mtp_projection(self.embedding_pack[:, : meta["embedding_count"]])
+                self.query[:, : len(active) + 1].copy_(projected.index_select(1, meta["query_map"]))
+                node_codes = [candidates[len(p) - 1][:, p[-1] : p[-1] + 1] for p in active]
+            else:
+                self.query[:, :1].copy_(predictor.small_to_mtp_projection(embed))
+                for i, path in enumerate(active):
+                    code = candidates[len(path) - 1][:, path[-1] : path[-1] + 1]
+                    node_codes.append(code)
+                    embed = predictor.model.codec_embedding[position + len(path) - 1](code)
+                    self.query[:, i + 1 : i + 2].copy_(predictor.small_to_mtp_projection(embed))
         with self.timer.phase("backbone_inclusive"):
             if self.execution == "graph" and self.graph_scope == "backbone":
                 self._stage_graph_layout(meta)
@@ -264,15 +328,36 @@ class PipelineExecutor:
                 hidden = predictor.model(self.packed, meta["full_positions"], meta["full_mask"])
                 hidden = hidden[:, self.capacity :]
         with self.timer.phase("sample_select"):
-            predictions = [self._sample(predictor.lm_head[position](hidden[:, 0]), position + 1)]
-            for i, path in enumerate(active):
-                next_position = position + len(path) + 1
-                predictions.append(
-                    self._sample(predictor.lm_head[next_position - 1](hidden[:, i + 1]), next_position)
-                    if next_position < self.groups
-                    else self.pending.new_zeros(1, 1)
-                )
-            predictions = torch.cat(predictions, dim=1).flatten()
+            logits, draws, logit_groups = [], [], []
+            if self.batched:
+                for target, nodes in meta["head_groups"]:
+                    values = predictor.lm_head[target - 1](hidden.index_select(1, nodes)[0])
+                    logits.append(values)
+                    logit_groups.append(nodes)
+                    draws.append(self._sample(values, target).reshape(1, -1))
+                if meta["terminal_count"]:
+                    draws.append(self.pending.new_zeros(1, meta["terminal_count"]))
+                predictions = torch.cat(draws, dim=1).index_select(1, meta["prediction_restore"]).flatten()
+            else:
+                for i, path in enumerate(((), *active)):
+                    target = position + len(path) + 1
+                    if target < self.groups:
+                        values = predictor.lm_head[target - 1](hidden[:, i])
+                        logits.append(values)
+                        logit_groups.append(i)
+                        draws.append(self._sample(values, target))
+                    else:
+                        draws.append(self.pending.new_zeros(1, 1))
+                predictions = torch.cat(draws, dim=1).flatten()
+            # Keep actual graph outputs alive for post-failure diagnostics and
+            # audit the batched Head result, rather than recomputing an M=1 Head.
+            self.debug_tensors[position] = dict(
+                candidates=candidates,
+                logits=logits,
+                logit_groups=logit_groups,
+                predictions=predictions,
+                batched=self.batched,
+            )
             tokens = torch.cat(node_codes, dim=1).flatten() if node_codes else self.codes.new_empty(0)
             selected, count, accepted, hit_path, parent = select_path(
                 predictions, meta["parents"], tokens, min(depth + 1, self.groups - position - 1)
@@ -291,25 +376,45 @@ class PipelineExecutor:
         with self.timer.phase("kv_commit"):
             # The known root and accepted candidate nodes have real KV. The new
             # tail usually does not; never commit it using a parent's state.
-            for d in range(min(depth + 1, self.capacity - position - 1)):
-                source = self.path_buffer[d : d + 1] + self.capacity
-                dest = position + 1 + d
-                if self.cache:
-                    for layer in self.layers:
-                        for storage in (layer.keys, layer.values):
-                            old = storage[:, :, dest : dest + 1]
-                            value = storage.index_select(2, source)
-                            old.copy_(torch.where(accepted >= d, value, old))
-                else:
-                    value = self.query.index_select(1, self.path_buffer[d : d + 1])
-                    old = self.prefix[:, dest : dest + 1]
-                    old.copy_(torch.where(accepted >= d, value, old))
+            self._commit(position, accepted)
         self.last_hidden.copy_(hidden)
+
+    def _commit(self, position, accepted):
+        offsets = self.layouts[position]["commit_offsets"]
+        length = len(offsets)
+        if self.optimization != "baseline":
+            source = self.path_buffer[:length]
+            valid = (accepted >= offsets).reshape(1, 1, length, 1)
+            if self.cache:
+                source = source + self.capacity
+                for layer in self.layers:
+                    for storage in (layer.keys, layer.values):
+                        old = storage[:, :, position + 1 : position + 1 + length]
+                        old.copy_(torch.where(valid, storage.index_select(2, source), old))
+            else:
+                old = self.prefix[:, position + 1 : position + 1 + length]
+                old.copy_(torch.where(valid.reshape(1, length, 1), self.query.index_select(1, source), old))
+            return
+        for d in range(length):
+            source = self.path_buffer[d : d + 1] + self.capacity
+            dest = position + 1 + d
+            if self.cache:
+                for layer in self.layers:
+                    for storage in (layer.keys, layer.values):
+                        old = storage[:, :, dest : dest + 1]
+                        value = storage.index_select(2, source)
+                        old.copy_(torch.where(accepted >= d, value, old))
+            else:
+                value = self.query.index_select(1, self.path_buffer[d : d + 1])
+                old = self.prefix[:, dest : dest + 1]
+                old.copy_(torch.where(accepted >= d, value, old))
 
     def _stage_graph_layout(self, meta):
         self.graph_positions.copy_(meta["positions"])
         self.graph_mask.ancestor_indices.copy_(meta["mask"].ancestor_indices)
         self.graph_mask.ancestor_valid.copy_(meta["mask"].ancestor_valid)
+        if self.graph_mask.blocked is not None:
+            self.graph_mask.blocked.copy_(meta["mask"].blocked)
 
     def _backbone(self):
         hidden = self.predictor.model(self.query, self.graph_positions, self.graph_mask, self.layers)
@@ -319,6 +424,7 @@ class PipelineExecutor:
         """Host attributes only; safe even after capture_end has failed."""
         return dict(
             scope=self.graph_scope,
+            optimization=self.optimization,
             count=len(self.graphs),
             position=self.capture_position,
             capture_seconds=self.capture_seconds,
@@ -410,7 +516,20 @@ class PipelineExecutor:
         self.prepared = True
 
     def snapshot(self):
+        def cpu(value):
+            if torch.is_tensor(value):
+                return value.detach().cpu()
+            if isinstance(value, dict):
+                return {k: cpu(v) for k, v in value.items()}
+            if isinstance(value, (list, tuple)):
+                return [cpu(v) for v in value]
+            return value
+
         return dict(
+            optimization=self.optimization,
+            step_outputs=cpu(self.debug_tensors.get(self.last_position)),
+            executed_steps={p: cpu(self.debug_tensors[p]) for p in self.executed_positions if p in self.debug_tensors},
+            rank_tree=[list(p) for p in self.paths],
             codes=self.codes.detach().cpu(),
             state=self.state.detach().cpu(),
             hit_path=self.path_buffer.detach().cpu(),
@@ -451,7 +570,15 @@ class PipelineExecutor:
                 continue
             serial = spec.reference_forward(predictor, torch.cat([prefix, *branch], dim=1))[:, -1]
             head = predictor.lm_head[next_position - 1]
-            left, right = head(hidden[:, i]), head(serial)
+            debug = self.debug_tensors[position]
+            if debug["batched"]:
+                group, row = next(
+                    (g, nodes.tolist().index(i)) for g, nodes in enumerate(debug["logit_groups"]) if i in nodes.tolist()
+                )
+                left = debug["logits"][group][row : row + 1]
+            else:
+                left = debug["logits"][debug["logit_groups"].index(i)]
+            right = head(serial)
             tolerance = 1e-5 if left.dtype == torch.float32 else 2e-2
             self.last_debug = dict(
                 position=position, rank_path=list(path), logits=left.detach().cpu(), serial_logits=right.detach().cpu()
@@ -463,6 +590,7 @@ class PipelineExecutor:
     @torch.inference_mode()
     def decode(self, *, audit=False, record_events=False, profile=False, **inputs):
         self.prepare(inputs)
+        self.executed_positions = []
         self.timer = spec.PhaseTimer(self.device, profile)
         for layer in self.layers:
             layer.timer = self.timer if profile else None
@@ -474,6 +602,8 @@ class PipelineExecutor:
         events, audit_max = [], 0.0
         while position < self.groups - 1:
             self.last_position = position
+            if audit or record_events:
+                self.executed_positions.append(position)
             self.graphs[position].replay() if self.execution == "graph" and self.graph_scope == "step" else self._step(
                 position
             )
@@ -490,6 +620,10 @@ class PipelineExecutor:
                         accepted=accepted,
                         backbone_calls=1,
                         cached_prefix_length=position + 1,
+                        draft_candidates=[
+                            t.detach().cpu().tolist()[0] for t in self.debug_tensors[position]["candidates"]
+                        ],
+                        accepted_path=self.path_buffer[: accepted + 1].cpu().tolist(),
                     )
                 )
             position += count
@@ -512,5 +646,6 @@ class PipelineExecutor:
             timings=self.timer.resolve(),
             attention_backend=spec.attention_backend(self.device),
             candidate_layout=CANDIDATE_LAYOUT,
+            pipeline_optimization=self.optimization,
             graph_scope=self.graph_scope if self.execution == "graph" else None,
         )

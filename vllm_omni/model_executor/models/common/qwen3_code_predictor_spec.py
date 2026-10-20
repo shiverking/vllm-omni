@@ -296,7 +296,7 @@ def sample(predictor, logits, position, uniforms, do_sample, temperature, top_k)
     if top_k > 0:
         values = scaled.topk(min(top_k, scaled.shape[-1]), dim=-1).values
         scaled = scaled.masked_fill(scaled < values[..., -1:], float("-inf"))
-    return predictor._sample_codes_gumbel(scaled, uniforms=uniforms[:, position - 1])
+    return predictor._sample_codes_gumbel(scaled, uniforms=uniforms[:, position - 1].expand_as(scaled))
 
 
 def select_covered(predictions, parents, tokens, max_steps):

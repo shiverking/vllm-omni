@@ -45,6 +45,8 @@ class CanonicalAttentionMask:
     visibility: torch.Tensor
     ancestor_indices: torch.Tensor
     ancestor_valid: torch.Tensor
+    gather_kv_first: bool = False
+    blocked: torch.Tensor | None = None
 
 
 if current_omni_platform.is_npu():
@@ -293,6 +295,17 @@ class CodePredictorAttention(nn.Module):
         indices = mask.ancestor_indices.reshape(-1)
 
         def gather(value):
+            if mask.gather_kv_first:
+                # Gather in KV-head layout, then materialize the exact dense
+                # B*Q,H,W,D layout used by the reference fusion invocation.
+                return (
+                    value.index_select(2, indices)
+                    .reshape(bsz, self.num_kv_heads, seq_len, width, dim)
+                    .permute(0, 2, 1, 3, 4)
+                    .reshape(bsz * seq_len, self.num_kv_heads, width, dim)
+                    .repeat_interleave(self.num_queries_per_kv, dim=1)
+                    .contiguous()
+                )
             value = value.repeat_interleave(self.num_queries_per_kv, dim=1)
             return (
                 value.index_select(2, indices)
@@ -303,8 +316,11 @@ class CodePredictorAttention(nn.Module):
             )
 
         with timer.phase("attention_gather_nested") if timer is not None else nullcontext():
-            blocked = (~mask.ancestor_valid)[None].expand(bsz, -1, -1)
-            blocked = blocked.reshape(bsz * seq_len, 1, 1, width).contiguous()
+            if mask.blocked is None:
+                blocked = (~mask.ancestor_valid)[None].expand(bsz, -1, -1)
+                blocked = blocked.reshape(bsz * seq_len, 1, 1, width).contiguous()
+            else:
+                blocked = mask.blocked
             query = q.transpose(1, 2).reshape(bsz * seq_len, heads, 1, dim).contiguous()
             keys, values = gather(k), gather(v)
         result = torch_npu.npu_fusion_attention(
