@@ -237,9 +237,72 @@ def diagnose(args):
     print(f"Saved {stem}.json and .pt. Diagnostic only; no acceptance gates changed.", flush=True)
 
 
+@torch.inference_mode()
+def probe_frames(args):
+    """Small correctness probe, separate from full replay and performance."""
+    import torch_npu  # noqa: F401
+
+    frozen = json.loads((args.output / "trees.json").read_text(encoding="utf-8"))
+    signature = frozen.pop("sha256")
+    if exp.digest(frozen) != signature:
+        raise ValueError("frozen tree digest changed")
+    manifest = json.loads((args.output / "manifest.json").read_text(encoding="utf-8"))
+    if frozen["dataset_sha256"] != exp.digest(manifest["dataset"]):
+        raise ValueError("dataset changed after calibration")
+    targets = {("smoke011", 0), ("smoke011", 2), ("smoke030", 129)}
+    selected = [f for f in exp.frames(args, "test") if (f["request_id"], f["frame_id"]) in targets]
+    if len(selected) != len(targets):
+        raise ValueError("missing one of the three diagnostic frames")
+    configs = {"reference": [], **frozen["configs"]}
+    total = len(selected) * 2 * len(configs)
+    result = dict(
+        scope="three_frame_probe_only", compact_kv=args.compact_kv, passed=False, tree_sha256=signature, checks=[]
+    )
+    stem = "fusion_compact_kv_probe" if args.compact_kv else "fusion_explicit_mask_probe"
+    destination = args.output / f"{stem}.json"
+    exp.write_json(destination, result)
+    print(f"Loading predictor; {total} checks, stop at first failure.", flush=True)
+    model, spec = exp.load_predictor(args), exp.spec_module()
+    install_probe(model, args.compact_kv)
+    for frame in selected:
+        for greedy in (True, False):
+            inputs = exp.inputs_for(args, model, frame, greedy)
+            stock = model(**inputs).clone()
+            for name, paths in configs.items():
+                row = dict(request_id=frame["request_id"], frame_id=frame["frame_id"], greedy=greedy, config=name)
+                print(f"Starting {len(result['checks']) + 1}/{total}: {row}", flush=True)
+                try:
+                    codes, info = spec.decode(model, **inputs, paths=paths, audit=True)
+                    row["code_equal"] = torch.equal(stock, codes)
+                    row["audit_max_logit_error"] = info["audit_max_logit_error"]
+                    if not row["code_equal"]:
+                        row.update(
+                            positions=(codes != stock).nonzero().cpu().tolist(),
+                            stock_codes=stock.cpu().tolist(),
+                            candidate_codes=codes.cpu().tolist(),
+                        )
+                except Exception as exc:
+                    row["error"] = repr(exc)
+                    if isinstance(exc, spec.NodeAuditError):
+                        artifact = args.output / f"{stem}_node_failure.pt"
+                        torch.save(exc.payload, artifact)
+                        row["node_artifact"] = artifact.name
+                result["checks"].append(row)
+                exp.write_json(destination, result)
+                print(json.dumps(row), flush=True)
+                if "error" in row or not row.get("code_equal", False):
+                    print(f"FAILED; saved {destination}. Full replay gates unchanged.", flush=True)
+                    return
+    result["passed"] = True
+    exp.write_json(destination, result)
+    print(f"PASSED {total}/{total}; saved {destination}. Not a full correctness or performance pass.", flush=True)
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(__doc__)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--device", default="npu:0")
     parser.add_argument("--compact-kv", action="store_true", help="probe batched queries with contiguous ancestor KV")
-    diagnose(parser.parse_args())
+    parser.add_argument("--probe-frames", action="store_true", help="check three real frames in both sampling modes")
+    args = parser.parse_args()
+    (probe_frames if args.probe_frames else diagnose)(args)
