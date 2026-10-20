@@ -285,6 +285,47 @@ class CodePredictorAttention(nn.Module):
             sync=True,
         )[0]
 
+    def _forward_npu_ancestor_attention(self, q, k, v, mask):
+        """Batch queries with contiguous ancestor KV, using cached indices."""
+        bsz, heads, seq_len, dim = q.shape
+        width = mask.ancestor_indices.shape[1]
+        indices = mask.ancestor_indices.reshape(-1)
+
+        def gather(value):
+            value = value.repeat_interleave(self.num_queries_per_kv, dim=1)
+            return (
+                value.index_select(2, indices)
+                .reshape(bsz, heads, seq_len, width, dim)
+                .permute(0, 2, 1, 3, 4)
+                .reshape(bsz * seq_len, heads, width, dim)
+                .contiguous()
+            )
+
+        blocked = (~mask.ancestor_valid)[None].expand(bsz, -1, -1)
+        blocked = blocked.reshape(bsz * seq_len, 1, 1, width).contiguous()
+        result = torch_npu.npu_fusion_attention(
+            q.transpose(1, 2).reshape(bsz * seq_len, heads, 1, dim).contiguous(),
+            gather(k),
+            gather(v),
+            heads,
+            "BNSD",
+            pse=None,
+            padding_mask=None,
+            atten_mask=blocked,
+            scale=float(self.scaling),
+            keep_prob=1.0,
+            pre_tockens=2147483647,
+            next_tockens=2147483647,
+            inner_precise=0,
+            prefix=None,
+            actual_seq_qlen=None,
+            actual_seq_kvlen=None,
+            sparse_mode=0,
+            gen_mask_parallel=True,
+            sync=True,
+        )[0]
+        return result.reshape(bsz, seq_len, heads, dim).transpose(1, 2)
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -314,7 +355,9 @@ class CodePredictorAttention(nn.Module):
         else:
             q = (q * cos) + (_rotate_half(q) * sin)
             k = (k * cos) + (_rotate_half(k) * sin)
-        if isinstance(attention_mask, CanonicalAttentionMask):
+        if isinstance(attention_mask, CanonicalAttentionMask) and current_omni_platform.is_npu():
+            attn_out = self._forward_npu_ancestor_attention(q, k, v, attention_mask)
+        elif isinstance(attention_mask, CanonicalAttentionMask):
             # The same logical prefix must have the same reduction order and
             # width, regardless of where its ancestors sit in the packed tree.
             # Explicit FP32 multiply/reduce also avoids reduced-precision FP32

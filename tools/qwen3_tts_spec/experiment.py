@@ -500,6 +500,21 @@ def replay(args):
                     f"completed request={frame['request_id']} frame={frame['frame_id']} "
                     f"mode={'greedy' if greedy else 'sampling'} config={name} mismatches={len(mismatches)}"
                 )
+                if mismatches and getattr(args, "fail_fast", False):
+                    write_rows(args.output / "events.jsonl", events)
+                    write_rows(args.output / "diagnostics.jsonl", diagnostics)
+                    write_json(
+                        args.output / "correctness.json",
+                        dict(
+                            passed=False,
+                            partial=True,
+                            mismatches=mismatches,
+                            tree_sha256=signature,
+                            attention_backend=spec.attention_backend(args.device),
+                        ),
+                    )
+                    progress.message("Correctness FAILED; saved partial results and stopped at first code mismatch.")
+                    raise RuntimeError("code differences found; inspect correctness.json")
     progress.message("Saving correctness events and diagnostics.")
     write_rows(args.output / "events.jsonl", events)
     write_rows(args.output / "diagnostics.jsonl", diagnostics)
@@ -583,7 +598,7 @@ def replay(args):
                                 "npu_fusion_attention_sparse_mode2" if device.type == "npu" else "torch_sdpa"
                             )
                             if kind == "stock"
-                            else spec.ATTENTION_BACKEND,
+                            else spec.attention_backend(device),
                         )
                     )
                     # Printing/file I/O must remain outside measured() above.
@@ -748,6 +763,9 @@ def main():
     parser.add_argument("--e2e-label", choices=("stock", "chain", "tree8", "tree16", "tree32"))
     parser.add_argument("--greedy", action="store_true")
     parser.add_argument("--progress-interval", type=float, default=10.0, help="replay progress interval in seconds")
+    parser.add_argument(
+        "--fail-fast", action="store_true", help="stop replay at the first code mismatch, saving results"
+    )
     args = parser.parse_args()
     if args.device.startswith("npu"):
         import torch_npu  # noqa: F401

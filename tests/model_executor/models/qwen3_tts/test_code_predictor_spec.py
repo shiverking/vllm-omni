@@ -188,6 +188,45 @@ def test_layout_and_ancestor_closure(research):
             spec.validate_tree(invalid)
 
 
+@torch.inference_mode()
+def test_npu_ancestor_attention_packs_queries_and_masks(research, monkeypatch):
+    predictor, spec, _ = research
+    attention = predictor.model.layers[0].self_attn
+    module = sys.modules[type(attention).__module__]
+    _, visible = spec.layout(3, [(0,), (1,), (0, 2)], "cpu")
+    mask = spec.canonical_mask(visible, predictor._num_groups + 1)
+    seq, batch = visible.shape[0], 2
+    q = torch.randn(batch, attention.num_heads, seq, attention.head_dim)
+    k = torch.randn(batch, attention.num_kv_heads, seq, attention.head_dim)
+    v = torch.randn_like(k)
+    calls = []
+
+    def fusion(qp, kp, vp, heads, layout, **kwargs):
+        calls.append(True)
+        assert layout == "BNSD" and heads == attention.num_heads
+        assert qp.shape == (batch * seq, heads, 1, attention.head_dim)
+        assert kp.shape == vp.shape == (batch * seq, heads, predictor._num_groups + 1, attention.head_dim)
+        assert kwargs["sparse_mode"] == 0
+        assert kwargs["atten_mask"].shape == (batch * seq, 1, 1, predictor._num_groups + 1)
+        return (
+            torch.nn.functional.scaled_dot_product_attention(
+                qp, kp, vp, attn_mask=~kwargs["atten_mask"], scale=kwargs["scale"]
+            ),
+        )
+
+    monkeypatch.setattr(module, "torch_npu", SimpleNamespace(npu_fusion_attention=fusion), raising=False)
+    actual = attention._forward_npu_ancestor_attention(q, k, v, mask)
+    expected = torch.nn.functional.scaled_dot_product_attention(
+        q,
+        k.repeat_interleave(attention.num_queries_per_kv, dim=1),
+        v.repeat_interleave(attention.num_queries_per_kv, dim=1),
+        attn_mask=visible,
+        scale=attention.scaling,
+    )
+    torch.testing.assert_close(actual, expected)
+    assert calls == [True]
+
+
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 @torch.inference_mode()
 def test_canonical_attention_preserves_logical_ancestors(research, dtype):

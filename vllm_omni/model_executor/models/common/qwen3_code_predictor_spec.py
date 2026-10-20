@@ -21,6 +21,12 @@ import torch.nn.functional as F
 ATTENTION_BACKEND = "canonical_ancestor_fp32_reduce"
 
 
+def attention_backend(device):
+    if torch.device(device).type == "npu":
+        return "npu_fusion_attention_compact_ancestor_sparse_mode0"
+    return ATTENTION_BACKEND
+
+
 def canonical_mask(mask, width):
     from .qwen3_code_predictor import CanonicalAttentionMask
 
