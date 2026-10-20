@@ -28,6 +28,11 @@ def test_fusion_diagnostic_padding_keeps_rope_positions_in_bounds(monkeypatch):
     )
     diagnostic = importlib.util.module_from_spec(module_spec)
     module_spec.loader.exec_module(diagnostic)
+    frames = [dict(request_id=rid, frame_id=i) for rid, size in (("b", 2), ("a", 10)) for i in range(size)]
+    selected = diagnostic.select_request_frames(list(reversed(frames)), 3)
+    assert [(f["request_id"], f["frame_id"]) for f in selected] == [("a", 0), ("a", 4), ("a", 9), ("b", 0), ("b", 1)]
+    with pytest.raises(ValueError):
+        diagnostic.select_request_frames(frames, 0)
     positions = diagnostic.padded_position_ids(13, 43, "cpu")
     assert torch.equal(positions[:, :13], torch.arange(13)[None])
     assert torch.count_nonzero(positions[:, 13:]) == 0

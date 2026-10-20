@@ -249,16 +249,28 @@ def probe_frames(args):
     manifest = json.loads((args.output / "manifest.json").read_text(encoding="utf-8"))
     if frozen["dataset_sha256"] != exp.digest(manifest["dataset"]):
         raise ValueError("dataset changed after calibration")
-    targets = {("smoke011", 0), ("smoke011", 2), ("smoke030", 129)}
-    selected = [f for f in exp.frames(args, "test") if (f["request_id"], f["frame_id"]) in targets]
-    if len(selected) != len(targets):
-        raise ValueError("missing one of the three diagnostic frames")
+    test_frames = exp.frames(args, "test")
+    if args.frames_per_request is not None:
+        selected = select_request_frames(test_frames, args.frames_per_request)
+    else:
+        targets = {("smoke011", 0), ("smoke011", 2), ("smoke030", 129)}
+        selected = [f for f in test_frames if (f["request_id"], f["frame_id"]) in targets]
+        if len(selected) != len(targets):
+            raise ValueError("missing one of the three diagnostic frames")
     configs = {"reference": [], **frozen["configs"]}
     total = len(selected) * 2 * len(configs)
     result = dict(
-        scope="three_frame_probe_only", compact_kv=args.compact_kv, passed=False, tree_sha256=signature, checks=[]
+        scope="sampled_correctness_probe_only",
+        compact_kv=args.compact_kv,
+        passed=False,
+        tree_sha256=signature,
+        checks=[],
+        frames_per_request=args.frames_per_request,
+        selected_frames=[dict(request_id=f["request_id"], frame_id=f["frame_id"]) for f in selected],
     )
     stem = "fusion_compact_kv_probe" if args.compact_kv else "fusion_explicit_mask_probe"
+    if args.frames_per_request is not None:
+        stem += f"_per_request_{args.frames_per_request}"
     destination = args.output / f"{stem}.json"
     exp.write_json(destination, result)
     print(f"Loading predictor; {total} checks, stop at first failure.", flush=True)
@@ -298,11 +310,30 @@ def probe_frames(args):
     print(f"PASSED {total}/{total}; saved {destination}. Not a full correctness or performance pass.", flush=True)
 
 
+def select_request_frames(frames, count):
+    """Fixed evenly spaced frame positions, independent of observed errors."""
+    if count <= 0:
+        raise ValueError("frames-per-request must be positive")
+    requests = {}
+    for frame in frames:
+        requests.setdefault(frame["request_id"], []).append(frame)
+    selected = []
+    for request_id in sorted(requests):
+        ordered = sorted(requests[request_id], key=lambda f: f["frame_id"])
+        n = min(count, len(ordered))
+        offsets = [0] if n == 1 else [i * (len(ordered) - 1) // (n - 1) for i in range(n)]
+        selected.extend(ordered[i] for i in offsets)
+    return selected
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(__doc__)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--device", default="npu:0")
     parser.add_argument("--compact-kv", action="store_true", help="probe batched queries with contiguous ancestor KV")
     parser.add_argument("--probe-frames", action="store_true", help="check three real frames in both sampling modes")
+    parser.add_argument("--frames-per-request", type=int, help="probe evenly spaced frames from each test request")
     args = parser.parse_args()
+    if args.frames_per_request is not None and (not args.probe_frames or args.frames_per_request <= 0):
+        parser.error("--frames-per-request requires --probe-frames and a positive count")
     (probe_frames if args.probe_frames else diagnose)(args)
