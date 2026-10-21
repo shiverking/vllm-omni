@@ -51,12 +51,23 @@ class Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM(CodePredictorWrapp
         self.talker_config = talker_config
         self._vllm_config = vllm_config
         self.research = None
+        self.playback = None
+        additional = getattr(vllm_config, "additional_config", None)
+        playback_config = additional.get("tts_playback_experiment") if isinstance(additional, dict) else None
+        if playback_config:
+            from vllm_omni.model_executor.models.common.qwen3_tts_playback_session import PlaybackSession
+
+            self.playback = PlaybackSession(playback_config)
         if os.environ.get("VLLM_OMNI_TTS_SPEC_CONFIG"):
             from vllm_omni.model_executor.models.common.qwen3_code_predictor_research import ResearchSession
 
             self.research = ResearchSession(os.environ["VLLM_OMNI_TTS_SPEC_CONFIG"])
 
     def forward(self, *args, **kwargs):
+        if getattr(self, "playback", None) is not None:
+            bound = inspect.signature(super().forward).bind(*args, **kwargs)
+            bound.apply_defaults()
+            return self.playback.forward(self, super().forward, dict(bound.arguments))
         if getattr(self, "research", None) is None:
             return super().forward(*args, **kwargs)
         bound = inspect.signature(super().forward).bind(*args, **kwargs)

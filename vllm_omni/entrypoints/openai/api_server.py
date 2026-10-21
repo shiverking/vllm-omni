@@ -1377,7 +1377,15 @@ async def create_speech(request: OpenAICreateSpeechRequest, raw_request: Request
         )
         return _error_response_to_json_response(err, status_code=HTTPStatus.NOT_FOUND)
     try:
-        result = await handler.create_speech(request, raw_request)
+        research_id = raw_request.headers.get("x-tts-playback-request-id")
+        if research_id is not None:
+            if not research_id.startswith("speech-rvq-") or len(research_id) > 128 or not all(
+                char.isalnum() or char in "-_" for char in research_id
+            ):
+                raise HTTPException(status_code=400, detail="Invalid playback research request identity")
+            result = await handler.create_speech(request, raw_request, request_id=research_id)
+        else:
+            result = await handler.create_speech(request, raw_request)
         if isinstance(result, ErrorResponse):
             return _error_response_to_json_response(result)
         return result

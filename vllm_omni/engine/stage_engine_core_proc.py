@@ -109,6 +109,14 @@ class StageEngineCoreProc(EngineCoreProc):
         super().__init__(*args, **kwargs)
         if _bind_native_data_plane_ready_sink(self.model_executor, self.scheduler):
             logger.info("Bound native MRv2 connector readiness directly to the scheduler inbox.")
+        config = kwargs.get("vllm_config", getattr(self, "vllm_config", None))
+        playback_path = (getattr(config, "additional_config", None) or {}).get("tts_playback_experiment")
+        if playback_path:
+            from vllm_omni.engine.playback_stage import PlaybackStage
+
+            self._playback_stage = PlaybackStage(self, playback_path, config.model_config.stage_id)
+            # No batch-queue pre-submission can bypass this full-frame lease.
+            self.step_fn = self._playback_stage.step
 
     def preprocess_add_request(self, request: OmniEngineCoreRequest) -> tuple[Any, int]:
         """Preserve omni payloads when vLLM builds its scheduler request."""

@@ -2499,6 +2499,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         self,
         request: OpenAICreateSpeechRequest,
         raw_request: Request | None = None,
+        request_id: str | None = None,
     ):
         """
         Create Speech API similar to OpenAI's API.
@@ -2539,7 +2540,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             logger.error("Error with model %s", error_check_ret)
             return error_check_ret
 
-        request_id = f"speech-{random_uuid()}"
+        request_id = request_id or f"speech-{random_uuid()}"
         request_start_s = time.perf_counter()
         request_arrival_ts = (
             float(getattr(raw_request.state, "request_timestamp", time.time()))

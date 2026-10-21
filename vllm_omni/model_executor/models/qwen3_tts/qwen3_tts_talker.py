@@ -472,7 +472,7 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
                 talker_config=self.talker_config,
                 prefix="code_predictor",
             )
-        if self.code_predictor.research is not None:
+        if self.code_predictor.research is not None or getattr(self.code_predictor, "playback", None) is not None:
             # Variable-length tree traversal and collection are eager only.
             self.talker_mtp_graph_safe = False
 
@@ -1538,6 +1538,8 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         if top_p is None:
             top_p = float(subtalker_params.get("top_p", 1.0))
 
+        if getattr(self.code_predictor, "playback", None) is not None:
+            self.code_predictor.playback.request_ids = self._batch_req_ids
         audio_codes = self.code_predictor(
             layer0_code=input_ids.reshape(bsz, 1),
             layer0_embed=last_id_hidden,
