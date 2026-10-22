@@ -227,3 +227,16 @@ def test_prefill_diagnostic_matches_cpu_and_removes_hooks(models, monkeypatch): 
     for trace in (short_trace, cache_trace, padded_trace):
         assert diagnostic.compare(trace["head1.logits"], long_trace["head1.logits"])["outside_tolerance"] == 0
     assert all(not m._forward_hooks and not m._forward_pre_hooks for m in wrapper.model.modules())
+
+
+def test_stock_row_difference_reports_first_code_and_its_logits():
+    batch = torch.tensor([[0, 1, 2], [0, 2, 1]])
+    single = torch.tensor([[0, 1, 2]])
+    batch_logits = [torch.tensor([[0.0, 2.0, 1.0], [0.0, 1.0, 2.0]])] * 2
+    single_logits = [torch.tensor([[0.0, 2.0, 1.0]])] * 2
+    assert exp.stock_row_difference(batch, single, batch_logits, single_logits, 0) is None
+    result = exp.stock_row_difference(batch, single, batch_logits, single_logits, 1)
+    assert result["position"] == 1
+    assert result["different_positions"] == [1, 2]
+    assert result["first_token_logits"]["stock_batch_top5"][0] == 2
+    assert result["first_token_logits"]["stock_single_top5"][0] == 1

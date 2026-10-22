@@ -456,6 +456,30 @@ def collect(args, progress):
     validate_capture(args.results, args.model)
 
 
+def stock_row_difference(batch_codes, single_codes, batch_logits, single_logits, row):
+    positions = torch.nonzero(batch_codes[row] != single_codes[0]).flatten().tolist()
+    if not positions:
+        return None
+    position = positions[0]
+    result = dict(
+        row=row,
+        position=position,
+        different_positions=positions,
+        stock_batch_codes=batch_codes[row].tolist(),
+        stock_single_codes=single_codes[0].tolist(),
+    )
+    if position > 0:
+        left, right = batch_logits[position - 1][row].float(), single_logits[position - 1][0].float()
+        result["first_token_logits"] = dict(
+            max_abs=(left - right).abs().max().item(),
+            stock_batch_top5=left.topk(min(5, left.numel())).indices.tolist(),
+            stock_batch_top5_values=left.topk(min(5, left.numel())).values.tolist(),
+            stock_single_top5=right.topk(min(5, right.numel())).indices.tolist(),
+            stock_single_top5_values=right.topk(min(5, right.numel())).values.tolist(),
+        )
+    return result
+
+
 @torch.inference_mode()
 def check(args, progress):
     from vllm_omni.model_executor.models.common.qwen3_code_predictor_ar import CachedARExecutor
@@ -477,6 +501,7 @@ def check(args, progress):
     progress.begin("逐位置/输出/重放/批处理检查", len(matrix))
     context, inputs = {}, {}
     stock_logits, audit, expected = [], [], None
+    failure_details = None
     try:
         for size, sample, batch in matrix:
             inputs = batch_inputs(batch, args.device)
@@ -539,7 +564,43 @@ def check(args, progress):
             # Independent single-row baseline also catches padding/layout effects.
             for i in range(size):
                 single = {k: v[i : i + 1] if torch.is_tensor(v) else v for k, v in inputs.items()}
-                if not torch.equal(w(**single), expected[i : i + 1]):
+                context = dict(
+                    batch=size,
+                    sampling=sample,
+                    frames=[(f["request_id"], f["frame_id"]) for f in batch],
+                    engine="stock",
+                    phase="batch_vs_single",
+                    row=i,
+                    request_id=batch[i]["request_id"],
+                    frame_id=batch[i]["frame_id"],
+                )
+                single_logits = []
+                hooks = [
+                    head.register_forward_hook(lambda mod, inp, out: single_logits.append(out.detach().clone()))
+                    for head in w.lm_head
+                ]
+                try:
+                    single_codes = w(**single).clone()
+                finally:
+                    for hook in hooks:
+                        hook.remove()
+                difference = stock_row_difference(expected, single_codes, stock_logits, single_logits, i)
+                if difference is not None:
+                    context["position"] = difference["position"]
+                    # Repeated calls distinguish stable batch dependence from state contamination.
+                    single_repeat = w(**single).clone()
+                    batch_repeat = w(**inputs).clone()
+                    difference["single_repeat_equal"] = torch.equal(single_codes, single_repeat)
+                    difference["batch_repeat_equal"] = torch.equal(expected, batch_repeat)
+                    failure_details = dict(
+                        summary=difference,
+                        single_inputs=single,
+                        single_logits=single_logits,
+                        single_codes=single_codes,
+                        single_repeat=single_repeat,
+                        batch_repeat=batch_repeat,
+                    )
+                    audit = []  # No stale cached-engine logits for a stock-only failure.
                     raise AssertionError("Stock batch vs single differs; diagnose numerical layout before benchmarking")
             progress.advance()
         # Explicit bucket transition after the full matrix (including replacement rows).
@@ -559,14 +620,24 @@ def check(args, progress):
                 audit=audit,
                 expected=expected,
                 caches={name: engine.snapshot() for name, engine in engines.items()},
+                failure_details=failure_details,
             ),
             args.results / "failure.pt",
         )
         write_json(
-            args.results / "correctness.json", dict(passed=False, error=repr(exc), context=context, binding=bind)
+            args.results / "correctness.json",
+            dict(
+                passed=False,
+                error=repr(exc),
+                context=context,
+                binding=bind,
+                details=failure_details["summary"] if failure_details is not None else None,
+            ),
         )
         print("[正确性检查失败] " + json.dumps(context, ensure_ascii=False), flush=True)
         print(f"原因: {exc}", flush=True)
+        if failure_details is not None:
+            print("[Stock 对照详情] " + json.dumps(failure_details["summary"], ensure_ascii=False), flush=True)
         print(f"诊断文件: {args.results / 'correctness.json'}；{args.results / 'failure.pt'}", flush=True)
         raise
     write_json(
