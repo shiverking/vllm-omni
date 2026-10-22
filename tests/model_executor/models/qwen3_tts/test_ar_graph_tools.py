@@ -222,6 +222,8 @@ def test_prefill_diagnostic_matches_cpu_and_removes_hooks(models, monkeypatch): 
     short_trace = diagnostic.trace_prefill(wrapper, short, short_positions)
     cache_trace = diagnostic.trace_prefill(wrapper, short, short_positions, buffers["cache"])
     assert "layers.0.self_attn.o_proj.input" in cache_trace
-    for trace in (short_trace, cache_trace):
+    padded_trace = diagnostic.trace_prefill(wrapper, short, short_positions, buffers["cache"], pad_down_proj=True)
+    assert all("forward" not in layer.mlp.down_proj.__dict__ for layer in wrapper.model.layers)
+    for trace in (short_trace, cache_trace, padded_trace):
         assert diagnostic.compare(trace["head1.logits"], long_trace["head1.logits"])["outside_tolerance"] == 0
     assert all(not m._forward_hooks and not m._forward_pre_hooks for m in wrapper.model.modules())

@@ -18,9 +18,24 @@ def compare(left, right):
 
 
 @torch.inference_mode()
-def trace_prefill(wrapper, inputs, positions, cache=None):
+def trace_prefill(wrapper, inputs, positions, cache=None, pad_down_proj=False):
     snapshots, handles = {}, []
     batch, length = inputs.shape[:2]
+    restores = []
+    if pad_down_proj:
+        # Diagnostic only: preserve actual row positions inside the stock shape.
+        for layer in wrapper.model.layers:
+            module = layer.mlp.down_proj
+            previous = module.__dict__.get("forward")
+            original = module.forward
+
+            def padded_forward(x, original=original):
+                padded = x.new_zeros((x.shape[0], wrapper._num_groups + 1, x.shape[-1]))
+                padded[:, : x.shape[1]].copy_(x)
+                return original(padded)[:, : x.shape[1]]
+
+            restores.append((module, previous))
+            module.forward = padded_forward
 
     def save(name, value):
         if torch.is_tensor(value) and value.ndim >= 3 and value.shape[:2] == (batch, length):
@@ -39,6 +54,11 @@ def trace_prefill(wrapper, inputs, positions, cache=None):
     finally:
         for handle in handles:
             handle.remove()
+        for module, previous in restores:
+            if previous is None:
+                del module.forward
+            else:
+                module.forward = previous
     return snapshots
 
 
@@ -75,11 +95,16 @@ def main():
         print(f"诊断前向: {name}, shape={tuple(tensor.shape)}", flush=True)
         positions = torch.arange(tensor.shape[1], device=tensor.device).unsqueeze(0).expand(bucket, -1).contiguous()
         runs[name] = trace_prefill(wrapper, tensor, positions, cache)
+    print("诊断前向: short_cached_padded_down_proj（仅补齐 MLP down_proj）", flush=True)
+    runs["short_cached_padded_down_proj"] = trace_prefill(
+        wrapper, short, buffers["positions"][0], buffers["cache"], pad_down_proj=True
+    )
     comparisons = []
     for left, right in (
         ("short_no_cache", "full_no_cache"),
         ("short_cached", "short_no_cache"),
         ("short_cached", "full_no_cache"),
+        ("short_cached_padded_down_proj", "full_no_cache"),
     ):
         details = [
             dict(module=name, **compare(value[:size], runs[right][name][:size])) for name, value in runs[left].items()
