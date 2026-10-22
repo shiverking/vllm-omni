@@ -380,11 +380,25 @@ class CodePredictorMLP(nn.Module):
             bias=False,
         )
         self.down_proj = nn.Linear(config.intermediate_size, config.hidden_size, bias=False)
+        self._ar_full_sequence_length = int(config.num_code_groups) + 1
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(self, hidden_states: torch.Tensor, cache_position: int | None = None) -> torch.Tensor:
         gate_up = self.gate_up_proj(hidden_states)
         gate, up = gate_up.split([self._intermediate_size, self._intermediate_size], dim=-1)
-        return self.down_proj(F.silu(gate) * up)
+        activated = F.silu(gate) * up
+        if cache_position is None:
+            return self.down_proj(activated)
+        # NPU BF16 down_proj changed rounding when the sequence shrank from 17
+        # to 2, enough to change greedy codes. Match stock's GEMM row geometry
+        # only for this projection; attention and gate_up still process new KV
+        # positions only. Position is static per captured step. Graph capture
+        # owns this temporary's allocation; replay needs no host allocation.
+        end = cache_position + activated.shape[1]
+        if cache_position < 0 or end > self._ar_full_sequence_length:
+            raise ValueError("Cached MLP position out of range")
+        padded = activated.new_zeros((activated.shape[0], self._ar_full_sequence_length, self._intermediate_size))
+        padded[:, cache_position:end].copy_(activated)
+        return self.down_proj(padded)[:, cache_position:end]
 
 
 # ===================================================================
@@ -423,7 +437,7 @@ class CodePredictorDecoderLayer(nn.Module):
             hidden_states = residual + hidden_states
             residual = hidden_states
             hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = self.mlp(hidden_states)
+        hidden_states = self.mlp(hidden_states, cache_position=cache_position if kv_cache is not None else None)
         hidden_states = residual + hidden_states
         return hidden_states
 

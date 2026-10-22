@@ -107,3 +107,28 @@ def test_invalid_options(models):
         executor(**inputs(17))
     with pytest.raises(ValueError, match="supports greedy"):
         executor(**inputs(1), top_p=0.8)
+
+
+@pytest.mark.parametrize("position,length", [(0, 2), (2, 1), (15, 1)])
+@torch.inference_mode()
+def test_cached_mlp_preserves_stock_row_geometry(models, position, length):
+    wrapper, _ = models
+    mlp = wrapper.model.layers[0].mlp
+    x = torch.randn(8, length, wrapper.config.hidden_size)
+    down_inputs, gate_shapes = [], []
+    h1 = mlp.down_proj.register_forward_pre_hook(lambda mod, args: down_inputs.append(args[0].clone()))
+    h2 = mlp.gate_up_proj.register_forward_pre_hook(lambda mod, args: gate_shapes.append(tuple(args[0].shape)))
+    try:
+        cached = mlp(x, cache_position=position)
+        stock = mlp(x)
+    finally:
+        h1.remove()
+        h2.remove()
+    assert down_inputs[0].shape[1] == 17
+    assert down_inputs[1].shape[1] == length
+    assert all(shape[1] == length for shape in gate_shapes)
+    torch.testing.assert_close(down_inputs[0][:, position : position + length], down_inputs[1], rtol=0, atol=0)
+    remaining = down_inputs[0].clone()
+    remaining[:, position : position + length].zero_()
+    assert torch.count_nonzero(remaining) == 0
+    torch.testing.assert_close(cached, stock, rtol=2e-5, atol=2e-5)
