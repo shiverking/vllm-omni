@@ -150,3 +150,51 @@ def test_bench_wiring_with_cpu_standins(capture, tmp_path, models, monkeypatch):
     result = exp.read_json(output / "summary.json")
     assert len(result) == 4
     assert all(row["speedup"] == 1.0 for row in result)
+
+
+@pytest.mark.parametrize(
+    "payload,reason",
+    [
+        ({"passed": False, "error": "logits differ", "context": {"position": 3}}, "正确性检查未通过"),
+        ({"passed": True, "probe_only": True, "binding": {}}, "三帧预检"),
+        ({"passed": True, "binding": {"code": {"executor.py": "old"}}}, "绑定差异"),
+        ([], "无法读取"),
+    ],
+)
+def test_certificate_explains_rejection(tmp_path, capsys, payload, reason):
+    path = tmp_path / "correctness.json"
+    exp.write_json(path, payload)
+    args = SimpleNamespace(correctness=path, results=tmp_path / "results")
+    with pytest.raises(ValueError, match="性能测试未启动"):
+        exp.certificate(args, {})
+    assert reason in capsys.readouterr().out
+    report = exp.read_json(args.results / "certificate_diagnostic.json")
+    assert report["reasons"]
+    if isinstance(payload, dict) and payload.get("error"):
+        assert report["previous_error"] == payload["error"]
+        assert report["previous_context"] == payload["context"]
+
+
+@pytest.mark.parametrize("contents", [None, "{invalid"])
+def test_certificate_unreadable(tmp_path, capsys, contents):
+    path = tmp_path / "correctness.json"
+    if contents is not None:
+        path.write_text(contents, encoding="utf-8")
+    with pytest.raises(ValueError, match="证书校验失败"):
+        exp.certificate(SimpleNamespace(correctness=path), {})
+    assert "无法读取" in capsys.readouterr().out
+
+
+def test_binding_differences_reports_exact_fields():
+    differences = exp.binding_differences(
+        {"code": {"executor.py": "old"}, "frames": {"a": None}},
+        {"code": {"executor.py": "new"}, "frames": {"b": None}},
+    )
+    assert [row["field"] for row in differences] == [
+        "binding.code.executor.py",
+        "binding.frames.a",
+        "binding.frames.b",
+    ]
+    assert differences[0]["saved"] == "old"
+    assert differences[0]["current"] == "new"
+    assert differences[1]["current_present"] is False

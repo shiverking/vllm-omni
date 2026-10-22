@@ -306,10 +306,77 @@ def batches(frames, size, count):
     return [[frames[(i * size + j) % len(frames)] for j in range(size)] for i in range(count)]
 
 
+def binding_differences(saved, current, path="binding"):
+    """Compare recorded and current provenance without hiding missing fields."""
+    if isinstance(saved, dict) and isinstance(current, dict):
+        differences = []
+        for key in sorted(saved.keys() | current.keys()):
+            child = f"{path}.{key}"
+            if key not in saved or key not in current:
+                differences.append(
+                    dict(
+                        field=child,
+                        saved=saved.get(key),
+                        current=current.get(key),
+                        saved_present=key in saved,
+                        current_present=key in current,
+                    )
+                )
+            else:
+                differences.extend(binding_differences(saved[key], current[key], child))
+        return differences
+    if saved != current:
+        return [dict(field=path, saved=saved, current=current)]
+    return []
+
+
 def certificate(args, expected):
-    cert = read_json(args.correctness)
-    if not cert.get("passed") or cert.get("probe_only") or cert.get("binding") != expected:
-        raise ValueError("A full sampled correctness certificate matching code/model/data/environment is required")
+    reasons, differences = [], []
+    cert = {}
+    try:
+        cert = read_json(args.correctness)
+        if not isinstance(cert, dict):
+            raise ValueError("证书根节点必须是 JSON 对象")
+    except (OSError, ValueError) as exc:
+        reasons.append(f"无法读取正确性证书: {exc}")
+        cert = {}
+    else:
+        if not cert.get("passed"):
+            reasons.append("正确性检查未通过，或缺少 passed 字段；先解决检查失败。")
+        if cert.get("probe_only"):
+            reasons.append("该证书仅覆盖三帧预检；请执行不带 --probe-only 的 60 帧抽样检查。")
+        differences = binding_differences(cert.get("binding"), expected)
+        if differences:
+            reasons.append(f"证书与本次运行存在 {len(differences)} 项绑定差异；需在当前配置下重新检查。")
+    if not reasons:
+        return
+    diagnostic = dict(
+        certificate=str(args.correctness),
+        reasons=reasons,
+        passed=cert.get("passed"),
+        probe_only=cert.get("probe_only"),
+        previous_error=cert.get("error"),
+        previous_context=cert.get("context"),
+        differences=differences,
+    )
+    print(f"\n[证书校验失败] {args.correctness}", flush=True)
+    for reason in reasons:
+        print(f"  - {reason}", flush=True)
+    for key in ("previous_error", "previous_context"):
+        if diagnostic[key] is not None:
+            print(f"  {key}: {json.dumps(diagnostic[key], ensure_ascii=False)}", flush=True)
+    for difference in differences[:30]:
+        print("  " + json.dumps(difference, ensure_ascii=False), flush=True)
+    if len(differences) > 30:
+        print(f"  另有 {len(differences) - 30} 项差异，见诊断文件。", flush=True)
+    if getattr(args, "results", None) is not None:
+        destination = Path(args.results) / "certificate_diagnostic.json"
+        try:
+            write_json(destination, diagnostic)
+            print(f"完整诊断已保存: {destination}", flush=True)
+        except OSError as exc:
+            print(f"诊断文件保存失败: {exc}", flush=True)
+    raise ValueError("正确性证书校验失败；具体原因见上方输出。性能测试未启动。")
 
 
 def collect(args, progress):
@@ -498,6 +565,9 @@ def check(args, progress):
         write_json(
             args.results / "correctness.json", dict(passed=False, error=repr(exc), context=context, binding=bind)
         )
+        print("[正确性检查失败] " + json.dumps(context, ensure_ascii=False), flush=True)
+        print(f"原因: {exc}", flush=True)
+        print(f"诊断文件: {args.results / 'correctness.json'}；{args.results / 'failure.pt'}", flush=True)
         raise
     write_json(
         args.results / "correctness.json",
