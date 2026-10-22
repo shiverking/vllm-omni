@@ -1957,6 +1957,12 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
             num_tokens_padded = decode_batch_size
         else:
             num_tokens_padded = batch_desc.num_tokens
+        telemetry = getattr(self.model, "ar_batch_telemetry", None)
+        if telemetry is not None:
+            telemetry.record(
+                decode_batch_size, num_tokens_padded,
+                isinstance(self.talker_mtp, current_omni_platform.get_graph_wrapper_cls()),
+            )
         req_input_ids = self.talker_mtp_input_ids.gpu[:num_tokens_padded]
         req_embeds = self.talker_mtp_inputs_embeds.gpu[:num_tokens_padded]
         last_talker_hidden = self.last_talker_hidden.gpu[:num_tokens_padded]

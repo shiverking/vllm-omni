@@ -473,6 +473,18 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
                 prefix="code_predictor",
             )
 
+        if self.code_predictor.ar_execution != "stock" or self.code_predictor.ar_capture_root:
+            self.talker_mtp_graph_safe = False
+
+        ar_extra = self.code_predictor._stage_connector_extra_config(vllm_config)
+        self.ar_batch_telemetry = None
+        if ar_extra.get("code_predictor_ar_telemetry"):
+            from vllm_omni.model_executor.models.common.qwen3_code_predictor_ar import BatchTelemetry
+
+            self.ar_batch_telemetry = BatchTelemetry(
+                ar_extra["code_predictor_ar_telemetry"], self.code_predictor.ar_execution
+            )
+
         # Constant logit mask: allow only codec ids [1, codebook_vocab_size) plus codec EOS.
         # Register the *disallowed* form so compute_logits doesn't recompute ~mask per step.
         vocab = int(self.talker_config.vocab_size)
