@@ -198,3 +198,30 @@ def test_binding_differences_reports_exact_fields():
     assert differences[0]["saved"] == "old"
     assert differences[0]["current"] == "new"
     assert differences[1]["current_present"] is False
+
+
+@torch.inference_mode()
+def test_prefill_diagnostic_matches_cpu_and_removes_hooks(models, monkeypatch):  # noqa: F811
+    import sys
+
+    monkeypatch.setitem(sys.modules, "experiment", exp)
+    spec = importlib.util.spec_from_file_location(
+        "prefill_diagnostic", ROOT / "tools/qwen3_tts_ar_graph/diagnose_prefill.py"
+    )
+    diagnostic = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(diagnostic)
+    wrapper, executor = models
+    buffers = executor._allocate(2)
+    buffers["inputs"].normal_()
+    short = buffers["inputs"][:, :2]
+    full = torch.zeros(2, wrapper._num_groups + 1, short.shape[-1])
+    full[:, :2].copy_(short)
+    long_positions = torch.arange(full.shape[1]).unsqueeze(0).expand(2, -1)
+    short_positions = long_positions[:, :2]
+    long_trace = diagnostic.trace_prefill(wrapper, full, long_positions)
+    short_trace = diagnostic.trace_prefill(wrapper, short, short_positions)
+    cache_trace = diagnostic.trace_prefill(wrapper, short, short_positions, buffers["cache"])
+    assert "layers.0.self_attn.o_proj.input" in cache_trace
+    for trace in (short_trace, cache_trace):
+        assert diagnostic.compare(trace["head1.logits"], long_trace["head1.logits"])["outside_tolerance"] == 0
+    assert all(not m._forward_hooks and not m._forward_pre_hooks for m in wrapper.model.modules())
