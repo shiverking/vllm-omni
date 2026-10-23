@@ -278,6 +278,7 @@ def binding(args, root, frames):
         environment=environment(args),
         buckets=BUCKETS,
         check_batches=CHECK_BATCHES,
+        stock_batch_policy=getattr(args, "stock_batch_policy", "strict"),
         modes=["stock", "eager", "kv_step", "kv_frame"],
         sampling=["greedy", "sampling"],
         temperature=0.9,
@@ -349,6 +350,8 @@ def certificate(args, expected):
         if differences:
             reasons.append(f"证书与本次运行存在 {len(differences)} 项绑定差异；需在当前配置下重新检查。")
     if not reasons:
+        if getattr(args, "results", None) is not None:
+            write_json(Path(args.results) / "verified_correctness.json", cert)
         return
     diagnostic = dict(
         certificate=str(args.correctness),
@@ -502,6 +505,7 @@ def check(args, progress):
     context, inputs = {}, {}
     stock_logits, audit, expected = [], [], None
     failure_details = None
+    stock_variations = []
     try:
         for size, sample, batch in matrix:
             inputs = batch_inputs(batch, args.device)
@@ -601,7 +605,30 @@ def check(args, progress):
                         batch_repeat=batch_repeat,
                     )
                     audit = []  # No stale cached-engine logits for a stock-only failure.
-                    raise AssertionError("Stock batch vs single differs; diagnose numerical layout before benchmarking")
+                    stable = difference["single_repeat_equal"] and difference["batch_repeat_equal"]
+                    if getattr(args, "stock_batch_policy", "strict") == "record-stable" and stable:
+                        variation = dict(context=context.copy(), **difference)
+                        stock_variations.append(variation)
+                        write_json(args.results / "stock_batch_variations.json", stock_variations)
+                        if len(stock_variations) == 1:
+                            torch.save(
+                                dict(
+                                    inputs=inputs,
+                                    stock_logits=stock_logits,
+                                    expected=expected,
+                                    failure_details=failure_details,
+                                ),
+                                args.results / "stock_batch_variation_first.pt",
+                            )
+                        print(
+                            "[Stock 跨 batch 稳定差异：单独记录] " + json.dumps(variation, ensure_ascii=False),
+                            flush=True,
+                        )
+                        failure_details = None
+                    else:
+                        raise AssertionError(
+                            "Stock batch vs single differs; diagnose numerical layout before benchmarking"
+                        )
             progress.advance()
         # Explicit bucket transition after the full matrix (including replacement rows).
         for size in (16, 1, 9, 2, 15, 3, 8, 1):
@@ -649,10 +676,17 @@ def check(args, progress):
             checks=len(rows),
             unique_frames=len(frames),
             graph_verified=args.device.startswith("npu"),
+            correctness_scope="cached_vs_stock_same_batch",
+            stock_batch_policy=getattr(args, "stock_batch_policy", "strict"),
+            stock_batch_invariant=not stock_variations,
+            stock_batch_variations=stock_variations,
             results=rows,
         ),
     )
-    progress.message(f"通过 {len(rows)} 项；CPU 结果不授权 NPU 性能测试。")
+    progress.message(
+        f"同 batch 对照通过 {len(rows)} 项；stock 跨 batch 稳定差异 {len(stock_variations)} 项。"
+        "存在差异时不代表跨 batch 输出一致；CPU 结果不授权 NPU 性能测试。"
+    )
 
 
 def measured(api, fn):
@@ -874,6 +908,16 @@ def report(args, progress):
         "区间是配对 batch 的探索性 bootstrap；帧被循环复用，不作为泛化证据。",
         "服务并发、实际 batch 分布和音频指标另见服务实验产物。",
     ]
+    verified = args.results / "verified_correctness.json"
+    if verified.exists():
+        cert = read_json(verified)
+        lines += [
+            "",
+            f"正确性策略：{cert.get('stock_batch_policy', 'strict')}。",
+            "缓存执行与相同 batch 的 stock 对照；跨 batch 一致性单独报告。",
+            f"stock 跨 batch 稳定差异：{len(cert.get('stock_batch_variations', []))} 项；"
+            f"跨 batch 输出一致：{cert.get('stock_batch_invariant', '未记录')}。",
+        ]
     write_json(args.results / "summary.json", summary)
     (args.results / "report.md").write_text("\n".join(lines), encoding="utf-8")
     progress.message("报告已保存。")
@@ -898,6 +942,13 @@ def parser():
             p.add_argument("--url", default="http://127.0.0.1:8000")
         else:
             p.add_argument("--input", type=Path, required=True)
+        if name in ("check", "bench", "profile"):
+            p.add_argument(
+                "--stock-batch-policy",
+                choices=("strict", "record-stable"),
+                default="strict",
+                help="strict rejects stock batch dependence; record-stable records reproducible stock differences",
+            )
         if name == "check":
             p.add_argument("--probe-only", action="store_true")
         if name in ("bench", "profile"):

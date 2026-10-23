@@ -240,3 +240,37 @@ def test_stock_row_difference_reports_first_code_and_its_logits():
     assert result["different_positions"] == [1, 2]
     assert result["first_token_logits"]["stock_batch_top5"][0] == 2
     assert result["first_token_logits"]["stock_single_top5"][0] == 1
+
+
+@pytest.mark.parametrize("policy", ["strict", "record-stable"])
+def test_stock_variation_policy_is_explicit(capture, tmp_path, models, monkeypatch, policy):  # noqa: F811
+    wrapper, _ = models
+    output = tmp_path / "check_policy"
+    output.mkdir()
+    args = SimpleNamespace(
+        input=capture, results=output, probe_only=True, device="cpu", model=exp.MODEL, stock_batch_policy=policy
+    )
+    monkeypatch.setattr(exp, "load_predictor", lambda *unused: wrapper)
+    monkeypatch.setattr(exp, "binding", lambda *unused: {})
+    monkeypatch.setattr(exp, "CHECK_BATCHES", [1])
+    # Inject one comparison result to test policy plumbing independently of CPU rounding.
+    seen = []
+
+    def one_variation(*unused):
+        if seen:
+            return None
+        seen.append(True)
+        return dict(row=0, position=1, different_positions=[1])
+
+    monkeypatch.setattr(exp, "stock_row_difference", one_variation)
+    if policy == "strict":
+        with pytest.raises(AssertionError, match="Stock batch vs single"):
+            exp.check(args, exp.Progress(output))
+        assert not exp.read_json(output / "correctness.json")["passed"]
+    else:
+        exp.check(args, exp.Progress(output))
+        cert = exp.read_json(output / "correctness.json")
+        assert cert["passed"] and not cert["stock_batch_invariant"]
+        assert cert["correctness_scope"] == "cached_vs_stock_same_batch"
+        assert len(cert["stock_batch_variations"]) == 1
+        assert (output / "stock_batch_variation_first.pt").exists()

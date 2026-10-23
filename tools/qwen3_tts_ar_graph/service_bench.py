@@ -286,6 +286,7 @@ def main():
     p.add_argument("--vllm-repo", type=Path, default=Path("/vllm-workspace/vllm"))
     p.add_argument("--ascend-repo", type=Path, default=Path("/vllm-workspace/vllm-ascend"))
     p.add_argument("--port", type=int, default=8091)
+    p.add_argument("--stock-batch-policy", choices=("strict", "record-stable"), default="strict")
     args = p.parse_args()
     try:
         run(args)
