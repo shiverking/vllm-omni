@@ -22,7 +22,6 @@ from experiment import (
     Progress,
     binding,
     capture_root,
-    certificate,
     read_json,
     select_frames,
     write_json,
@@ -73,7 +72,7 @@ def summarize(results):
     lines = [
         "# 原始 AR 多并发服务实验",
         "",
-        "帧级正确性是前置条件；性能不设置通过门槛。",
+        "本服务测试不校验帧级正确性证书；性能结果不代表新增正确性验证。",
         "",
         "客户端并发不等于实际推理 batch。batch 遥测包含预热请求，原始快照按轮保存。",
         "",
@@ -161,12 +160,21 @@ def reset_results(args):
 
 
 def prepare_results(args):
-    # Reset only this stage; certificate() may now write its copy here.
+    # Service benchmarks are independent of frame-correctness certificates.
     args._results_created = False
     reset_results(args)
     args._results_created = True
     root = capture_root(args.input)
-    certificate(args, binding(args, root, select_frames(root)))
+    write_json(
+        args.results / "service_run.json",
+        dict(
+            correctness_certificate_required=False,
+            correctness_certificate_checked=False,
+            legacy_correctness_argument=str(args.correctness) if getattr(args, "correctness", None) else None,
+            note="服务性能测试不校验帧级证书；本次运行不代表新增帧级正确性验证。",
+        ),
+    )
+    print("服务多并发测试：不校验正确性证书，开始准备服务。", flush=True)
     return root
 
 
@@ -315,7 +323,7 @@ def run(args):
 def main():
     p = argparse.ArgumentParser(__doc__)
     p.add_argument("--input", type=Path, required=True)
-    p.add_argument("--correctness", type=Path, required=True)
+    p.add_argument("--correctness", type=Path, help="兼容旧命令；服务测试不读取或校验此证书")
     p.add_argument("--results", type=Path, required=True)
     p.add_argument("--model", default=MODEL)
     p.add_argument("--device", default="npu:0")

@@ -312,34 +312,26 @@ def service_tool(monkeypatch):
     return service
 
 
-def test_service_creates_results_before_certificate(service_tool, tmp_path, monkeypatch):
+@pytest.mark.parametrize("certificate_kind", ["omitted", "missing", "failed", "stale"])
+def test_service_rerun_does_not_require_certificate(service_tool, tmp_path, monkeypatch, certificate_kind):
     cert = tmp_path / "correctness.json"
-    exp.write_json(cert, dict(passed=True, probe_only=False, binding={}))
-    args = SimpleNamespace(input=tmp_path / "capture", results=tmp_path / "service", correctness=cert)
+    if certificate_kind == "failed":
+        exp.write_json(cert, dict(passed=False, error="old failure"))
+    elif certificate_kind == "stale":
+        exp.write_json(cert, dict(passed=True, binding={"code": "old"}))
+    args = SimpleNamespace(input=tmp_path / "capture", results=tmp_path / "service")
+    if certificate_kind != "omitted":
+        args.correctness = cert
     monkeypatch.setattr(service_tool, "capture_root", lambda root: root)
-    monkeypatch.setattr(service_tool, "select_frames", lambda root: [])
-    monkeypatch.setattr(service_tool, "binding", lambda *unused: {})
-    assert service_tool.prepare_results(args) == tmp_path / "capture"
-    assert args._results_created
-    assert (args.results / "verified_correctness.json").exists()
+    assert service_tool.prepare_results(args) == args.input
+    info = exp.read_json(args.results / "service_run.json")
+    assert not info["correctness_certificate_required"]
+    assert not info["correctness_certificate_checked"]
+    assert not (args.results / "verified_correctness.json").exists()
     (args.results / "stale.log").write_text("old run")
     service_tool.prepare_results(args)
-    assert args._results_created
     assert not (args.results / "stale.log").exists()
-    assert (args.results / "verified_correctness.json").exists()
-
-
-def test_service_invalid_certificate_retains_diagnostic(service_tool, tmp_path, monkeypatch):
-    cert = tmp_path / "correctness.json"
-    exp.write_json(cert, dict(passed=False, error="original check failure", binding={}))
-    args = SimpleNamespace(input=tmp_path / "capture", results=tmp_path / "service", correctness=cert)
-    monkeypatch.setattr(service_tool, "capture_root", lambda root: root)
-    monkeypatch.setattr(service_tool, "select_frames", lambda root: [])
-    monkeypatch.setattr(service_tool, "binding", lambda *unused: {})
-    with pytest.raises(ValueError, match="性能测试未启动"):
-        service_tool.prepare_results(args)
-    assert args._results_created
-    assert exp.read_json(args.results / "certificate_diagnostic.json")["previous_error"] == "original check failure"
+    assert (args.results / "service_run.json").exists()
 
 
 def test_reset_results_preserves_sibling_inputs(tmp_path, service_tool):
