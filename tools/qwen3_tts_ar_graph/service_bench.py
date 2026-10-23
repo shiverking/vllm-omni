@@ -7,6 +7,7 @@ import argparse
 import hashlib
 import json
 import os
+import shutil
 import signal
 import subprocess
 import time
@@ -132,14 +133,37 @@ def summarize(results):
     (results / "report.md").write_text("\n".join(lines), encoding="utf-8")
 
 
+def reset_results(args):
+    """Replace only the explicitly selected output directory, never its inputs."""
+    original = Path(args.results)
+    target = original.resolve()
+    protected = [ROOT.resolve(), Path.home().resolve(), Path.cwd().resolve()]
+    inputs = []
+    for name in ("input", "import_from", "correctness", "failure", "model", "vllm_repo", "ascend_repo"):
+        value = getattr(args, name, None)
+        if value:
+            path = Path(value).resolve()
+            inputs.append(path)
+            if name in ("input", "import_from") and (path / "import.json").is_file():
+                inputs.append(Path(read_json(path / "import.json")["source"]).resolve())
+    if original.is_symlink() or target == Path(target.anchor):
+        raise ValueError(f"拒绝清理根目录或链接目录: {target}")
+    if any(target == path or target in path.parents for path in protected + inputs):
+        raise ValueError(f"结果目录包含输入、模型或代码目录，拒绝清理: {target}")
+    if any(path in target.parents for path in inputs):
+        raise ValueError(f"结果目录位于输入目录内部，拒绝清理: {target}")
+    if target.exists():
+        if not target.is_dir():
+            raise ValueError(f"结果路径不是目录: {target}")
+        print(f"清理服务多并发测试旧结果并重新运行: {target}", flush=True)
+        shutil.rmtree(target)
+    target.mkdir(parents=True)
+
+
 def prepare_results(args):
-    # Claim the directory before certificate() writes diagnostics or its copy.
-    # Never overwrite status.json in a directory owned by an earlier run.
+    # Reset only this stage; certificate() may now write its copy here.
     args._results_created = False
-    try:
-        args.results.mkdir(parents=True, exist_ok=False)
-    except FileExistsError:
-        raise FileExistsError(f"结果目录已存在，未修改已有产物；请使用新目录: {args.results}") from None
+    reset_results(args)
     args._results_created = True
     root = capture_root(args.input)
     certificate(args, binding(args, root, select_frames(root)))

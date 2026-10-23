@@ -315,24 +315,24 @@ def service_tool(monkeypatch):
 def test_service_creates_results_before_certificate(service_tool, tmp_path, monkeypatch):
     cert = tmp_path / "correctness.json"
     exp.write_json(cert, dict(passed=True, probe_only=False, binding={}))
-    args = SimpleNamespace(input=tmp_path, results=tmp_path / "service", correctness=cert)
+    args = SimpleNamespace(input=tmp_path / "capture", results=tmp_path / "service", correctness=cert)
     monkeypatch.setattr(service_tool, "capture_root", lambda root: root)
     monkeypatch.setattr(service_tool, "select_frames", lambda root: [])
     monkeypatch.setattr(service_tool, "binding", lambda *unused: {})
-    assert service_tool.prepare_results(args) == tmp_path
+    assert service_tool.prepare_results(args) == tmp_path / "capture"
     assert args._results_created
     assert (args.results / "verified_correctness.json").exists()
-    before = (args.results / "verified_correctness.json").read_bytes()
-    with pytest.raises(FileExistsError, match="未修改已有产物"):
-        service_tool.prepare_results(args)
-    assert not args._results_created
-    assert (args.results / "verified_correctness.json").read_bytes() == before
+    (args.results / "stale.log").write_text("old run")
+    service_tool.prepare_results(args)
+    assert args._results_created
+    assert not (args.results / "stale.log").exists()
+    assert (args.results / "verified_correctness.json").exists()
 
 
 def test_service_invalid_certificate_retains_diagnostic(service_tool, tmp_path, monkeypatch):
     cert = tmp_path / "correctness.json"
     exp.write_json(cert, dict(passed=False, error="original check failure", binding={}))
-    args = SimpleNamespace(input=tmp_path, results=tmp_path / "service", correctness=cert)
+    args = SimpleNamespace(input=tmp_path / "capture", results=tmp_path / "service", correctness=cert)
     monkeypatch.setattr(service_tool, "capture_root", lambda root: root)
     monkeypatch.setattr(service_tool, "select_frames", lambda root: [])
     monkeypatch.setattr(service_tool, "binding", lambda *unused: {})
@@ -340,3 +340,36 @@ def test_service_invalid_certificate_retains_diagnostic(service_tool, tmp_path, 
         service_tool.prepare_results(args)
     assert args._results_created
     assert exp.read_json(args.results / "certificate_diagnostic.json")["previous_error"] == "original check failure"
+
+
+def test_reset_results_preserves_sibling_inputs(tmp_path, service_tool):
+    capture = tmp_path / "capture"
+    capture.mkdir()
+    (capture / "frame.pt").write_bytes(b"keep")
+    output = tmp_path / "service"
+    output.mkdir()
+    (output / "old").mkdir()
+    (output / "old/result.json").write_text("stale")
+    service_tool.reset_results(SimpleNamespace(results=output, input=capture))
+    assert list(output.iterdir()) == []
+    assert (capture / "frame.pt").read_bytes() == b"keep"
+
+
+@pytest.mark.parametrize("relative", [".", "capture", "capture/nested"])
+def test_reset_results_rejects_overlap_before_deleting(tmp_path, relative, service_tool):
+    capture = tmp_path / "capture"
+    capture.mkdir()
+    (capture / "frame.pt").write_bytes(b"keep")
+    with pytest.raises(ValueError, match="拒绝清理"):
+        service_tool.reset_results(SimpleNamespace(results=tmp_path / relative, input=capture))
+    assert (capture / "frame.pt").exists()
+
+
+def test_reset_results_protects_imported_source(tmp_path, service_tool):
+    source = tmp_path / "source"
+    source.mkdir()
+    imported = tmp_path / "imported"
+    exp.write_json(imported / "import.json", dict(source=str(source)))
+    with pytest.raises(ValueError, match="拒绝清理"):
+        service_tool.reset_results(SimpleNamespace(results=source, input=imported))
+    assert source.exists()
