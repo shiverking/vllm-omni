@@ -132,12 +132,24 @@ def summarize(results):
     (results / "report.md").write_text("\n".join(lines), encoding="utf-8")
 
 
+def prepare_results(args):
+    # Claim the directory before certificate() writes diagnostics or its copy.
+    # Never overwrite status.json in a directory owned by an earlier run.
+    args._results_created = False
+    try:
+        args.results.mkdir(parents=True, exist_ok=False)
+    except FileExistsError:
+        raise FileExistsError(f"结果目录已存在，未修改已有产物；请使用新目录: {args.results}") from None
+    args._results_created = True
+    root = capture_root(args.input)
+    certificate(args, binding(args, root, select_frames(root)))
+    return root
+
+
 def run(args):
     if os.name == "nt":
         raise RuntimeError("Run server experiments on the Linux Ascend host")
-    root = capture_root(args.input)
-    certificate(args, binding(args, root, select_frames(root)))
-    args.results.mkdir(parents=True, exist_ok=False)
+    root = prepare_results(args)
     progress = Progress(args.results)
     dataset = args.results / "dataset/en"
     dataset.mkdir(parents=True)
@@ -291,7 +303,7 @@ def main():
     try:
         run(args)
     except Exception as exc:
-        if args.results.exists():
+        if getattr(args, "_results_created", False):
             write_json(args.results / "status.json", dict(status="failed", error=repr(exc)))
         raise
     write_json(args.results / "status.json", dict(status="complete"))

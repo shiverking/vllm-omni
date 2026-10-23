@@ -299,3 +299,44 @@ def test_decode_diagnostic_uses_requested_position(models, monkeypatch):  # noqa
     torch.testing.assert_close(reference["head.logits"], cached["head.logits"], atol=2e-5, rtol=2e-5)
     assert "layers.0.self_attn.o_proj.input" in cached
     assert all(not m._forward_hooks and not m._forward_pre_hooks for m in w.model.modules())
+
+
+@pytest.fixture
+def service_tool(monkeypatch):
+    import sys
+
+    monkeypatch.setitem(sys.modules, "experiment", exp)
+    spec = importlib.util.spec_from_file_location("service_test", ROOT / "tools/qwen3_tts_ar_graph/service_bench.py")
+    service = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(service)
+    return service
+
+
+def test_service_creates_results_before_certificate(service_tool, tmp_path, monkeypatch):
+    cert = tmp_path / "correctness.json"
+    exp.write_json(cert, dict(passed=True, probe_only=False, binding={}))
+    args = SimpleNamespace(input=tmp_path, results=tmp_path / "service", correctness=cert)
+    monkeypatch.setattr(service_tool, "capture_root", lambda root: root)
+    monkeypatch.setattr(service_tool, "select_frames", lambda root: [])
+    monkeypatch.setattr(service_tool, "binding", lambda *unused: {})
+    assert service_tool.prepare_results(args) == tmp_path
+    assert args._results_created
+    assert (args.results / "verified_correctness.json").exists()
+    before = (args.results / "verified_correctness.json").read_bytes()
+    with pytest.raises(FileExistsError, match="未修改已有产物"):
+        service_tool.prepare_results(args)
+    assert not args._results_created
+    assert (args.results / "verified_correctness.json").read_bytes() == before
+
+
+def test_service_invalid_certificate_retains_diagnostic(service_tool, tmp_path, monkeypatch):
+    cert = tmp_path / "correctness.json"
+    exp.write_json(cert, dict(passed=False, error="original check failure", binding={}))
+    args = SimpleNamespace(input=tmp_path, results=tmp_path / "service", correctness=cert)
+    monkeypatch.setattr(service_tool, "capture_root", lambda root: root)
+    monkeypatch.setattr(service_tool, "select_frames", lambda root: [])
+    monkeypatch.setattr(service_tool, "binding", lambda *unused: {})
+    with pytest.raises(ValueError, match="性能测试未启动"):
+        service_tool.prepare_results(args)
+    assert args._results_created
+    assert exp.read_json(args.results / "certificate_diagnostic.json")["previous_error"] == "original check failure"
