@@ -16,7 +16,6 @@ from pathlib import Path
 
 import yaml
 from experiment import (
-    BUCKETS,
     MODEL,
     ROOT,
     Progress,
@@ -26,6 +25,11 @@ from experiment import (
     select_frames,
     write_json,
 )
+
+CONCURRENCIES = (1, 4, 16)
+ROUNDS = 1
+WARMUP_REQUESTS = 3
+HEALTH_INTERVAL = 20
 
 
 def local_urlopen(request, timeout):
@@ -45,11 +49,11 @@ def benchmark_client_env():
 
 def ready(process, url, timeout=1800):
     deadline = time.monotonic() + timeout
-    next_notice = 0.0
     last_error = "尚未响应"
     while time.monotonic() < deadline:
         if process.poll() is not None:
             raise RuntimeError("Server exited; inspect server.log")
+        attempt_started = time.monotonic()
         try:
             with local_urlopen(url + "/health", timeout=5) as response:
                 if response.status == 200:
@@ -58,11 +62,44 @@ def ready(process, url, timeout=1800):
                 last_error = f"HTTP {response.status}"
         except OSError as exc:
             last_error = str(exc)
-        if time.monotonic() >= next_notice:
-            print(f"等待本机服务就绪（绕过代理）: {url}/health；{last_error}", flush=True)
-            next_notice = time.monotonic() + 10
-        time.sleep(2)
+        print(f"等待本机服务就绪（每 20 秒检查）: {url}/health；{last_error}", flush=True)
+        delay = min(HEALTH_INTERVAL - (time.monotonic() - attempt_started), deadline - time.monotonic())
+        if delay > 0:
+            time.sleep(delay)
     raise TimeoutError("Server did not become healthy within 1800 seconds")
+
+
+def run_benchmark(command, output, progress, label):
+    """Keep the full client log and report progress while a round is running."""
+    log_path = output / "client.log"
+    started = time.monotonic()
+    env = benchmark_client_env()
+    env["PYTHONUNBUFFERED"] = "1"
+    with log_path.open("w", encoding="utf-8") as client_log:
+        child = subprocess.Popen(command, cwd=ROOT, stdout=client_log, stderr=subprocess.STDOUT, env=env)
+        try:
+            while True:
+                try:
+                    code = child.wait(timeout=20)
+                    if code:
+                        raise subprocess.CalledProcessError(code, command)
+                    break
+                except subprocess.TimeoutExpired:
+                    with log_path.open("rb") as reader:
+                        reader.seek(0, 2)
+                        reader.seek(max(0, reader.tell() - 4096))
+                        lines = reader.read().decode("utf-8", errors="replace").replace("\r", "\n").splitlines()
+                    latest = next((line.strip() for line in reversed(lines) if line.strip()), "等待客户端进度输出")
+                    progress.message(f"{label}：运行中，耗时 {time.monotonic() - started:.0f}s；{latest[-300:]}")
+        finally:
+            if child.poll() is None:
+                child.terminate()
+                try:
+                    child.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    child.kill()
+                    child.wait()
+    progress.message(f"{label}：客户端完成，耗时 {time.monotonic() - started:.1f}s")
 
 
 def audio_request(url, model, text, cancel=False):
@@ -226,7 +263,9 @@ def run(args):
         pass
     else:
         raise RuntimeError("Port already serves a healthy process; choose a free --port")
+    progress.begin("服务多并发总进度", 3 * len(CONCURRENCIES) * ROUNDS)
     for mode in ("stock", "kv_step", "kv_frame"):
+        progress.message(f"{mode}：准备配置与运行信息，随后启动服务；并发 {list(CONCURRENCIES)}，每档 {ROUNDS} 轮")
         directory = args.results / mode
         directory.mkdir()
         config = yaml.safe_load((ROOT / f"vllm_omni/deploy/qwen3_tts_ar_{mode}.yaml").read_text(encoding="utf-8"))
@@ -269,9 +308,10 @@ def run(args):
                 )
                 if before != after:
                     raise RuntimeError("Seeded output changed after cancellation; diagnose before performance run")
-                progress.begin(f"{mode} 服务并发", 15)
-                for concurrency in BUCKETS:
-                    for repeat in range(3):
+                for concurrency in CONCURRENCIES:
+                    for repeat in range(ROUNDS):
+                        label = f"{mode} / 并发 {concurrency} / 第 {repeat + 1}/{ROUNDS} 轮"
+                        progress.message(f"开始 {label}：预热 {WARMUP_REQUESTS} 请求，正式 120 请求")
                         output = directory / f"c{concurrency}" / f"round{repeat}"
                         output.mkdir(parents=True)
                         time.sleep(2)  # background telemetry flush, outside measurement
@@ -303,7 +343,7 @@ def run(args):
                             "--num-prompts",
                             "120",
                             "--num-warmups",
-                            "16",
+                            str(WARMUP_REQUESTS),
                             "--max-concurrency",
                             str(concurrency),
                             "--request-rate",
@@ -322,15 +362,7 @@ def run(args):
                             "result.json",
                         ]
                         write_json(output / "command.json", bench)
-                        with (output / "client.log").open("w", encoding="utf-8") as client_log:
-                            subprocess.run(
-                                bench,
-                                cwd=ROOT,
-                                stdout=client_log,
-                                stderr=subprocess.STDOUT,
-                                check=True,
-                                env=benchmark_client_env(),
-                            )
+                        run_benchmark(bench, output, progress, label)
                         time.sleep(2)
                         write_json(output / "batch-after.json", snapshot(directory / "telemetry"))
                         result = read_json(output / "result.json")

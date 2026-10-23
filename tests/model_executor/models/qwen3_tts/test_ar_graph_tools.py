@@ -409,3 +409,55 @@ def test_benchmark_proxy_changes_are_child_only(service_tool, monkeypatch):
     assert env["NO_PROXY"] == env["no_proxy"] == "127.0.0.1,localhost,::1"
     assert env["KEEP_SERVICE_TEST"] == "unchanged"
     assert service_tool.os.environ["HTTPS_PROXY"] == "http://proxy.invalid:8080"
+
+
+def test_service_health_checks_twenty_seconds_apart(service_tool, monkeypatch):
+    from contextlib import nullcontext
+
+    clock = [0.0]
+    attempts = []
+    monkeypatch.setattr(service_tool.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(service_tool.time, "sleep", lambda seconds: clock.__setitem__(0, clock[0] + seconds))
+
+    def open_health(*args, **kwargs):
+        attempts.append(clock[0])
+        if len(attempts) == 1:
+            clock[0] += 5
+            raise OSError("not ready")
+        return nullcontext(SimpleNamespace(status=200))
+
+    monkeypatch.setattr(service_tool, "local_urlopen", open_health)
+    service_tool.ready(SimpleNamespace(poll=lambda: None), "http://127.0.0.1:8091")
+    assert attempts == [0.0, 20.0]
+
+
+@pytest.mark.parametrize("returncode", [0, 1])
+def test_service_client_progress_and_exit(service_tool, tmp_path, monkeypatch, returncode):
+    calls = []
+    messages = []
+
+    class Child:
+        def wait(self, timeout=None):
+            calls.append(timeout)
+            if len(calls) == 1:
+                raise service_tool.subprocess.TimeoutExpired("client", timeout)
+            return returncode
+
+        def poll(self):
+            return returncode
+
+    def launch(*args, **kwargs):
+        kwargs["stdout"].write("progress 25/120\n")
+        kwargs["stdout"].flush()
+        assert kwargs["env"]["PYTHONUNBUFFERED"] == "1"
+        return Child()
+
+    monkeypatch.setattr(service_tool.subprocess, "Popen", launch)
+    progress = SimpleNamespace(message=messages.append)
+    if returncode:
+        with pytest.raises(service_tool.subprocess.CalledProcessError):
+            service_tool.run_benchmark(["client"], tmp_path, progress, "stock / c1")
+    else:
+        service_tool.run_benchmark(["client"], tmp_path, progress, "stock / c1")
+    assert any("25/120" in msg for msg in messages)
+    assert calls == [20, 20]
