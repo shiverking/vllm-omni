@@ -38,7 +38,12 @@ def trace_prefill(wrapper, inputs, positions, cache=None, pad_down_proj=False):
             module.forward = padded_forward
 
     def save(name, value):
-        if torch.is_tensor(value) and value.ndim >= 3 and value.shape[:2] == (batch, length):
+        if (
+            torch.is_tensor(value)
+            and value.ndim >= 3
+            and value.shape[0] == batch
+            and value.shape[1] in (length, wrapper._num_groups + 1)
+        ):
             snapshots[name] = value[:, :2].detach().clone().cpu()
 
     for name, module in wrapper.model.named_modules():

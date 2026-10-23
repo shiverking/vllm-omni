@@ -356,6 +356,14 @@ class CodePredictorAttention(nn.Module):
             )
 
         attn_out = attn_out.transpose(1, 2).reshape(bsz, seq_len, -1)
+        if kv_cache is not None:
+            # Ascend BF16 o_proj also changes rounding with short GEMM shapes.
+            # Keep stock row positions for this projection, while QKV and
+            # attention still process only the newly appended tokens.
+            end = cache_position + seq_len
+            padded = attn_out.new_zeros((bsz, self.max_seq, attn_out.shape[-1]))
+            padded[:, cache_position:end].copy_(attn_out)
+            return self.o_proj(padded)[:, cache_position:end]
         return self.o_proj(attn_out)
 
 

@@ -132,3 +132,29 @@ def test_cached_mlp_preserves_stock_row_geometry(models, position, length):
     remaining[:, position : position + length].zero_()
     assert torch.count_nonzero(remaining) == 0
     torch.testing.assert_close(cached, stock, rtol=2e-5, atol=2e-5)
+
+
+@torch.inference_mode()
+def test_cached_attention_projection_geometry_and_positions(models):
+    w, executor = models
+    b = executor._allocate(2)
+    b["inputs"].normal_()
+    attention = w.model.layers[0].self_attn
+    projected = []
+    qkv_lengths = []
+    h1 = attention.o_proj.register_forward_pre_hook(lambda mod, args: projected.append(args[0].clone()))
+    h2 = attention.qkv_proj.register_forward_pre_hook(lambda mod, args: qkv_lengths.append(args[0].shape[1]))
+    try:
+        for step in range(15):
+            executor._backbone(b, step)
+    finally:
+        h1.remove()
+        h2.remove()
+    assert qkv_lengths == [2] + [1] * 14
+    for step, value in enumerate(projected):
+        assert value.shape[1] == 17
+        start, length = (0, 2) if step == 0 else (step + 1, 1)
+        remaining = value.clone()
+        remaining[:, start : start + length].zero_()
+        assert torch.count_nonzero(remaining) == 0
+        assert torch.count_nonzero(value[:, start : start + length]) > 0

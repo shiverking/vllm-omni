@@ -15,8 +15,16 @@ def trace_position(wrapper, inputs, positions, codebook, target, cache=None, cac
     batch, length = inputs.shape[:2]
 
     def save(name, value):
-        if torch.is_tensor(value) and value.ndim >= 3 and value.shape[:2] == (batch, length):
-            snapshots[name] = value[:, target : target + 1].detach().clone().cpu()
+        if not torch.is_tensor(value) or value.ndim < 3 or value.shape[0] != batch:
+            return
+        if value.shape[1] == length:
+            index = target
+        elif cache is not None and value.shape[1] == wrapper._num_groups + 1:
+            # o_proj/down_proj use stock-length padded rows on cached paths.
+            index = cache_position + target
+        else:
+            return
+        snapshots[name] = value[:, index : index + 1].detach().clone().cpu()
 
     for name, module in wrapper.model.named_modules():
         if name and not list(module.children()):
