@@ -365,3 +365,47 @@ def test_reset_results_protects_imported_source(tmp_path, service_tool):
     with pytest.raises(ValueError, match="拒绝清理"):
         service_tool.reset_results(SimpleNamespace(results=source, input=imported))
     assert source.exists()
+
+
+def test_service_local_http_ignores_proxy(service_tool, monkeypatch):
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"ok")
+
+        def log_message(self, *args):
+            pass
+
+    monkeypatch.setenv("http_proxy", "http://127.0.0.1:1")
+    monkeypatch.setenv("HTTP_PROXY", "http://127.0.0.1:1")
+    monkeypatch.setenv("NO_PROXY", "")
+    monkeypatch.setenv("no_proxy", "")
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        url = f"http://127.0.0.1:{server.server_port}/health"
+        with service_tool.local_urlopen(url, timeout=3) as response:
+            assert response.status == 200
+            assert response.read() == b"ok"
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=3)
+    assert service_tool.os.environ["http_proxy"] == "http://127.0.0.1:1"
+
+
+def test_benchmark_proxy_changes_are_child_only(service_tool, monkeypatch):
+    monkeypatch.setenv("HTTPS_PROXY", "http://proxy.invalid:8080")
+    monkeypatch.setenv("http_proxy", "http://proxy.invalid:8080")
+    monkeypatch.setenv("ALL_PROXY", "socks5://proxy.invalid:1080")
+    monkeypatch.setenv("KEEP_SERVICE_TEST", "unchanged")
+    env = service_tool.benchmark_client_env()
+    assert not any(k.lower() in {"http_proxy", "https_proxy", "all_proxy"} for k in env)
+    assert env["NO_PROXY"] == env["no_proxy"] == "127.0.0.1,localhost,::1"
+    assert env["KEEP_SERVICE_TEST"] == "unchanged"
+    assert service_tool.os.environ["HTTPS_PROXY"] == "http://proxy.invalid:8080"

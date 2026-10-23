@@ -28,17 +28,39 @@ from experiment import (
 )
 
 
+def local_urlopen(request, timeout):
+    # Private opener: ignore proxy settings for this script's loopback requests
+    # without changing urllib's global opener or the server environment.
+    return urllib.request.build_opener(urllib.request.ProxyHandler({})).open(request, timeout=timeout)
+
+
+def benchmark_client_env():
+    env = os.environ.copy()
+    for key in list(env):
+        if key.lower() in {"http_proxy", "https_proxy", "all_proxy"}:
+            del env[key]
+    env["NO_PROXY"] = env["no_proxy"] = "127.0.0.1,localhost,::1"
+    return env
+
+
 def ready(process, url, timeout=1800):
     deadline = time.monotonic() + timeout
+    next_notice = 0.0
+    last_error = "尚未响应"
     while time.monotonic() < deadline:
         if process.poll() is not None:
             raise RuntimeError("Server exited; inspect server.log")
         try:
-            with urllib.request.urlopen(url + "/health", timeout=5) as response:
+            with local_urlopen(url + "/health", timeout=5) as response:
                 if response.status == 200:
+                    print(f"本机直连健康检查通过: {url}/health", flush=True)
                     return
-        except OSError:
-            pass
+                last_error = f"HTTP {response.status}"
+        except OSError as exc:
+            last_error = str(exc)
+        if time.monotonic() >= next_notice:
+            print(f"等待本机服务就绪（绕过代理）: {url}/health；{last_error}", flush=True)
+            next_notice = time.monotonic() + 10
         time.sleep(2)
     raise TimeoutError("Server did not become healthy within 1800 seconds")
 
@@ -57,7 +79,8 @@ def audio_request(url, model, text, cancel=False):
     request = urllib.request.Request(
         url + "/v1/audio/speech", data=json.dumps(payload).encode(), headers={"Content-Type": "application/json"}
     )
-    with urllib.request.urlopen(request, timeout=1800) as response:
+    print(f"发送本机语音请求（绕过代理）: cancel={cancel}, text_chars={len(text)}", flush=True)
+    with local_urlopen(request, timeout=1800) as response:
         body = response.read1(4096) if cancel else response.read()
     if not body or len(body) % 2:
         raise RuntimeError("Empty or malformed PCM response")
@@ -198,7 +221,7 @@ def run(args):
     url = f"http://127.0.0.1:{args.port}"
     # Do not accidentally benchmark or stop a pre-existing service.
     try:
-        urllib.request.urlopen(url + "/health", timeout=2).close()
+        local_urlopen(url + "/health", timeout=2).close()
     except OSError:
         pass
     else:
@@ -300,7 +323,14 @@ def run(args):
                         ]
                         write_json(output / "command.json", bench)
                         with (output / "client.log").open("w", encoding="utf-8") as client_log:
-                            subprocess.run(bench, cwd=ROOT, stdout=client_log, stderr=subprocess.STDOUT, check=True)
+                            subprocess.run(
+                                bench,
+                                cwd=ROOT,
+                                stdout=client_log,
+                                stderr=subprocess.STDOUT,
+                                check=True,
+                                env=benchmark_client_env(),
+                            )
                         time.sleep(2)
                         write_json(output / "batch-after.json", snapshot(directory / "telemetry"))
                         result = read_json(output / "result.json")
