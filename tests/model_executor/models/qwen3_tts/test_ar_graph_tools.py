@@ -274,3 +274,28 @@ def test_stock_variation_policy_is_explicit(capture, tmp_path, models, monkeypat
         assert cert["correctness_scope"] == "cached_vs_stock_same_batch"
         assert len(cert["stock_batch_variations"]) == 1
         assert (output / "stock_batch_variation_first.pt").exists()
+
+
+@torch.inference_mode()
+def test_decode_diagnostic_uses_requested_position(models, monkeypatch):  # noqa: F811
+    import sys
+
+    monkeypatch.syspath_prepend(str(ROOT / "tools/qwen3_tts_ar_graph"))
+    monkeypatch.setitem(sys.modules, "experiment", exp)
+    spec = importlib.util.spec_from_file_location(
+        "decode_diagnostic", ROOT / "tools/qwen3_tts_ar_graph/diagnose_decode.py"
+    )
+    diagnostic = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(diagnostic)
+    w, executor = models
+    b = executor._allocate(2)
+    b["inputs"].normal_()
+    executor._backbone(b, 0)
+    full = torch.zeros(2, 17, w.config.hidden_size)
+    full[:, :3].copy_(b["inputs"][:, :3])
+    positions = torch.arange(17).unsqueeze(0).expand(2, -1)
+    reference = diagnostic.trace_position(w, full, positions, 2, 2)
+    cached = diagnostic.trace_position(w, b["inputs"][:, 2:3], positions[:, 2:3], 2, 0, b["cache"], 2)
+    torch.testing.assert_close(reference["head.logits"], cached["head.logits"], atol=2e-5, rtol=2e-5)
+    assert "layers.0.self_attn.o_proj.input" in cached
+    assert all(not m._forward_hooks and not m._forward_pre_hooks for m in w.model.modules())
