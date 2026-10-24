@@ -47,6 +47,10 @@ class NPUGraphDecoderWrapper(PooledGraphMixin, CUDAGraphDecoderWrapper):
         self._stage_constants = {}
         if optimization != "current":
             prepare_constants(decoder)
+        if optimization == "fused":
+            from .code2wav_optimization import prepare_fused
+
+            prepare_fused(decoder)
         super().__init__(
             decoder,
             capture_modes=("xvec",),

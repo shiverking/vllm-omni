@@ -202,6 +202,38 @@ class StateTests(unittest.TestCase):
         wrapper.reset_pool()
         self.assertEqual(len(wrapper.state_pool.free), 16)
 
+    @torch.no_grad()
+    def test_fused_outputs_and_call_counts(self):
+        from collections import Counter
+        from vllm_omni.model_executor.models.qwen3_tts.code2wav_optimization import PackedProjection
+
+        model = decoder()
+        wrapper = eager_layout_class()(model, optimization="fused")
+        wrapper.warmup(torch.device("cpu"))
+        counts = Counter()
+        handles = []
+        for name, module in model.named_modules():
+            if isinstance(module, PackedProjection) or name.endswith(
+                ("q_proj", "k_proj", "v_proj", "gate_proj", "up_proj")
+            ):
+                handles.append(module.register_forward_hook(lambda m, a, o, n=name: counts.update([n])))
+        caches = [dict(prefix_frames=0) for _ in range(3)]
+        refs = [dict(prefix_frames=0) for _ in range(3)]
+        for length in (1, 25, 25, 25, 25, 3):
+            codes = [torch.randint(0, 32, (1, 2, length)) for _ in caches]
+            a = run(model, wrapper, codes, caches)
+            b = run(self.model, self.wrapper, codes, refs)
+            for x, y in zip(a, b):
+                self.assert_tensor(x, y)
+        for handle in handles:
+            handle.remove()
+        self.assertTrue(counts)
+        self.assertTrue(all("_code2wav_" in n for n in counts))
+        self.assertTrue(any("qkv" in n for n in counts))
+        self.assertTrue(any("gate_up" in n for n in counts))
+        self.assertFalse(any("_packed_" in n for n in model.state_dict()))
+        wrapper.release_requests(caches)
+
     def test_graph_shapes(self):
         self.assertEqual(self.wrapper.statistics()["graph_count"], 15)
         self.assertEqual(self.wrapper._xvec_previous_frames_by_target, {26: 1, 51: 26, 76: 51, 97: 72})

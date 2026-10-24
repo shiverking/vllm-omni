@@ -90,3 +90,43 @@ def fixed_stage(wrapper, batch, length):
         yield
     finally:
         transformer._code2wav_fixed_stage = previous
+
+
+class PackedProjection(nn.Module):
+    """Derived buffers, preserving original checkpoint parameter ownership."""
+
+    def __init__(self, sources):
+        super().__init__()
+        object.__setattr__(self, "sources", tuple(sources))
+        self.sizes = tuple(m.out_features for m in sources)
+        self.register_buffer("_packed_weight", None, persistent=False)
+        self.register_buffer("_packed_bias", None, persistent=False)
+        self.prepare()
+
+    def prepare(self):
+        self._packed_weight = torch.cat([m.weight.detach() for m in self.sources], 0).contiguous()
+        if any(m.bias is not None for m in self.sources):
+            self._packed_bias = torch.cat(
+                [m.bias.detach() if m.bias is not None else m.weight.new_zeros(m.out_features) for m in self.sources], 0
+            ).contiguous()
+
+    def _apply(self, fn, recurse=True):
+        self._packed_weight = self._packed_bias = None
+        return super()._apply(fn, recurse)
+
+    def _load_from_state_dict(self, *args, **kwargs):
+        self._packed_weight = self._packed_bias = None
+        return super()._load_from_state_dict(*args, **kwargs)
+
+    def forward(self, hidden):
+        if self._packed_weight is None:
+            self.prepare()
+        return nn.functional.linear(hidden, self._packed_weight, self._packed_bias).split(self.sizes, -1)
+
+
+def prepare_fused(decoder):
+    for layer in decoder.pre_transformer.layers:
+        attn = layer.self_attn
+        attn._code2wav_qkv = PackedProjection((attn.q_proj, attn.k_proj, attn.v_proj))
+        mlp = layer.mlp
+        mlp._code2wav_gate_up = PackedProjection((mlp.gate_proj, mlp.up_proj))

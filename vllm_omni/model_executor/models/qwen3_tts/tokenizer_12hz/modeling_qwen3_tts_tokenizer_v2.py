@@ -358,9 +358,14 @@ class Qwen3TTSTokenizerV2DecoderAttention(nn.Module):
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
 
-        query_states = self.q_norm(self.q_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
-        key_states = self.k_norm(self.k_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
-        value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+        packed = getattr(self, "_code2wav_qkv", None)
+        if packed is None:
+            query, key, value = self.q_proj(hidden_states), self.k_proj(hidden_states), self.v_proj(hidden_states)
+        else:
+            query, key, value = packed(hidden_states)
+        query_states = self.q_norm(query.view(hidden_shape)).transpose(1, 2)
+        key_states = self.k_norm(key.view(hidden_shape)).transpose(1, 2)
+        value_states = value.view(hidden_shape).transpose(1, 2)
 
         cos, sin = position_embeddings
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
@@ -403,7 +408,9 @@ class Qwen3TTSTokenizerV2DecoderMlp(nn.Module):
         self.act_fn = ACT2FN[config.hidden_act]
 
     def forward(self, x):
-        down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+        packed = getattr(self, "_code2wav_gate_up", None)
+        gate, up = (self.gate_proj(x), self.up_proj(x)) if packed is None else packed(x)
+        down_proj = self.down_proj(self.act_fn(gate) * up)
         return down_proj
 
 
