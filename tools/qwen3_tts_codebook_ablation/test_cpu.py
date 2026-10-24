@@ -9,6 +9,7 @@ from pathlib import Path
 
 import torch
 from experiment import decode_audio, read_request, retain_codebooks, save_wav
+from generate_zh import captured_rows
 
 ROOT = Path(__file__).resolve().parents[2]
 spec = importlib.util.spec_from_file_location(
@@ -99,6 +100,27 @@ class AblationTests(unittest.TestCase):
             codes.write_text("changed", encoding="utf-8")
             with self.assertRaisesRegex(ValueError, "changed source"):
                 read_request(root, marker)
+
+    def test_chinese_capture_order_and_request_isolation(self):
+        with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as temporary:
+            root = Path(temporary)
+            paths = []
+            for seq in (1, 0):
+                path = root / f"{seq}.pt"
+                torch.save(
+                    dict(sequence=seq, rows=[dict(request_id="internal", codes=torch.full((16, 2), seq + 1))]), path
+                )
+                paths.append(path)
+            rows = captured_rows(paths, dict(id="zh001-s42"), "attempt")
+            self.assertEqual([row["codes"][0] for row in rows], [1, 1, 2, 2])
+            self.assertEqual([row["frame_id"] for row in rows], [0, 1, 2, 3])
+            self.assertTrue(all(row["valid"] for row in rows))
+            torch.save(
+                dict(sequence=2, rows=[dict(request_id="another", codes=torch.ones(16, 1, dtype=torch.long))]),
+                root / "extra.pt",
+            )
+            with self.assertRaisesRegex(ValueError, "唯一对应"):
+                captured_rows([*paths, root / "extra.pt"], dict(id="zh001-s42"), "attempt")
 
 
 if __name__ == "__main__":

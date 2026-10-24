@@ -52,3 +52,29 @@ python -m http.server 8092 --bind 0.0.0.0 \
 先关注 keep16 重解码是否正常，再比较其他版本是否有发闷、失真、音色变化或辅音丢失。
 模型没有因本实验重新训练；该实验只评估听感，不测实际提前结束 AR 的加速，
 也不据此认定商业可接受性或人耳无差异。本地 CPU 测试不替代真实 NPU 解码验证。
+
+## 中文试听
+
+新增 12 条中文自编文本，覆盖数字、齿音、绕口令、问句、情绪与长句。
+先生成真实中文音频并采集实际 Code2Wav 输入，再执行相同删减解码。
+生成脚本自动启动及关闭 kv_frame 基线服务，Vivian、Chinese、种子 42；
+服务占用 8091，运行前停止自己手动启动的同端口服务。健康检查每 20 秒，HTTP 请求绕过代理。
+已完整生成的请求重跑时跳过；--limit 3 可先生成三条，之后改为 12 补齐。
+
+```bash
+python tools/qwen3_tts_codebook_ablation/generate_zh.py \
+  --results /softwarePlatform/y00899301/qwen3_tts_codebook_ablation_zh_capture01 \
+  --model /softwarePlatform/l00927835/Qwen3-TTS-12Hz-1.7B-CustomVoice \
+  --device npu:0 --limit 12 --seed 42 --port 8091
+
+python tools/qwen3_tts_codebook_ablation/experiment.py \
+  --input /softwarePlatform/y00899301/qwen3_tts_codebook_ablation_zh_capture01 \
+  --results /softwarePlatform/y00899301/qwen3_tts_codebook_ablation_zh_listen01 \
+  --model /softwarePlatform/l00927835/Qwen3-TTS-12Hz-1.7B-CustomVoice \
+  --device npu:0 --seed 42 --limit 12 --keep 16 14 12 8 4 1
+
+python -m http.server 8092 --bind 0.0.0.0 \
+  --directory /softwarePlatform/y00899301/qwen3_tts_codebook_ablation_zh_listen01
+```
+
+访问服务器 IP 的 8092 端口 /listen.html。生成日志保存在采集目录 server/server.log。
