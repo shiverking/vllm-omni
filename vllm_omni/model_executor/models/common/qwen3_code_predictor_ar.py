@@ -17,6 +17,7 @@ from vllm.logger import init_logger
 logger = init_logger(__name__)
 
 KV_IMPLEMENTATION = "fia_gqa_short_projection_v1"
+FRAME_OPTIMIZATION = "batched_gumbel_projected_embeddings_v1"
 
 
 class CachedARExecutor:
@@ -45,6 +46,7 @@ class CachedARExecutor:
         self._lock = threading.Lock()
         self._stream = None
         self.last_stats = {}
+        self._projected_embeddings = None
 
     def _allocate(self, batch):
         if batch in self.buffers:
@@ -76,9 +78,60 @@ class CachedARExecutor:
                 for step in range(self.groups - 1)
             ],
         )
+        if self.mode == "kv_frame":
+            b["log_noise"] = torch.empty_like(b["uniforms"])
         b["last_logits"] = [None] * (self.groups - 1)
         self.buffers[batch] = b
         return b
+
+    @torch.inference_mode()
+    def _prepare_frame_tables(self):
+        """Build once after weight loading, outside capture; weights stay frozen.
+
+        Nonpersistent model buffer: shared across executors, buckets and sampling
+        graphs, never serialized in checkpoints. Recreate executors/model after
+        changing weights, as required for their captured graphs as well.
+        """
+        if self.mode != "kv_frame" or self._projected_embeddings is not None:
+            return
+        w = self.wrapper
+        name = "_kv_frame_projected_embeddings"
+        table = getattr(w, name, None)
+        if table is None:
+            started = time.perf_counter()
+            table = torch.empty(
+                self.groups - 2, self.vocab, int(w.config.hidden_size), device=self.device, dtype=self.dtype
+            )
+            # c15 is output only. Keep all original embeddings for Talker use.
+            # Bound build temporaries; do not stack another copy of the table.
+            for step in range(self.groups - 2):
+                weight = w.model.codec_embedding[step].weight
+                for start in range(0, self.vocab, 256):
+                    table[step, start : start + 256].copy_(w.small_to_mtp_projection(weight[start : start + 256]))
+            if self.device.type == "npu":
+                torch.npu.synchronize(self.device)
+            w.register_buffer(name, table, persistent=False)
+            logger.info(
+                "kv_frame projected embeddings ready: tables=%d bytes=%d seconds=%.3f; shared across buckets",
+                self.groups - 2,
+                table.numel() * table.element_size(),
+                time.perf_counter() - started,
+            )
+        self._projected_embeddings = table
+
+    def optimization_metadata(self):
+        table = self._projected_embeddings
+        return dict(
+            optimization=FRAME_OPTIMIZATION if self.mode == "kv_frame" else "none",
+            projected_embedding_bytes=0 if table is None else table.numel() * table.element_size(),
+            projected_embedding_tables=0 if table is None else self.groups - 2,
+            gumbel_buffer_bytes=sum(
+                b["log_noise"].numel() * b["log_noise"].element_size()
+                for b in self.buffers.values()
+                if "log_noise" in b
+            ),
+            projected_embedding_scope="shared model buffer, frozen weights; excludes original embeddings",
+        )
 
     def _project(self, b):
         project = self.wrapper.small_to_mtp_projection
@@ -100,15 +153,30 @@ class CachedARExecutor:
             if self.vocab >= 50:
                 vals = scaled.topk(50, dim=-1).values
                 scaled = scaled.masked_fill(scaled < vals[:, -1:], float("-inf"))
-            code = w._sample_codes_gumbel(scaled, uniforms=b["uniforms"][:, step])
+            if self.mode == "kv_frame":
+                # Same subtraction and FP32 arithmetic as _sample_codes_gumbel.
+                code = (scaled.float() - b["log_noise"][:, step]).argmax(dim=-1, keepdim=True)
+            else:
+                code = w._sample_codes_gumbel(scaled, uniforms=b["uniforms"][:, step])
         else:
             code = logits.argmax(dim=-1, keepdim=True)
         b["codes"][:, step + 1].copy_(code.reshape(-1))
         if step + 1 < self.groups - 1:
-            embedded = w.model.codec_embedding[step](code.reshape(-1)).unsqueeze(1)
-            b["inputs"][:, step + 2 : step + 3].copy_(w.small_to_mtp_projection(embedded))
+            if self.mode == "kv_frame":
+                projected = torch.nn.functional.embedding(code.reshape(-1), self._projected_embeddings[step]).unsqueeze(
+                    1
+                )
+            else:
+                embedded = w.model.codec_embedding[step](code.reshape(-1)).unsqueeze(1)
+                projected = w.small_to_mtp_projection(embedded)
+            b["inputs"][:, step + 2 : step + 3].copy_(projected)
 
     def _frame(self, b, sampling, audit=None):
+        if self.mode == "kv_frame" and sampling:
+            # One transform for [batch, codebook, vocabulary]. Keep generation
+            # of uniforms unchanged: step then real row, excluding padding.
+            torch.log(b["uniforms"], out=b["log_noise"])
+            b["log_noise"].neg_().log_()
         self._project(b)
         for step in range(self.groups - 1):
             self._head(b, step, self._backbone(b, step), sampling, audit)
@@ -152,6 +220,7 @@ class CachedARExecutor:
             return
         if torch.npu.is_current_stream_capturing():
             raise RuntimeError("Cached AR owns its graphs; outer MTP capture must be disabled")
+        self._prepare_frame_tables()
         started = time.perf_counter()
         for _ in range(3):
             self._frame(b, sampling)

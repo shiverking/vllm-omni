@@ -16,7 +16,7 @@ KV 预热捕获 batch buckets `[1,2,4,8,16]`，输出捕获进度和耗时；首
 KV 模式关闭外层 MTP 包装，保留正常 Talker 图；不嵌套 replay。
 FIA 直接读取完整 KV-head 缓存，有效长度排除旧数据，不扩展 GQA heads 或复制缓存前缀。
 `o_proj`、`down_proj` 只处理 prefill 两位置或 decode 单位置，保留当前融合 QKV、gate/up、RoPE、RMSNorm。
-两种 KV 模式共用计算函数，只改变图捕获范围；每个 bucket 独立缓存，同一执行流串行调度。
+两种 KV 模式共用缓存主干；kv_frame 另外启用下文的整帧 Gumbel 和投影表预计算。每个 bucket 独立 KV 缓存，同一执行流串行调度。
 输出在缓冲区复用前克隆；新帧从位置 0 覆盖，禁止读取本帧有效长度之外的缓存。
 FIA 不可用、非 BF16、捕获失败或不支持的采样参数会明确报错，不静默回退。
 
@@ -215,3 +215,15 @@ python -m pytest -o addopts= --confcutdir=tests/model_executor/models/qwen3_tts 
 ```
 
 CPU 验证缓存和状态逻辑，模拟 FIA 参数与图管理；不能替代 NPU 算子数值和真实捕获检查。
+
+
+## kv_frame 专用预计算优化
+
+`kv_frame` 默认启用 `batched_gumbel_projected_embeddings_v1`，不改变 `stock` 和 `kv_step`。
+
+- uniforms 的生成顺序、请求随机流和 padding 策略保持不变；整帧图内对 `[batch, 15, vocab]` 一次计算 `log(-log(u))`，各步沿用原 FP32 减法、temperature、Top-k 和 argmax。Greedy 不计算 Gumbel。
+- 权重加载后、捕图前分块预计算 c1 至 c14 的 embedding＋projection（包含 bias），帧内改为查表。Talker hidden 和 c0 embedding 仍动态投影。c15 不再作为输入，无需投影表。
+- 表由模型的所有 bucket、greedy/sampling 图和执行器共享，不写入 checkpoint；原 embedding 保留供 Talker 使用。仅用于冻结权重推理，修改权重后须重建执行器和图。
+- 正式 BF16 CustomVoice 模型额外表内存为 `14 × 2048 × 1024 × 2 = 56 MiB`。五个 bucket 的 FP32 Gumbel 缓冲合计约 `3.63 MiB`（batch16 为 `1.875 MiB`），不包含图池及临时工作区。
+- 预计算采用不同的 GEMM 形状，可能产生 BF16 舍入差异；现有逐位置/codes 检查仍会报告差异，不放宽标准。CPU 测试不能代替 NPU 数值和捕图验证。
+- `bench` 的 manifest 和中文报告记录优化版本及实际额外缓冲字节数。所有测试仍可独立运行，无需正确性证书。

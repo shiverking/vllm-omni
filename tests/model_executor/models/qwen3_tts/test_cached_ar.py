@@ -258,3 +258,143 @@ def test_graph_capture_failure_does_not_register_or_fallback(models, monkeypatch
     with pytest.raises(RuntimeError, match="capture failed"):
         executor.prepare(1, False)
     assert executor.graphs == {}
+
+
+def _cpu_frame(executor, args, sampling):
+    """Run the exact whole-graph body on CPU; no claim of testing NPU capture."""
+    batch = args["layer0_code"].shape[0]
+    bucket = next(n for n in executor.buckets if n >= batch)
+    executor._prepare_frame_tables()
+    b = executor._allocate(bucket)
+    b["hidden"].zero_()
+    b["embed"].zero_()
+    b["codes"][:, 0].zero_()
+    b["hidden"][:batch].copy_(args["last_talker_hidden"].unsqueeze(1))
+    b["embed"][:batch].copy_(args["layer0_embed"].unsqueeze(1))
+    b["codes"][:batch, 0].copy_(args["layer0_code"])
+    if sampling:
+        executor._fill_uniforms(b, batch, args["sample_uniforms"], None, None)
+    audit = []
+    executor._frame(b, sampling, audit)
+    return b["codes"][:batch].clone(), [x[:batch] for x in audit]
+
+
+@pytest.mark.parametrize("sampling", [False, True])
+@torch.inference_mode()
+def test_frame_precomputation_projection_calls_and_state(models, sampling):
+    w, eager = models
+    torch.manual_seed(120)
+    # Exercise a genuine biased projection, not the tiny fixture's Identity.
+    w.small_to_mtp_projection = torch.nn.Linear(48, 32).eval()
+    w.model.codec_embedding = torch.nn.ModuleList([torch.nn.Embedding(64, 48) for _ in range(15)])
+    frame = type(eager)(w, "eager")
+    frame.mode = "kv_frame"  # CPU body only; graph construction still requires NPU.
+    frame._prepare_frame_tables()
+    projection_calls, embedding_calls, backbone_calls = [], [], []
+    hooks = [w.small_to_mtp_projection.register_forward_hook(lambda *a: projection_calls.append(1))]
+    hooks += [m.register_forward_hook(lambda *a: embedding_calls.append(1)) for m in w.model.codec_embedding]
+    hooks += [w.model.register_forward_hook(lambda *a: backbone_calls.append(1))]
+    try:
+        saved = None
+        for batch in (3, 16, 1, 3):
+            args = inputs(batch)
+            args["last_talker_hidden"] = torch.randn(batch, 48)
+            args["layer0_embed"] = torch.randn(batch, 48)
+            baseline = []
+            expected = eager(**args, do_sample=sampling, audit=baseline)
+            assert len(projection_calls) == 16 and len(embedding_calls) == 14
+            projection_calls.clear()
+            embedding_calls.clear()
+            backbone_calls.clear()
+            actual, logits = _cpu_frame(frame, args, sampling)
+            assert len(projection_calls) == 2 and not embedding_calls
+            assert len(backbone_calls) == 15
+            assert torch.equal(actual, expected)
+            for left, right in zip(logits, baseline):
+                torch.testing.assert_close(left, right[:batch], atol=2e-5, rtol=2e-5)
+            if saved is None:
+                saved = actual.clone(), args
+            projection_calls.clear()
+            backbone_calls.clear()
+        repeated, _ = _cpu_frame(frame, saved[1], sampling)
+        assert torch.equal(repeated, saved[0])
+        order = torch.tensor([2, 0, 1])
+        reordered, _ = _cpu_frame(frame, {k: v[order] for k, v in saved[1].items()}, sampling)
+        assert torch.equal(reordered, saved[0][order])
+        if sampling:
+            changed = dict(saved[1], sample_uniforms=1 - saved[1]["sample_uniforms"])
+            new_codes, _ = _cpu_frame(frame, changed, True)
+            assert torch.equal(new_codes, eager(**changed))
+            assert not torch.equal(new_codes, saved[0])
+    finally:
+        for hook in hooks:
+            hook.remove()
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@torch.inference_mode()
+def test_frame_tables_shared_nonpersistent_chunked_and_biased(models, dtype):
+    w, original = models
+    # Include a partial final chunk and a non-square projection with bias.
+    w.config.vocab_size = 270
+    w.small_to_mtp_projection = torch.nn.Linear(48, 32, dtype=dtype).eval()
+    w.model.codec_embedding = torch.nn.ModuleList([torch.nn.Embedding(270, 48, dtype=dtype) for _ in range(15)])
+    w.to(dtype)
+    frame = type(original)(w, "eager")
+    frame.mode = "kv_frame"
+    sizes = []
+    h = w.small_to_mtp_projection.register_forward_pre_hook(lambda m, a: sizes.append(a[0].shape[0]))
+    frame._prepare_frame_tables()
+    h.remove()
+    assert sizes == [256, 14] * 14
+    table = frame._projected_embeddings
+    assert table.shape == (14, 270, 32) and table.dtype == dtype
+    assert table.is_contiguous() and not table.requires_grad
+    for step in range(14):
+        expected = w.small_to_mtp_projection(w.model.codec_embedding[step].weight[[0, 255, 269]])
+        torch.testing.assert_close(table[step, [0, 255, 269]], expected, atol=0.02, rtol=0.02)
+    other = type(original)(w, "eager")
+    other.mode = "kv_frame"
+    other._prepare_frame_tables()
+    for batch in (1, 2, 4, 8, 16):
+        frame._allocate(batch)
+    assert table.data_ptr() == other._projected_embeddings.data_ptr()
+    assert not any("projected_embeddings" in key for key in w.state_dict())
+    meta = frame.optimization_metadata()
+    assert meta["projected_embedding_bytes"] == 14 * 270 * 32 * table.element_size()
+    assert meta["gumbel_buffer_bytes"] == 31 * 15 * 270 * 4
+    assert original.optimization_metadata()["projected_embedding_bytes"] == 0
+    original._allocate(1)
+    assert "log_noise" not in original.buffers[1]
+
+
+@torch.inference_mode()
+def test_frame_gumbel_matches_step_arithmetic_and_rng(models):
+    w, original = models
+    frame = type(original)(w, "eager")
+    frame.mode = "kv_frame"
+    frame._prepare_frame_tables()
+    b = frame._allocate(4)
+    # Include endpoint behavior: no new clamping or RNG draws are introduced.
+    u = torch.rand(3, 15, 64)
+    u[0, 0, :2] = torch.tensor([0.0, 1.0])
+    frame._fill_uniforms(b, 3, u, None, None)
+    state = torch.random.get_rng_state().clone()
+    frame._frame(b, True)
+    assert torch.equal(state, torch.random.get_rng_state())
+    expected = torch.stack([torch.log(-torch.log(b["uniforms"][:, step])) for step in range(15)], dim=1)
+    assert torch.equal(b["log_noise"], expected)
+    for step in range(15):
+        logits = torch.randn(4, 64).to(torch.bfloat16)
+        assert torch.equal(
+            (logits.float() - b["log_noise"][:, step]).argmax(-1, keepdim=True),
+            w._sample_codes_gumbel(logits, uniforms=b["uniforms"][:, step]),
+        )
+    for per_row in (False, True):
+        left = [torch.Generator().manual_seed(i) for i in range(3)]
+        right = [torch.Generator().manual_seed(i) for i in range(3)]
+        frame._fill_uniforms(b, 3, None, None if per_row else left[0], left if per_row else None)
+        ref = original._allocate(4)
+        original._fill_uniforms(ref, 3, None, None if per_row else right[0], right if per_row else None)
+        assert torch.equal(b["uniforms"][:3], ref["uniforms"][:3])
+        assert all(torch.equal(a.get_state(), c.get_state()) for a, c in zip(left, right))

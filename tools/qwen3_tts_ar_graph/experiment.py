@@ -281,6 +281,7 @@ def binding(args, root, frames):
         stock_batch_policy=getattr(args, "stock_batch_policy", "strict"),
         stock_comparison=getattr(args, "stock_comparison", "strict"),
         kv_implementation="fia_gqa_short_projection_v1",
+        kv_frame_optimization="batched_gumbel_projected_embeddings_v1",
         modes=["stock", "eager", "kv_step", "kv_frame"],
         sampling=["greedy", "sampling"],
         temperature=0.9,
@@ -818,6 +819,7 @@ def bench(args, progress):
                 attention="npu_fused_infer_attention_score: native GQA, full static KV, effective lengths",
                 projection="short sequence: prefill=2, decode=1",
                 implementation="fia_gqa_short_projection_v1",
+                **executor.optimization_metadata(),
             )
         )
         del run, executor
@@ -902,6 +904,8 @@ def profile(args, progress):
 
 def report(args, progress):
     rows = [json.loads(line) for line in (args.results / "timings.jsonl").read_text().splitlines()]
+    manifest_path = args.results / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8")) if manifest_path.exists() else {}
     groups = defaultdict(list)
     for row in rows:
         groups[(row["sampling"], row["batch"], row["candidate"])].append(row)
@@ -915,6 +919,16 @@ def report(args, progress):
         "候选设备事件 p50/p95 ms | 帧/s | 相对 stock | 配对 95% 区间 |",
         "|---|---:|---|---|---|---|---:|---:|---|",
     ]
+    for graph in manifest.get("graphs", []):
+        if graph.get("optimization") == "batched_gumbel_projected_embeddings_v1":
+            lines[4:4] = [
+                "kv_frame 启用整帧 Gumbel 变换和冻结权重投影后 embedding 表；stock、kv_step 保持原路径。",
+                f"共享投影表：{graph['projected_embedding_bytes'] / 2**20:.2f} MiB；"
+                f"各 bucket 的 Gumbel 缓冲合计：{graph['gumbel_buffer_bytes'] / 2**20:.2f} MiB。",
+                "预计算 projection 可能改变 BF16 舍入；本计时不代表输出一致性验证。",
+                "",
+            ]
+
     for (sample, size, candidate), group in groups.items():
         base = [r for r in group if r["engine"] == "stock"]
         cand = [r for r in group if r["engine"] == candidate]
