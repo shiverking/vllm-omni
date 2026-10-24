@@ -752,3 +752,26 @@ def test_load_weights_uses_model_dtype_before_precomputing_caches(dtype):
     assert _load_weights_noop(model) == {"decoder.fake_weight"}
     assert model.decoder.weight.dtype is dtype
     assert cache_dtypes == [dtype]
+
+
+@pytest.mark.parametrize("ending", ["scheduler", "empty", "chunk", "segment"])
+def test_graph_state_pool_released_at_all_request_endings(ending):
+    model = _make_model(async_chunk=True)
+    released = []
+    model.decoder._npugraph_wrapper = SimpleNamespace(
+        optimization="current", release_requests=lambda caches: released.extend(caches)
+    )
+    model.forward(
+        input_ids=torch.arange(6, dtype=torch.long), runtime_additional_information=[{"meta": {"request_id": "rid"}}]
+    )
+    cache = model._decoder_state_cache["rid"]
+    if ending == "scheduler":
+        model.on_requests_finished(["rid"])
+    else:
+        meta = {"request_id": "rid", "is_segment_finished" if ending == "segment" else "finished": True}
+        model.forward(
+            input_ids=torch.arange(0 if ending == "empty" else 4, dtype=torch.long),
+            runtime_additional_information=[{"meta": meta}],
+        )
+    assert "rid" not in model._decoder_state_cache
+    assert len(released) == 1 and released[0] is cache

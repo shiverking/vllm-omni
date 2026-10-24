@@ -19,6 +19,7 @@ import yaml
 ROOT = Path(__file__).resolve().parents[2]
 MODEL = "/softwarePlatform/l00927835/Qwen3-TTS-12Hz-1.7B-CustomVoice"
 RESULTS = "/softwarePlatform/y00899301/qwen3_tts_kv_frame_code2wav_graph_run01"
+OPTIMIZED_RESULTS = "/softwarePlatform/y00899301/qwen3_tts_kv_frame_code2wav_optimized_run01"
 
 
 def write_json(path, value):
@@ -51,7 +52,15 @@ def manifest(args):
     files = list((ROOT / "tools/qwen3_tts_code2wav_graph").glob("*.py"))
     files += [
         ROOT / "vllm_omni/model_executor/models/qwen3_tts" / name
-        for name in ("npu_segmented_graph_wrapper.py", "segmented_graph_wrapper.py", "qwen3_tts_code2wav.py")
+        for name in (
+            "npu_segmented_graph_wrapper.py",
+            "segmented_graph_wrapper.py",
+            "qwen3_tts_code2wav.py",
+            "code2wav_optimization.py",
+            "code2wav_state_pool.py",
+            "code2wav_capture.py",
+            "tokenizer_12hz/modeling_qwen3_tts_tokenizer_v2.py",
+        )
     ]
     cann = Path("/usr/local/Ascend/ascend-toolkit/latest/version.cfg")
     return dict(
@@ -142,6 +151,7 @@ def deployment(args, mode, directory, capture=None):
         if not old.is_symlink():
             old.unlink()
     extra["code2wav_graph_telemetry"] = str(telemetry)
+    extra["code2wav_graph_optimization"] = mode if mode in ("constants", "pooled", "fused") else "current"
     if capture:
         extra["code2wav_capture_dir"] = str(capture)
         # Collection must execute Python hooks, so disable Stage 1 outer capture

@@ -145,7 +145,11 @@ def run(model, wrapper, codes, caches):
 
 def snapshot_cache(cache):
     """Only semantic state, never ping-pong aliases from another executor."""
-    return copy.deepcopy({k: v for k, v in cache.items() if not k.startswith(("_suffix_", "_c2w_"))})
+    return {
+        k: v.detach().clone() if isinstance(v, torch.Tensor) else copy.deepcopy(v)
+        for k, v in cache.items()
+        if not k.startswith(("_suffix_", "_c2w_"))
+    }
 
 
 def cpu_cache(cache):

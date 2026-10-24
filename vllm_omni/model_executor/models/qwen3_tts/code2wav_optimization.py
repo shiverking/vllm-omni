@@ -55,9 +55,9 @@ def fixed_stage(wrapper, batch, length):
         yield
         return
     transformer = wrapper.decoder.pre_transformer
-    key = (batch, length)
+    parameter = next(transformer.parameters())
+    key = (batch, length, parameter.dtype, parameter.device, transformer.config._attn_implementation)
     if key not in wrapper._stage_constants:
-        parameter = next(transformer.parameters())
         positions = torch.arange(length, device=parameter.device)
         dummy = torch.empty(
             batch, length, transformer.config.hidden_size, device=parameter.device, dtype=parameter.dtype

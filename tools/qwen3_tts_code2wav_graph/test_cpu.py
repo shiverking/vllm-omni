@@ -74,6 +74,12 @@ def decoder():
         sliding_window=72,
     )
     model = Qwen3TTSTokenizerV2Decoder._from_config(config).eval()
+    # Nonzero, nonuniform books ensure different codes exercise state isolation.
+    with torch.no_grad():
+        for module in model.modules():
+            if hasattr(module, "embedding_sum"):
+                module.embedding_sum.normal_(std=0.2)
+                module.cluster_usage.uniform_(0.5, 2.0)
     model._initial_codec_chunk_frames = 1
     model._incremental_chunk_frames = 25
     return model
@@ -205,6 +211,7 @@ class StateTests(unittest.TestCase):
     @torch.no_grad()
     def test_fused_outputs_and_call_counts(self):
         from collections import Counter
+
         from vllm_omni.model_executor.models.qwen3_tts.code2wav_optimization import PackedProjection
 
         model = decoder()
@@ -233,6 +240,30 @@ class StateTests(unittest.TestCase):
         self.assertTrue(any("gate_up" in n for n in counts))
         self.assertFalse(any("_packed_" in n for n in model.state_dict()))
         wrapper.release_requests(caches)
+
+    @torch.no_grad()
+    def test_pool_exception_and_concurrent_submission(self):
+        from unittest.mock import patch
+
+        model = decoder()
+        wrapper = eager_layout_class()(model, optimization="pooled")
+        wrapper.warmup(torch.device("cpu"))
+        cache = dict(prefix_frames=0)
+        codes = [torch.randint(0, 32, (1, 2, 1))]
+        wrapper._execution_lock.acquire()
+        try:
+            with self.assertRaisesRegex(RuntimeError, "Concurrent"):
+                run(model, wrapper, codes, [cache])
+        finally:
+            wrapper._execution_lock.release()
+        run(model, wrapper, codes, [cache])
+        with patch.object(model, "_decode_suffix", side_effect=RuntimeError("injected failure")):
+            with self.assertRaisesRegex(RuntimeError, "injected failure"):
+                run(model, wrapper, [torch.randint(0, 32, (1, 2, 25))], [cache])
+        self.assertEqual(len(wrapper.state_pool.free), 16)
+        self.assertEqual(cache, {"prefix_frames": 0})
+        run(model, wrapper, codes, [cache])
+        wrapper.release_requests([cache])
 
     def test_graph_shapes(self):
         self.assertEqual(self.wrapper.statistics()["graph_count"], 15)
@@ -364,6 +395,35 @@ class StateTests(unittest.TestCase):
             result = read_json(args.results / "summary.json")
             self.assertTrue(result["comparisons"])
             self.assertTrue(all(x["speedup"] == 2.0 for x in result["comparisons"]))
+            import variants
+
+            def fake_executor(options, variant, progress):
+                model = decoder()
+                wrapper = None if variant == "baseline" else eager_layout_class()(model, optimization=variant)
+                if wrapper:
+                    wrapper.warmup(torch.device("cpu"))
+                return model, 24000, wrapper
+
+            args.variants = ["current", "constants", "pooled", "fused"]
+            args.batches = [1, 3, 4]
+            args.results = root / "variants_check"
+            args.results.mkdir()
+            with patch.object(variants, "make_executor", fake_executor):
+                variants.check(args, exp.Progress(args.results))
+            self.assertTrue(read_json(args.results / "correctness.json")["passed"])
+            args.results = root / "variants_bench"
+            args.results.mkdir()
+            args.variants = ["baseline", "current", "constants", "pooled", "fused"]
+            args.executions_per_round = 3
+            with patch.object(variants, "make_executor", fake_executor), patch.object(exp, "measured", fake_measure):
+                variants.bench(args, exp.Progress(args.results))
+            result = read_json(args.results / "summary.json")
+            self.assertEqual(
+                {r["variant"] for r in result["comparisons"]}, {"baseline", "constants", "pooled", "fused"}
+            )
+            self.assertTrue(
+                all(r["speedup"] == (0.5 if r["variant"] == "baseline" else 1.0) for r in result["comparisons"])
+            )
             # These mock times live only in TemporaryDirectory and are never
             # emitted as real performance evidence.
 
@@ -389,7 +449,7 @@ class StateTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             args = SimpleNamespace(device="npu:0")
             configs = []
-            for mode in ("baseline", "code2wav_graph"):
+            for mode in ("baseline", "code2wav_graph", "current", "constants", "pooled", "fused"):
                 directory = Path(tmp) / mode
                 directory.mkdir()
                 configs.append(yaml.safe_load(deployment(args, mode, directory).read_text(encoding="utf-8")))

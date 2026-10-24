@@ -48,6 +48,10 @@ def record_batch(owner, directory, lengths=(), force=False):
                 record_batch(live, directory, force=True)
 
         atexit.register(final_flush)
+        # Spawned workers may exit via multiprocessing rather than Python atexit.
+        from multiprocessing.util import Finalize
+
+        owner._code2wav_exit_finalizer = Finalize(None, final_flush, exitpriority=10)
         owner._code2wav_exit_flush_registered = True
     counters = getattr(owner, "_code2wav_research_batches", None)
     if counters is None:

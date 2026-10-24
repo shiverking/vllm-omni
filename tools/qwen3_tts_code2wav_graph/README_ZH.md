@@ -1,3 +1,102 @@
+# Code2Wav 两阶段优化实验
+
+默认比较 `baseline current fused`；完整消融选择 `baseline current constants pooled fused`。
+Code Predictor 始终为 kv_frame。`current` 为第一版 NPU graph，`constants` 追加码表/mask/RoPE 预计算与输入清理，
+`pooled` 追加16请求＋4填充槽位的双缓冲状态池和图内 gather/scatter，`fused` 追加 QKV/gate-up 融合。
+没有引入 Transformer 增量 KV；短块仍 eager。每个图档位预期15张图，batch=3填充到4。
+权重和dtype必须在捕获前固定；改动权重/设备后重建执行器和图，不复用已捕获图。
+
+各命令独立，不需要正确性证书。性能命令不读取检查结果，不能将耗时结果当作正确性通过。
+复用现有30条真实请求的采集，不必重新 collect。代码更新后执行：
+
+```bash
+cd /softwarePlatform/y00899301/vllm_debug_omni/vllm-omni-tts
+python tools/qwen3_tts_code2wav_graph/test_cpu.py
+```
+
+固定三条请求＋窗口边界小检查（所有优化档位）：
+
+```bash
+python tools/qwen3_tts_code2wav_graph/experiment.py check \
+  --input /softwarePlatform/y00899301/qwen3_tts_kv_frame_code2wav_graph_run01/capture \
+  --results /softwarePlatform/y00899301/qwen3_tts_kv_frame_code2wav_optimized_run01/probe \
+  --model /softwarePlatform/l00927835/Qwen3-TTS-12Hz-1.7B-CustomVoice \
+  --device npu:0 --probe-only --variants baseline current constants pooled fused \
+  --vllm-repo /vllm-workspace/vllm --ascend-repo /vllm-workspace/vllm-ascend
+```
+
+完整30条分块序列检查：
+
+```bash
+python tools/qwen3_tts_code2wav_graph/experiment.py check \
+  --input /softwarePlatform/y00899301/qwen3_tts_kv_frame_code2wav_graph_run01/capture \
+  --results /softwarePlatform/y00899301/qwen3_tts_kv_frame_code2wav_optimized_run01/check \
+  --model /softwarePlatform/l00927835/Qwen3-TTS-12Hz-1.7B-CustomVoice \
+  --device npu:0 --variants baseline current constants pooled fused \
+  --vllm-repo /vllm-workspace/vllm --ascend-repo /vllm-workspace/vllm-ascend
+```
+
+所有档位的独立消融计时和另行 profiling：
+
+```bash
+python tools/qwen3_tts_code2wav_graph/experiment.py bench \
+  --input /softwarePlatform/y00899301/qwen3_tts_kv_frame_code2wav_graph_run01/capture \
+  --results /softwarePlatform/y00899301/qwen3_tts_kv_frame_code2wav_optimized_run01/bench \
+  --model /softwarePlatform/l00927835/Qwen3-TTS-12Hz-1.7B-CustomVoice \
+  --device npu:0 --variants baseline current constants pooled fused \
+  --batches 1 2 3 4 --warmup 20 --executions-per-round 60 --profile \
+  --vllm-repo /vllm-workspace/vllm --ascend-repo /vllm-workspace/vllm-ascend
+```
+
+每个候选单独与 current 做 ABBA，不是五个档位混合排序。比较列统一为 `current耗时/候选耗时`，
+大于1代表候选更快；baseline 行表示 current 相对 baseline 的反向比值，不能当作 graph 加速倍数。
+池历史恢复在计时外，本次图内状态读写与输出交接计时。填充统计应结合实际路由，短块可能不走图。
+先运行 check 是建议，不是启动 bench 的条件。NPU 捕获异常明确失败，不静默换 eager。
+
+三组完整服务对比，顺序启动 baseline、current、fused；每档并发1/4/16、预热3请求、正式120请求、1轮：
+
+```bash
+python tools/qwen3_tts_code2wav_graph/service_bench.py \
+  --results /softwarePlatform/y00899301/qwen3_tts_kv_frame_code2wav_optimized_run01/service \
+  --model /softwarePlatform/l00927835/Qwen3-TTS-12Hz-1.7B-CustomVoice \
+  --device npu:0 --variants baseline current fused \
+  --concurrencies 1 4 16 --requests 120 --port 8091 \
+  --vllm-repo /vllm-workspace/vllm --ascend-repo /vllm-workspace/vllm-ascend
+```
+
+需服务消融时显式追加 constants、pooled。请勿同时手工启动占用8091端口的服务。
+服务工具支持重新执行覆盖自身结果，不删除 capture；本机请求绕过代理，健康检查20秒一次。
+周期遥测可能滞后5秒，包含预热，不能当作精确请求完成计数；状态池内存、图命中和实际batch见遥测。
+
+查看结果：
+
+```bash
+cat /softwarePlatform/y00899301/qwen3_tts_kv_frame_code2wav_optimized_run01/check/report.md
+cat /softwarePlatform/y00899301/qwen3_tts_kv_frame_code2wav_optimized_run01/bench/report.md
+cat /softwarePlatform/y00899301/qwen3_tts_kv_frame_code2wav_optimized_run01/service/report.md
+```
+
+`correctness.json` 按档位记录通过/失败、波形和状态误差、原生batch与单请求差异。
+`failure_<variant>.pt` 保存首个失败；fused 额外执行一次 eager 模块诊断定位投影或后续模块差异。
+`graph.json` 记录实际后端、图数、捕获耗时、派生buffer、状态池、路由和同时驻留模型的内存峰值。
+`timings.jsonl` 保存配对原始计时；`profile/<variant>/batch*/` 和 `operators.json` 保存独立设备诊断。
+单独计时不会计算完整服务指标；服务生成长度可能不同，应同时比较音频总时长。
+
+手动启动最终 fused 服务：
+
+```bash
+vllm-omni serve /softwarePlatform/l00927835/Qwen3-TTS-12Hz-1.7B-CustomVoice \
+  --deploy-config /softwarePlatform/y00899301/vllm_debug_omni/vllm-omni-tts/vllm_omni/deploy/qwen3_tts_kv_frame_code2wav_fused.yaml \
+  --host 0.0.0.0 --port 8091 --trust-remote-code --omni
+```
+
+同目录提供 `_current.yaml`、`_constants.yaml`、`_pooled.yaml`；原 `_baseline.yaml`、`_npu_graph.yaml` 保持兼容。
+本地 CPU 测试中的 graph 是同一计算流程的 eager 替身，不能证明 NPU 捕获成功或加速。
+
+---
+
+以下为原始采集和第一版工具说明。新 CLI 不写 `--variants` 时默认选择 baseline/current/fused。
+
 # kv_frame 基线上的 Code2Wav 缓存＋NPU graph
 
 两组始终使用当前 kv_frame（包括批量 Gumbel、预投影 embedding）。

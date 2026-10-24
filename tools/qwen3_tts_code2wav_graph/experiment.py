@@ -468,6 +468,9 @@ def main():
     parser = argparse.ArgumentParser(__doc__)
     parser.add_argument("command", choices=("collect", "check", "bench", "report"))
     common_args(parser)
+    from variants import DEFAULT_VARIANTS, VARIANTS
+
+    parser.add_argument("--variants", nargs="+", choices=VARIANTS, default=list(DEFAULT_VARIANTS))
     parser.add_argument("--input", type=Path, default=Path(RESULTS) / "capture")
     parser.add_argument("--results", type=Path, required=True)
     parser.add_argument("--limit", type=int, default=0, help="collect请求数；0表示30条")
@@ -488,7 +491,12 @@ def main():
     if args.command != "report":
         write_json(args.results / "manifest.json", manifest(args))
     try:
-        globals()[args.command](args, progress)
+        if args.command == "collect":
+            collect(args, progress)
+        else:
+            import variants
+
+            getattr(variants, args.command)(args, progress)
     except Exception as exc:
         write_json(args.results / "status.json", dict(status="failed", error=repr(exc)))
         raise

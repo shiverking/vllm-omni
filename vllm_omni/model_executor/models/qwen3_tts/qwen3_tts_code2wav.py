@@ -227,6 +227,12 @@ class Qwen3TTSCode2Wav(nn.Module):
         self._batch_stats_actual_frames.update(actual_frames)
         self._batch_stats_bucket_groups[(group_size, bucket_frames)] += 1
 
+    def _release_decoder_request(self, req_id):
+        cache = self._decoder_state_cache.pop(req_id, None)
+        wrapper = getattr(getattr(self, "decoder", None), "_npugraph_wrapper", None)
+        if wrapper is not None and cache is not None:
+            wrapper.release_requests([cache])
+
     def on_requests_finished(self, finished_req_ids: set[str] | list[str]) -> None:
         capture_dir = getattr(self, "_code2wav_capture_dir", None)
         if capture_dir and finished_req_ids:
@@ -238,11 +244,8 @@ class Qwen3TTSCode2Wav(nn.Module):
             from .code2wav_capture import record_batch
 
             record_batch(self, telemetry_dir)
-        wrapper = getattr(getattr(self, "decoder", None), "_npugraph_wrapper", None)
         for req_id in finished_req_ids:
-            cache = self._decoder_state_cache.pop(req_id, None)
-            if wrapper is not None and cache is not None:
-                wrapper.release_requests([cache])
+            self._release_decoder_request(req_id)
 
     def log_decode_batch_stats(self) -> None:
         if not self._batch_stats_enabled or self._batch_stats_requests == 0:
@@ -294,6 +297,23 @@ class Qwen3TTSCode2Wav(nn.Module):
         empty = torch.zeros((0,), dtype=torch.float32)
 
         if input_ids is None or input_ids.numel() == 0:
+            # Empty final payloads still own request slots until explicit cleanup.
+            infos = runtime_additional_information or model_intermediate_buffer or []
+            internal_ids = kwargs.get("request_ids") or []
+
+            def scalar(value):
+                if isinstance(value, list):
+                    value = value[0] if value else None
+                if isinstance(value, torch.Tensor):
+                    return value.reshape(-1)[0].item() if value.numel() else None
+                return value
+
+            for row, info in enumerate(infos):
+                meta = info.get("meta", {}) if isinstance(info, dict) else {}
+                if scalar(meta.get("finished")) or scalar(meta.get("is_segment_finished")):
+                    key = internal_ids[row] if row < len(internal_ids) else scalar(meta.get("request_id"))
+                    if key is not None:
+                        self._release_decoder_request(str(key))
             return OmniOutput(
                 text_hidden_states=None,
                 multimodal_outputs={"model_outputs": [empty], "sr": [sr_tensor]},
@@ -441,7 +461,7 @@ class Qwen3TTSCode2Wav(nn.Module):
                 strict=False,
             ):
                 if req_id is not None and (finished or segment_finished):
-                    self._decoder_state_cache.pop(req_id, None)
+                    self._release_decoder_request(req_id)
             return OmniOutput(
                 text_hidden_states=None,
                 multimodal_outputs={
@@ -573,7 +593,7 @@ class Qwen3TTSCode2Wav(nn.Module):
             strict=False,
         ):
             if req_id is not None and (finished or segment_finished):
-                self._decoder_state_cache.pop(req_id, None)
+                self._release_decoder_request(req_id)
 
         return OmniOutput(
             text_hidden_states=None,

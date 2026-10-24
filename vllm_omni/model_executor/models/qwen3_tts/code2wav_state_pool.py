@@ -104,10 +104,12 @@ class PooledGraphMixin:
             read=torch.arange(32, 32 + 2 * batch, 2, device=device, dtype=torch.long),
             write=torch.arange(33, 33 + 2 * batch, 2, device=device, dtype=torch.long),
         )
-        # A host buffer stages all row indexes with two copies per replay.
+        static["indices"] = torch.stack((static["read"], static["write"]))
+        static["read"], static["write"] = static["indices"][0], static["indices"][1]
+        # One host-to-device copy stages all row indexes per replay.
         host = torch.empty(2, batch, dtype=torch.long)
         caches = self._make_dummy_xvec_cache(batch, device, next(self.decoder.parameters()).dtype)
-        state = dict(input=static, cache=caches, host=host)
+        state = dict(input=static, cache=caches, host=host, host_array=host.numpy())
 
         def forward():
             with fixed_stage(self, batch, length):
@@ -157,11 +159,10 @@ class PooledGraphMixin:
                 static["codes"][row].copy_(codes_list[row][0])
             else:
                 read, write = 32 + row * 2, 33 + row * 2
-            state["host"][0, row] = read
-            state["host"][1, row] = write
+            state["host_array"][0, row] = read
+            state["host_array"][1, row] = write
         static["codes"][count:].zero_()
-        static["read"].copy_(state["host"][0])
-        static["write"].copy_(state["host"][1])
+        static["indices"].copy_(state["host"])
         state["graph"].replay()
         wav, q, c = state["output"]
         # One ownership transfer for the batch; returned row views own this copy.

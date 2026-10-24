@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Compare two services, both using the existing kv_frame Code Predictor."""
+"""Compare Code2Wav variants with the existing kv_frame Code Predictor."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ import time
 from pathlib import Path
 
 from runtime import (
-    RESULTS,
+    OPTIMIZED_RESULTS,
     ROOT,
     Progress,
     client_env,
@@ -60,7 +60,7 @@ def summarize(root, entries):
     lines = [
         "# kv_frame 基线：Code2Wav 服务对比",
         "",
-        "两组 Code Predictor 都是 kv_frame；Code2Wav 最大 batch=4；并发不等于实际 batch。",
+        "各组 Code Predictor 都是 kv_frame；Code2Wav 最大 batch=4；并发不等于实际 batch。",
         "性能不校验前序证书，不代表音频正确性通过。baseline 保留原外层图，实验组由 Code2Wav 管理内层图。",
         "",
         "| 配置 | 并发 | 成功/总数 | 请求/s | 音频秒/s | TTFP p50/p95 ms | "
@@ -85,27 +85,39 @@ def summarize(root, entries):
             f"{pair('audio_rtf')} | {pair('audio_underrun_s')} | {audio} | {error} |"
         )
     comparisons = []
-    lines += ["", "| 并发 | 请求吞吐比 graph/baseline | E2E 中位耗时比 baseline/graph |", "|---:|---:|---:|"]
+    lines += ["", "| 并发 | 候选/对照 | 请求吞吐比 | E2E 中位耗时比 |", "|---:|---|---:|---:|"]
+
+    def ratio(a, b):
+        return a / b if isinstance(a, (int, float)) and isinstance(b, (int, float)) and b else None
+
     for concurrency in sorted({r["concurrency"] for r in entries if r["concurrency"] > 0}):
         sides = {r["mode"]: r.get("result", {}) for r in entries if r["concurrency"] == concurrency}
-        baseline, candidate = sides.get("baseline", {}), sides.get("code2wav_graph", {})
-
-        def ratio(a, b):
-            return a / b if isinstance(a, (int, float)) and isinstance(b, (int, float)) and b else None
-
-        throughput = ratio(candidate.get("request_throughput"), baseline.get("request_throughput"))
-        latency = ratio(
-            baseline.get("median_e2el_ms", baseline.get("p50_e2el_ms")),
-            candidate.get("median_e2el_ms", candidate.get("p50_e2el_ms")),
-        )
-        comparisons.append(
-            dict(concurrency=concurrency, request_throughput_ratio=throughput, e2e_median_speedup=latency)
-        )
-        lines.append(f"| {concurrency} | {throughput} | {latency} |")
+        for anchor in ("baseline", "current"):
+            if anchor not in sides:
+                continue
+            for name, candidate in sides.items():
+                if name == anchor or (anchor == "current" and name == "baseline"):
+                    continue
+                baseline = sides[anchor]
+                throughput = ratio(candidate.get("request_throughput"), baseline.get("request_throughput"))
+                latency = ratio(
+                    baseline.get("median_e2el_ms", baseline.get("p50_e2el_ms")),
+                    candidate.get("median_e2el_ms", candidate.get("p50_e2el_ms")),
+                )
+                comparisons.append(
+                    dict(
+                        concurrency=concurrency,
+                        candidate=name,
+                        baseline=anchor,
+                        request_throughput_ratio=throughput,
+                        e2e_median_speedup=latency,
+                    )
+                )
+                lines.append(f"| {concurrency} | {name}/{anchor} | {throughput} | {latency} |")
     lines += [
         "",
         "None 表示未提供。原始指标、执行错误与各档遥测快照保存在 summary.json。",
-        "遥测快照是累计计数，包含预热；按 before/after 差值比较正式档位。",
+        "遥测快照是累计计数，包含预热，周期快照可能滞后5秒；before/after差值为路由诊断，不作为精确请求计数。",
         "重复运行覆盖本轮已管理结果，不删除采集输入或整个输出目录。",
     ]
     write_json(
@@ -135,9 +147,9 @@ def run(args):
     (dataset / "meta.lst").write_text("\n".join(lines) + "\n", encoding="utf-8")
     entries = []
     summarize(root, entries)
-    total = 2 * len(args.concurrencies)
+    total = len(args.variants) * len(args.concurrencies)
     done = 0
-    for mode in ("baseline", "code2wav_graph"):
+    for mode in args.variants:
         directory = root / mode
         try:
             with server(args, mode, directory, progress) as url:
@@ -223,7 +235,7 @@ def run(args):
                     entries.append(item)
                     summarize(root, entries)
                     done += 1
-                    progress.update(done, total, "两组服务对比")
+                    progress.update(done, total, "多档位服务对比")
         except Exception as exc:
             progress.log(f"{mode} 失败：{exc}；保留诊断并继续另一组")
             entries.append(dict(mode=mode, concurrency=0, requests=args.requests, error=repr(exc)))
@@ -242,7 +254,10 @@ def run(args):
 def main():
     parser = argparse.ArgumentParser(__doc__)
     common_args(parser)
-    parser.add_argument("--results", type=Path, default=Path(RESULTS) / "service")
+    from variants import DEFAULT_VARIANTS, VARIANTS
+
+    parser.add_argument("--variants", nargs="+", choices=VARIANTS, default=list(DEFAULT_VARIANTS))
+    parser.add_argument("--results", type=Path, default=Path(OPTIMIZED_RESULTS) / "service")
     parser.add_argument("--requests", type=int, default=120)
     parser.add_argument("--concurrencies", type=int, nargs="+", default=[1, 4, 16])
     args = parser.parse_args()

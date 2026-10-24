@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 import time
 from collections import Counter
 from contextlib import contextmanager
@@ -45,6 +46,8 @@ class NPUGraphDecoderWrapper(PooledGraphMixin, CUDAGraphDecoderWrapper):
             raise ValueError(f"Unknown Code2Wav optimization: {optimization}")
         self.optimization = optimization
         self._stage_constants = {}
+        self._execution_lock = threading.Lock()
+        self._execution_stream = None
         if optimization != "current":
             prepare_constants(decoder)
         if optimization == "fused":
@@ -262,6 +265,22 @@ class NPUGraphDecoderWrapper(PooledGraphMixin, CUDAGraphDecoderWrapper):
             return output
 
     def _batched_request_decode(self, codes_list, request_caches):
+        if self.optimization == "current":
+            return self._decode_requests_impl(codes_list, request_caches)
+        if not self._execution_lock.acquire(blocking=False):
+            raise RuntimeError("Concurrent Code2Wav graph submission would overwrite static buffers")
+        try:
+            if codes_list and codes_list[0].device.type == "npu":
+                stream = torch.npu.current_stream(codes_list[0].device).npu_stream
+                if self._execution_stream is None:
+                    self._execution_stream = stream
+                elif self._execution_stream != stream:
+                    raise RuntimeError("Code2Wav graph buffers require a single ordered execution stream")
+            return self._decode_requests_impl(codes_list, request_caches)
+        finally:
+            self._execution_lock.release()
+
+    def _decode_requests_impl(self, codes_list, request_caches):
         if self._is_capturing():
             raise RuntimeError("Code2Wav inner NPU graphs cannot run inside an outer capture")
         if any(int(cache.get("prefix_frames", 0)) != 0 for cache in request_caches):
