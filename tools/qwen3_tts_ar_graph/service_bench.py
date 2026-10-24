@@ -133,12 +133,13 @@ def summarize(results):
         "# 原始 AR 多并发服务实验",
         "",
         "本服务测试不校验帧级正确性证书；性能结果不代表新增正确性验证。",
+        "KV 使用 FIA 原生 GQA 与短序列投影；可能与 stock 有数值及输出差异，结合音频时长判断吞吐。",
         "",
         "客户端并发不等于实际推理 batch。batch 遥测包含预热请求，原始快照按轮保存。",
         "",
         "| 配置 | 并发 | 轮次 | 成功请求 | 请求/s | 音频/s | TTFP p50/p95 | E2E p50/p95 | "
-        "RTF p50/p95 | underrun p50/p95 s | 错误率 |",
-        "|---|---:|---:|---:|---:|---:|---|---|---|---|---:|",
+        "RTF p50/p95 | underrun p50/p95 s | 总音频时长 s | 错误率 |",
+        "|---|---:|---:|---:|---:|---:|---|---|---|---|---:|---:|",
     ]
     summaries = []
 
@@ -168,6 +169,7 @@ def summarize(results):
         completed = get(data, "completed")
         duration = get(data, "duration")
         audio_duration = get(data, "total_audio_duration_s", "total_audio_duration", "audio_duration_total")
+        item["total_audio_duration_s"] = audio_duration
         throughput = get(data, "request_throughput")
         audio_throughput = get(data, "audio_throughput")
         if audio_throughput is None and audio_duration is not None and duration:
@@ -179,7 +181,7 @@ def summarize(results):
         lines.append(
             f"| {mode} | {concurrency[1:]} | {round_id} | {completed} | {throughput} | "
             f"{audio_throughput} | {pair('audio_ttfp_ms')} | {pair('e2el_ms')} | "
-            f"{pair('audio_rtf')} | {pair('audio_underrun_s')} | "
+            f"{pair('audio_rtf')} | {pair('audio_underrun_s')} | {audio_duration} | "
             f"{(120 - completed) / 120 if completed is not None else None} |"
         )
     lines += [

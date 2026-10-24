@@ -111,7 +111,7 @@ def test_invalid_options(models):
 
 @pytest.mark.parametrize("position,length", [(0, 2), (2, 1), (15, 1)])
 @torch.inference_mode()
-def test_cached_mlp_preserves_stock_row_geometry(models, position, length):
+def test_cached_mlp_uses_only_new_positions(models, position, length):
     wrapper, _ = models
     mlp = wrapper.model.layers[0].mlp
     x = torch.randn(8, length, wrapper.config.hidden_size)
@@ -124,13 +124,9 @@ def test_cached_mlp_preserves_stock_row_geometry(models, position, length):
     finally:
         h1.remove()
         h2.remove()
-    assert down_inputs[0].shape[1] == 17
-    assert down_inputs[1].shape[1] == length
+    assert all(value.shape[1] == length for value in down_inputs)
     assert all(shape[1] == length for shape in gate_shapes)
-    torch.testing.assert_close(down_inputs[0][:, position : position + length], down_inputs[1], rtol=0, atol=0)
-    remaining = down_inputs[0].clone()
-    remaining[:, position : position + length].zero_()
-    assert torch.count_nonzero(remaining) == 0
+    torch.testing.assert_close(down_inputs[0], down_inputs[1], rtol=0, atol=0)
     torch.testing.assert_close(cached, stock, rtol=2e-5, atol=2e-5)
 
 
@@ -151,10 +147,114 @@ def test_cached_attention_projection_geometry_and_positions(models):
         h1.remove()
         h2.remove()
     assert qkv_lengths == [2] + [1] * 14
-    for step, value in enumerate(projected):
-        assert value.shape[1] == 17
-        start, length = (0, 2) if step == 0 else (step + 1, 1)
-        remaining = value.clone()
-        remaining[:, start : start + length].zero_()
-        assert torch.count_nonzero(remaining) == 0
-        assert torch.count_nonzero(value[:, start : start + length]) > 0
+    assert [value.shape[1] for value in projected] == [2] + [1] * 14
+    assert all(torch.count_nonzero(value) > 0 for value in projected)
+
+
+@pytest.mark.parametrize("mode,expected_graphs,expected_calls", [("kv_step", 15, 60), ("kv_frame", 2, 120)])
+@torch.inference_mode()
+def test_graph_capture_shared_only_for_step(models, monkeypatch, mode, expected_graphs, expected_calls):
+    from contextlib import nullcontext
+    from types import SimpleNamespace
+
+    w, executor = models
+    executor.mode = mode  # Exercise capture bookkeeping on CPU with a fake NPU API.
+    monkeypatch.setattr(
+        torch,
+        "npu",
+        SimpleNamespace(
+            is_current_stream_capturing=lambda: False,
+            synchronize=lambda *args: None,
+            graph_pool_handle=lambda: object(),
+            NPUGraph=lambda: object(),
+            graph=lambda *args, **kw: nullcontext(),
+        ),
+        raising=False,
+    )
+    calls = []
+    hook = w.model.register_forward_hook(lambda *args: calls.append(1))
+    try:
+        executor.prepare(2, False)
+        executor.prepare(2, True)
+        executor.prepare(2, False)
+    finally:
+        hook.remove()
+    assert executor.graph_count == expected_graphs
+    assert len(calls) == expected_calls
+    if mode == "kv_step":
+        assert executor.graph_key(2, False) == executor.graph_key(2, True)
+
+
+@torch.inference_mode()
+def test_cached_fia_reads_full_native_gqa_cache(models, monkeypatch):
+    import sys
+    from types import SimpleNamespace
+
+    w, executor = models
+    attn = w.model.layers[0].self_attn
+    module = sys.modules[type(attn).__module__]
+    monkeypatch.setattr(module.current_omni_platform, "is_npu", lambda: True)
+    attn._fusion_causal_mask = torch.triu(torch.ones(16, 16, dtype=torch.bool), diagonal=1)
+    batch, capacity, dim = 2, 16, attn.head_dim
+    cache = tuple(torch.randn(batch, attn.num_kv_heads, capacity, dim, dtype=torch.bfloat16) for _ in range(2))
+    seen = []
+
+    def fia(**kw):
+        seen.append(kw)
+        end = kw["actual_seq_lengths_kv"][0]
+        return (
+            torch.nn.functional.scaled_dot_product_attention(
+                kw["query"],
+                kw["key"][:, :, :end],
+                kw["value"][:, :, :end],
+                is_causal=kw["sparse_mode"] == 2,
+                enable_gqa=attn.is_gqa,
+                scale=attn.scaling,
+            ),
+        )
+
+    monkeypatch.setattr(module, "torch_npu", SimpleNamespace(npu_fused_infer_attention_score=fia), raising=False)
+    for position, length in ((0, 2), (2, 1), (15, 1)):
+        q = torch.randn(batch, attn.num_heads, length, dim, dtype=torch.bfloat16)
+        k, v = (torch.randn(batch, attn.num_kv_heads, length, dim, dtype=torch.bfloat16) for _ in range(2))
+        result = attn._cached_attention(q, k, v, cache, position)
+        kw = seen[-1]
+        assert kw["key"].data_ptr() == cache[0].data_ptr()
+        assert kw["value"].data_ptr() == cache[1].data_ptr()
+        assert kw["key"].shape == (batch, attn.num_kv_heads, capacity, dim)
+        assert kw["actual_seq_lengths"] == [length] * batch
+        assert kw["actual_seq_lengths_kv"] == [position + length] * batch
+        assert kw["num_key_value_heads"] == attn.num_kv_heads
+        assert (kw["atten_mask"] is not None) == (position == 0)
+        assert result.shape == q.shape
+        torch.testing.assert_close(cache[0][:, :, position : position + length], k, atol=0, rtol=0)
+    monkeypatch.setattr(module, "torch_npu", SimpleNamespace(), raising=False)
+    with pytest.raises(RuntimeError, match="no fallback"):
+        attn._cached_attention(q, k, v, cache, 15)
+
+
+@torch.inference_mode()
+def test_graph_capture_failure_does_not_register_or_fallback(models, monkeypatch):
+    from types import SimpleNamespace
+
+    _, executor = models
+    executor.mode = "kv_step"
+
+    def failure(*args, **kwargs):
+        raise RuntimeError("capture failed")
+
+    monkeypatch.setattr(
+        torch,
+        "npu",
+        SimpleNamespace(
+            is_current_stream_capturing=lambda: False,
+            synchronize=lambda *args: None,
+            graph_pool_handle=lambda: object(),
+            NPUGraph=lambda: object(),
+            graph=failure,
+        ),
+        raising=False,
+    )
+    with pytest.raises(RuntimeError, match="capture failed"):
+        executor.prepare(1, False)
+    assert executor.graphs == {}

@@ -107,7 +107,7 @@ def test_failure_saved_before_performance(capture, tmp_path, models, monkeypatch
     original = type(executor).__call__
 
     def corrupt(self, *a, **kw):
-        return original(self, *a, **kw) + 1
+        return (original(self, *a, **kw) + 1) % self.vocab
 
     monkeypatch.setattr(type(executor), "__call__", corrupt)
     with pytest.raises(AssertionError, match="codes differ"):
@@ -271,7 +271,7 @@ def test_stock_variation_policy_is_explicit(capture, tmp_path, models, monkeypat
         exp.check(args, exp.Progress(output))
         cert = exp.read_json(output / "correctness.json")
         assert cert["passed"] and not cert["stock_batch_invariant"]
-        assert cert["correctness_scope"] == "cached_vs_stock_same_batch"
+        assert cert["correctness_scope"].startswith("cached_eager_vs_graph_same_batch")
         assert len(cert["stock_batch_variations"]) == 1
         assert (output / "stock_batch_variation_first.pt").exists()
 
@@ -461,3 +461,141 @@ def test_service_client_progress_and_exit(service_tool, tmp_path, monkeypatch, r
         service_tool.run_benchmark(["client"], tmp_path, progress, "stock / c1")
     assert any("25/120" in msg for msg in messages)
     assert calls == [20, 20]
+
+
+@torch.inference_mode()
+def test_teacher_forcing_uses_stock_history(models):  # noqa: F811
+    from .test_cached_ar import inputs
+
+    w, executor = models
+    x = inputs(3)
+    audit = []
+    codes = executor(**x, do_sample=False, audit=audit)
+    forced = exp.teacher_forced_logits(executor, x, codes)
+    for left, right in zip(forced, audit):
+        torch.testing.assert_close(left, right[:3], atol=2e-5, rtol=2e-5)
+    changed = codes.clone()
+    changed[:, 1] = (changed[:, 1] + 1) % 64
+    other = exp.teacher_forced_logits(executor, x, changed)
+    torch.testing.assert_close(forced[0], other[0], atol=0, rtol=0)
+    assert not torch.equal(forced[1], other[1])
+
+
+@pytest.mark.parametrize("policy", ["record", "strict"])
+def test_stock_policy_records_differences_without_hiding_them(capture, tmp_path, models, monkeypatch, policy):  # noqa: F811
+    w, _ = models
+    output = tmp_path / policy
+    output.mkdir()
+    args = SimpleNamespace(
+        input=capture, results=output, probe_only=True, device="cpu", model=exp.MODEL, stock_comparison=policy
+    )
+    monkeypatch.setattr(exp, "load_predictor", lambda *args: w)
+    monkeypatch.setattr(exp, "binding", lambda *args: {"stock_comparison": policy})
+    monkeypatch.setattr(exp, "CHECK_BATCHES", [1])
+    original = w.forward
+
+    def perturbed_stock(*args, **kw):
+        codes = original(*args, **kw).clone()
+        codes[:, 1] = (codes[:, 1] + 1) % w.config.vocab_size
+        return codes
+
+    monkeypatch.setattr(w, "forward", perturbed_stock)
+    if policy == "strict":
+        with pytest.raises(AssertionError, match="codes differ from stock"):
+            exp.check(args, exp.Progress(output))
+    else:
+        exp.check(args, exp.Progress(output))
+        cert = exp.read_json(output / "correctness.json")
+        assert cert["passed"] and cert["kv_execution_consistent"]
+        assert not cert["stock_codes_equal"]
+        assert cert["stock_comparison_summary"]["differing_residual_tokens"] > 0
+        assert (output / "stock_comparison.json").exists()
+
+
+def test_invalid_outputs_remain_fatal_in_record_mode():
+    with pytest.raises(AssertionError, match="Non-finite"):
+        exp.validate_outputs(torch.zeros(1, 16, dtype=torch.long), [torch.tensor([[float("nan")]])], 64)
+    with pytest.raises(AssertionError, match="Invalid codec"):
+        exp.validate_outputs(torch.full((1, 16), 64), [torch.zeros(1, 64)] * 15, 64)
+
+
+def test_stock_comparison_cli_default_is_strict():
+    args = exp.parser().parse_args(["check", "--input", "capture", "--results", "out"])
+    assert args.stock_comparison == "strict"
+
+
+def test_three_service_configs_differ_only_in_execution():
+    import yaml
+
+    configs = []
+    for mode in ("stock", "kv_step", "kv_frame"):
+        config = yaml.safe_load((ROOT / f"vllm_omni/deploy/qwen3_tts_ar_{mode}.yaml").read_text())
+        extra = config["connectors"]["connector_of_shared_memory"]["extra"]
+        assert extra.pop("code_predictor_ar_execution") == mode
+        configs.append(config)
+    assert configs[0] == configs[1] == configs[2]
+
+
+@torch.inference_mode()
+def test_record_policy_still_rejects_cached_graph_differences(capture, tmp_path, models, monkeypatch):  # noqa: F811
+    import importlib
+
+    w, eager = models
+    output = tmp_path / "record_graph_failure"
+    output.mkdir()
+    args = SimpleNamespace(
+        input=capture,
+        results=output,
+        probe_only=True,
+        device="npu:0",
+        model=exp.MODEL,
+        stock_comparison="record",
+        stock_batch_policy="record-stable",
+    )
+    module = importlib.import_module("vllm_omni.model_executor.models.common.qwen3_code_predictor_ar")
+    real_executor = module.CachedARExecutor
+
+    class FakeGraph:
+        # Only test check's comparison policy; CPU eager stands in for the NPU graph.
+        def __init__(self, wrapper):
+            self.inner = real_executor(wrapper, "eager")
+            self.mode = "fake_graph"
+            self.graphs = {(1, None): object()}
+            self.graph_count = 1
+
+        def graph_key(self, batch, sampling):
+            return (batch, None)
+
+        def __call__(self, **inputs):
+            codes = self.inner(**inputs).clone()
+            codes[:, -1] = (codes[:, -1] + 1) % w.config.vocab_size
+            return codes
+
+        def last_logits(self, *args):
+            return self.inner.last_logits(*args)
+
+        def snapshot(self):
+            return self.inner.snapshot()
+
+    monkeypatch.setattr(
+        module,
+        "CachedARExecutor",
+        lambda wrapper, mode: real_executor(wrapper, "eager") if mode == "eager" else FakeGraph(wrapper),
+    )
+    monkeypatch.setattr(exp, "load_predictor", lambda *args: w)
+    monkeypatch.setattr(exp, "binding", lambda *args: {"stock_comparison": "record"})
+    monkeypatch.setattr(exp, "CHECK_BATCHES", [1])
+    original_inputs, original_uniforms = exp.batch_inputs, exp.uniforms_for
+    monkeypatch.setattr(exp, "batch_inputs", lambda frames, device: original_inputs(frames, "cpu"))
+    monkeypatch.setattr(
+        exp, "uniforms_for", lambda frames, vocab, device, salt=0: original_uniforms(frames, vocab, "cpu", salt)
+    )
+    # order tensor is constructed on args.device; fail the corrupt graph before reordering it.
+    original_arange = torch.arange
+    monkeypatch.setattr(torch, "arange", lambda *a, **kw: original_arange(*a, **dict(kw, device="cpu")))
+    with pytest.raises(AssertionError, match="KV codes differ"):
+        exp.check(args, exp.Progress(output))
+    cert = exp.read_json(output / "correctness.json")
+    assert not cert["passed"]
+    assert cert["context"]["engine"] == "kv_step"
+    assert (output / "failure.pt").exists()

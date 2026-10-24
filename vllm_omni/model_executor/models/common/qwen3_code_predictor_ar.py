@@ -12,6 +12,11 @@ from collections import Counter
 from pathlib import Path
 
 import torch
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
+
+KV_IMPLEMENTATION = "fia_gqa_short_projection_v1"
 
 
 class CachedARExecutor:
@@ -108,11 +113,41 @@ class CachedARExecutor:
         for step in range(self.groups - 1):
             self._head(b, step, self._backbone(b, step), sampling, audit)
 
+    def graph_key(self, batch, sampling):
+        # Backbone computation does not depend on how its logits are sampled.
+        return (batch, bool(sampling) if self.mode == "kv_frame" else None)
+
+    @property
+    def graph_count(self):
+        return len(self.graphs) * (1 if self.mode == "kv_frame" else self.groups - 1)
+
+    def prepare_all(self):
+        samples = (False, True) if self.mode == "kv_frame" else (False,)
+        total = len(self.buckets) * len(samples)
+        for index, (bucket, sampling) in enumerate(((b, s) for b in self.buckets for s in samples), 1):
+            logger.info(
+                "Cached AR capture %d/%d: mode=%s bucket=%d sampling=%s",
+                index,
+                total,
+                self.mode,
+                bucket,
+                sampling if self.mode == "kv_frame" else "shared",
+            )
+            self.prepare(bucket, sampling)
+        logger.info(
+            "Cached AR ready: implementation=%s mode=%s buckets=%s graphs=%d capture_seconds=%.3f",
+            KV_IMPLEMENTATION,
+            self.mode,
+            self.buckets,
+            self.graph_count,
+            self.capture_seconds,
+        )
+
     @torch.inference_mode()
     def prepare(self, batch, sampling):
         """Capture outside benchmark timing; graph errors propagate."""
         b = self._allocate(batch)
-        key = (batch, bool(sampling))
+        key = self.graph_key(batch, sampling)
         if self.mode == "eager" or key in self.graphs:
             return
         if torch.npu.is_current_stream_capturing():
@@ -135,8 +170,18 @@ class CachedARExecutor:
                     output = self._backbone(b, step)
                 entry.append((graph, output))
         torch.npu.synchronize(self.device)
-        self.capture_seconds += time.perf_counter() - started
+        elapsed = time.perf_counter() - started
+        self.capture_seconds += elapsed
         self.graphs[key] = entry
+        logger.info(
+            "Cached AR captured: mode=%s bucket=%d sampling=%s graphs=%d seconds=%.3f total_graphs=%d",
+            self.mode,
+            batch,
+            sampling if self.mode == "kv_frame" else "shared",
+            1 if self.mode == "kv_frame" else self.groups - 1,
+            elapsed,
+            self.graph_count,
+        )
         if self.mode == "kv_frame":
             self.graph_logits[key] = tuple(b["last_logits"])
 
@@ -203,10 +248,10 @@ class CachedARExecutor:
             if sampling:
                 self._fill_uniforms(b, batch, sample_uniforms, generator, generators)
             if self.mode == "kv_frame":
-                self.graphs[(bucket, sampling)].replay()
+                self.graphs[self.graph_key(bucket, sampling)].replay()
             elif self.mode == "kv_step":
                 self._project(b)
-                for step, (graph, output) in enumerate(self.graphs[(bucket, sampling)]):
+                for step, (graph, output) in enumerate(self.graphs[self.graph_key(bucket, sampling)]):
                     graph.replay()
                     self._head(b, step, output, sampling)
             else:
@@ -226,7 +271,7 @@ class CachedARExecutor:
     def last_logits(self, batch, sampling):
         bucket = next(n for n in self.buckets if n >= batch)
         if self.mode == "kv_frame":
-            return self.graph_logits[(bucket, sampling)]
+            return self.graph_logits[self.graph_key(bucket, sampling)]
         return self.buffers[bucket]["last_logits"]
 
     def snapshot(self):

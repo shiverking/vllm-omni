@@ -158,8 +158,8 @@ class CodePredictorAttention(nn.Module):
     """Multi-head self-attention for code predictor.
 
     Uses ``F.scaled_dot_product_attention`` with HF-compatible RoPE and RMSNorm.
-    No KV cache -- the code predictor always re-prefills the full (short)
-    sequence each AR step.
+    Stock re-prefills the full short sequence. Experimental cached AR
+    processes only new positions and uses native FIA GQA on NPU.
 
     Input : [B, seq_len, hidden_size]
     Output: [B, seq_len, hidden_size]
@@ -282,29 +282,38 @@ class CodePredictorAttention(nn.Module):
             raise ValueError("Code predictor KV position out of range")
         keys[:, :, position:end].copy_(k)
         values[:, :, position:end].copy_(v)
-        k = keys[:, :, :end].contiguous()
-        v = values[:, :, :end].contiguous()
         causal = position == 0 and q.shape[2] > 1
         if not current_omni_platform.is_npu():
-            return F.scaled_dot_product_attention(q, k, v, scale=self.scaling, is_causal=causal, enable_gqa=self.is_gqa)
-        if self.is_gqa:
-            k = k.repeat_interleave(self.num_queries_per_kv, dim=1)
-            v = v.repeat_interleave(self.num_queries_per_kv, dim=1)
-        return torch_npu.npu_fusion_attention(
-            q.contiguous(),
-            k.contiguous(),
-            v.contiguous(),
-            self.num_heads,
-            "BNSD",
-            atten_mask=self._fusion_causal_mask if causal else None,
+            return F.scaled_dot_product_attention(
+                q,
+                keys[:, :, :end],
+                values[:, :, :end],
+                scale=self.scaling,
+                is_causal=causal,
+                enable_gqa=self.is_gqa,
+            )
+        # Native GQA reads the static KV-head cache directly. Do not materialize
+        # the prefix or repeat KV heads: effective lengths exclude stale slots.
+        if q.dtype != torch.bfloat16:
+            raise ValueError("Cached NPU AR requires BF16 FIA attention")
+        if not keys.is_contiguous() or not values.is_contiguous():
+            raise ValueError("Cached NPU AR requires contiguous full KV caches")
+        if not hasattr(torch_npu, "npu_fused_infer_attention_score"):
+            raise RuntimeError("Cached NPU AR requires npu_fused_infer_attention_score; no fallback")
+        return torch_npu.npu_fused_infer_attention_score(
+            query=q.contiguous(),
+            key=keys,
+            value=values,
+            num_heads=self.num_heads,
+            num_key_value_heads=self.num_kv_heads,
+            input_layout="BNSD",
+            atten_mask=self._fusion_causal_mask.contiguous() if causal else None,
+            actual_seq_lengths=[q.shape[2]] * q.shape[0],
+            actual_seq_lengths_kv=[end] * q.shape[0],
             scale=float(self.scaling),
-            keep_prob=1.0,
-            pre_tockens=2147483647,
-            next_tockens=2147483647,
-            inner_precise=0,
+            pre_tokens=2147483647,
+            next_tokens=2147483647,
             sparse_mode=2 if causal else 0,
-            gen_mask_parallel=True,
-            sync=True,
         )[0]
 
     def forward(
@@ -356,14 +365,6 @@ class CodePredictorAttention(nn.Module):
             )
 
         attn_out = attn_out.transpose(1, 2).reshape(bsz, seq_len, -1)
-        if kv_cache is not None:
-            # Ascend BF16 o_proj also changes rounding with short GEMM shapes.
-            # Keep stock row positions for this projection, while QKV and
-            # attention still process only the newly appended tokens.
-            end = cache_position + seq_len
-            padded = attn_out.new_zeros((bsz, self.max_seq, attn_out.shape[-1]))
-            padded[:, cache_position:end].copy_(attn_out)
-            return self.o_proj(padded)[:, cache_position:end]
         return self.o_proj(attn_out)
 
 
@@ -388,25 +389,14 @@ class CodePredictorMLP(nn.Module):
             bias=False,
         )
         self.down_proj = nn.Linear(config.intermediate_size, config.hidden_size, bias=False)
-        self._ar_full_sequence_length = int(config.num_code_groups) + 1
 
     def forward(self, hidden_states: torch.Tensor, cache_position: int | None = None) -> torch.Tensor:
         gate_up = self.gate_up_proj(hidden_states)
         gate, up = gate_up.split([self._intermediate_size, self._intermediate_size], dim=-1)
         activated = F.silu(gate) * up
-        if cache_position is None:
-            return self.down_proj(activated)
-        # NPU BF16 down_proj changed rounding when the sequence shrank from 17
-        # to 2, enough to change greedy codes. Match stock's GEMM row geometry
-        # only for this projection; attention and gate_up still process new KV
-        # positions only. Position is static per captured step. Graph capture
-        # owns this temporary's allocation; replay needs no host allocation.
-        end = cache_position + activated.shape[1]
-        if cache_position < 0 or end > self._ar_full_sequence_length:
-            raise ValueError("Cached MLP position out of range")
-        padded = activated.new_zeros((activated.shape[0], self._ar_full_sequence_length, self._intermediate_size))
-        padded[:, cache_position:end].copy_(activated)
-        return self.down_proj(padded)[:, cache_position:end]
+        # Keep the true incremental GEMM shape. BF16 differences from the
+        # stock full-sequence shape are reported by the research checks.
+        return self.down_proj(activated)
 
 
 # ===================================================================
@@ -1193,9 +1183,7 @@ class CodePredictorWrapper(nn.Module):
 
                 self._prepare_npu_weights()
                 self._ar_executor = CachedARExecutor(self, self.ar_execution)
-                for bucket in self._ar_executor.buckets:
-                    for sampling in (False, True):
-                        self._ar_executor.prepare(bucket, sampling)
+                self._ar_executor.prepare_all()
             return self._ar_executor(
                 layer0_code,
                 layer0_embed,

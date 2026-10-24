@@ -1,193 +1,212 @@
-# Qwen3-TTS：帧内 KV cache＋整帧 AR 图
+# Qwen3-TTS：商业版高效 KV 路径与整帧 AR 图
 
-从 `v0.30.0`（a8576ccb725c4e21cd13c3eb5f9a546b21149d2b）开发，分支 `codex/qwen3-tts-kv-frame-graph`。
-只使用原始 AR，不训练、不投机。CPU 通过不代表 NPU 通过，未收到服务器结果前性能待验证。
+基于 v0.30.0，分支 `codex/qwen3-tts-kv-frame-graph`。只做原始 AR，不训练、不投机。
+本地 CPU 检查不代表 NPU 算子或图已验证；实际收益由服务器结果决定。
 
-## 执行模式
+## 执行路径与图数量
 
-| 模式 | 每帧主干 | Code Predictor 图 replay | 作用 |
-|---|---:|---:|---|
-| stock | 15 次 | 独立帧工具中 15 次；服务外层图可能合并 | tag 原始实现 |
-| kv_step | 15 次 | 15 次 | 首次两位置 prefill，然后 14 次单位置 decode |
-| kv_frame | 15 次 | 1 次 | projection、主干、Heads、采样、embedding、KV 更新全部展开捕获 |
+| 配置 | KV/attention | 每帧主干 | 每帧 Code Predictor replay | 全部五个 bucket 的图数 |
+|---|---|---:|---:|---:|
+| stock | v0.30 原始重算路径 | 15 | 帧级工具 15，服务以实际外层图为准 | 沿用原实现 |
+| kv_step | FIA 原生 GQA，静态 KV，短序列投影 | 15 | 15 | 75，采样模式共用 |
+| kv_frame | 与 kv_step 相同 | 15 | 1 | 10，greedy/sampling 各 5 |
 
-`code_predictor_ar_execution` 放在部署 YAML 的共享内存 connector `extra` 中，默认 stock。
-KV 模式显式关闭外层 talker_mtp 包装，保留正常 Talker 图；捕获失败不会回退。
-按 batch 1/2/4/8/16 和 greedy/sampling 分别捕获。单 worker 内只支持同一执行流串行调度，不支持并行写同一缓存。
-完整图和小图共享冻结权重，每个 bucket 有独立缓存。KV 只在一帧内有效，下一帧从位置 0 覆盖。
+KV 预热捕获 batch buckets `[1,2,4,8,16]`，输出捕获进度和耗时；首次初始化发生在服务预热调用中。
+图按实际推理 batch 选择，不按客户端并发选择；batch=3 使用 bucket=4。
+KV 模式关闭外层 MTP 包装，保留正常 Talker 图；不嵌套 replay。
+FIA 直接读取完整 KV-head 缓存，有效长度排除旧数据，不扩展 GQA heads 或复制缓存前缀。
+`o_proj`、`down_proj` 只处理 prefill 两位置或 decode 单位置，保留当前融合 QKV、gate/up、RoPE、RMSNorm。
+两种 KV 模式共用计算函数，只改变图捕获范围；每个 bucket 独立缓存，同一执行流串行调度。
+输出在缓冲区复用前克隆；新帧从位置 0 覆盖，禁止读取本帧有效长度之外的缓存。
+FIA 不可用、非 BF16、捕获失败或不支持的采样参数会明确报错，不静默回退。
 
-采样默认 temperature=0.9、top-k=50、top-p=1；其他随机参数明确拒绝。每帧 uniforms 在图外更新。
-生产 generator 按码本再按有效请求行消费随机数；padding 行不消耗真实请求的 generator。
-验证 uniforms 由请求/帧身份固定，避免 batch 排列改变采样。
+采样参数为 temperature=0.9、top-k=50、top-p=1，也支持 greedy。
+整帧 uniforms 在图外准备；按码本、有效请求行消费 generator，填充行不消耗真实请求随机流。
+
+## 数值检查口径
+
+`--stock-comparison strict|record` 默认 strict；本次命令显式使用 record。
+record 单独记录 stock 与缓存 eager 的 codes 差异，允许测性能；不表示与 stock 完全一致。
+缓存 eager、kv_step、kv_frame 必须 codes 一致，逐位置 logits 使用 atol=rtol=0.02。
+重复运行、随机数更新、行换序、bucket 切换、请求替换和输出生命周期仍严格检查。
+非有限值、非法 token、状态污染、KV 执行差异和图失败均保存诊断并停止对应性能测试。
+`--stock-batch-policy record-stable` 单独处理 stock 自身稳定的跨 batch 差异，与上述选项互不替代。
+
+检查输出：
+- `correctness.json`：KV 一致性、stock 差异统计及代码/数据/策略绑定。
+- `stock_comparison.json`：每组自由生成 codes 差异，以及强制使用 stock 历史前缀后的逐位置 logits 差异。
+- `stock_batch_variations.json`：stock 自身的跨 batch 差异（存在时写入）。
+- `failure.pt`：首个失败输入、位置、logits、KV 和 codes。失败时停止；stock record 差异不算执行失败。
+
+统计中的帧次包括不同 batch/采样模式下的重复检查，不等于独立帧数。
 
 ## 服务器准备
 
-先将此分支文件部署到下面的仓库目录，并确认 Python 导入的是该目录；不要在旧实验进程运行时切换其代码。
-本文命令不使用环境变量。vLLM 与 vLLM Ascend 应已安装到当前 NPU Python 环境。
+部署本分支代码到指定服务器仓库，确认 Python 导入路径正确。vLLM、vLLM Ascend 应已安装到当前 Python 环境。
+复用现有 capture，不需要重新采集。以下命令使用新的统一结果目录，不覆盖旧 capture。
+非服务工具的结果子目录须尚不存在；服务工具支持清理旧结果后重新运行。
 
 ```bash
 cd /softwarePlatform/y00899301/vllm_debug_omni/vllm-omni-tts
-
 git branch --show-current
 python -c "import vllm_omni; print(vllm_omni.__file__)"
 ```
 
-本地实现位于独立 worktree；不会自动更新服务器仓库。
-仅 service_bench.py 支持同目录重新运行：先停止上一轮服务测试，再执行原命令，脚本会清空指定的服务 results 目录并重新开始，不保留旧结果。其他工具的 results 子目录仍必须尚不存在，保持原有行为。
-首次模型校验会读取模型权重；首次图捕获可能耗时较长，不计入正式计时。
+## 1. 固定三帧预检
 
-## 1. 只读复用已有采集
-
-```bash
-python tools/qwen3_tts_ar_graph/experiment.py collect \
-  --import-from /softwarePlatform/y00899301/qwen3_tts_zero_train_spec_run01 \
-  --results /softwarePlatform/y00899301/qwen3_tts_kv_frame_graph_run01/capture \
-  --model /softwarePlatform/l00927835/Qwen3-TTS-12Hz-1.7B-CustomVoice \
-  --device npu:0
-```
-
-导入只创建引用，不改原文件。验证数据包含固定 30 条文本和 20 条测试请求的帧；检查模型配置和 predictor 权重。
-旧的独立 Q/K/V、gate/up 权重仅按行拼接为 tag 的融合存储，不迁入投机逻辑。
-若检查提示不兼容或缺帧，使用本文末尾的重新采集流程。
-
-## 2. 固定三帧检查
+smoke011 第 0、2 帧和 smoke030 最后一帧。覆盖两种采样模式及 batch 1/2/3/4/5/8/9/15/16。
 
 ```bash
 python tools/qwen3_tts_ar_graph/experiment.py check \
-  --input /softwarePlatform/y00899301/qwen3_tts_kv_frame_graph_run01/capture \
-  --results /softwarePlatform/y00899301/qwen3_tts_kv_frame_graph_run01/probe \
+  --input /softwarePlatform/y00899301/qwen3_tts_ar_graph_run01/capture \
+  --results /softwarePlatform/y00899301/qwen3_tts_ar_graph_commercial_kv_run01/probe \
   --model /softwarePlatform/l00927835/Qwen3-TTS-12Hz-1.7B-CustomVoice \
   --device npu:0 \
+  --stock-comparison record \
+  --stock-batch-policy record-stable \
   --probe-only \
   --vllm-repo /vllm-workspace/vllm \
   --ascend-repo /vllm-workspace/vllm-ascend
 ```
 
-固定 smoke011 的 0、2 帧及 smoke030 最后一帧，两种采样模式，含非整桶 batch。
-检查 cached eager 逐位置 logits、三种路径 codes、重复运行、随机数更新、请求换序、batch 与单请求对照。
-这张 probe 证书不能授权 bench。
+## 2. 60 帧抽样检查
 
-## 3. 60 帧抽样检查
+每个测试请求取首/中/末三帧，不做全量检查。只有此检查的匹配结果可用于帧级 bench/profile；旧证书不可复用。
 
 ```bash
 python tools/qwen3_tts_ar_graph/experiment.py check \
-  --input /softwarePlatform/y00899301/qwen3_tts_kv_frame_graph_run01/capture \
-  --results /softwarePlatform/y00899301/qwen3_tts_kv_frame_graph_run01/check \
+  --input /softwarePlatform/y00899301/qwen3_tts_ar_graph_run01/capture \
+  --results /softwarePlatform/y00899301/qwen3_tts_ar_graph_commercial_kv_run01/check \
   --model /softwarePlatform/l00927835/Qwen3-TTS-12Hz-1.7B-CustomVoice \
   --device npu:0 \
+  --stock-comparison record \
+  --stock-batch-policy record-stable \
   --vllm-repo /vllm-workspace/vllm \
   --ascend-repo /vllm-workspace/vllm-ascend
 ```
 
-每个测试请求取首/中/末帧，共 60 帧；覆盖 batch 1/2/3/4/5/8/9/15/16。
-首个失败保存 failure.pt、correctness.json，停止，不放宽 logits 容差（atol/rtol 均为 0.02）或忽略 codes 差异。
-若 stock 的 batch 与单请求自身不一致，同样停止并诊断数值布局。
-查看结果：
+## 3. 三组帧级性能
 
-```bash
-cat /softwarePlatform/y00899301/qwen3_tts_kv_frame_graph_run01/check/correctness.json
-```
-
-## 4. 帧级性能
+每组预热 20 batch，每轮 60 batch，stock→候选→候选→stock 四轮，两种采样和五个 bucket。
+计时包含身份绑定随机数的 CPU 生成/H2D、输入暂存、执行和输出交接；与生产随机数成本不同。
+不设置性能门槛。报告 stock、kv_step、kv_frame 延迟、吞吐、配对区间和 step/frame 均值比。
+step/frame 来自各自的 ABBA 测量，不是直接配对置信区间。设备事件包含潜在主机空隙，不是纯 kernel 时间。
 
 ```bash
 python tools/qwen3_tts_ar_graph/experiment.py bench \
-  --input /softwarePlatform/y00899301/qwen3_tts_kv_frame_graph_run01/capture \
-  --correctness /softwarePlatform/y00899301/qwen3_tts_kv_frame_graph_run01/check/correctness.json \
-  --results /softwarePlatform/y00899301/qwen3_tts_kv_frame_graph_run01/bench \
+  --input /softwarePlatform/y00899301/qwen3_tts_ar_graph_run01/capture \
+  --results /softwarePlatform/y00899301/qwen3_tts_ar_graph_commercial_kv_run01/bench \
   --model /softwarePlatform/l00927835/Qwen3-TTS-12Hz-1.7B-CustomVoice \
   --device npu:0 \
+  --stock-comparison record \
+  --stock-batch-policy record-stable \
+  --correctness /softwarePlatform/y00899301/qwen3_tts_ar_graph_commercial_kv_run01/check/correctness.json \
   --warmup 20 \
   --executions-per-round 60 \
   --vllm-repo /vllm-workspace/vllm \
   --ascend-repo /vllm-workspace/vllm-ascend
-
-cat /softwarePlatform/y00899301/qwen3_tts_kv_frame_graph_run01/bench/report.md
 ```
-
-五个 batch bucket、greedy/sampling、stock→候选→候选→stock 四轮配对。
-模型权重、源代码、软件环境、数据或帧集合变化会令旧证书失效。
-均为完整帧调用计时：包含身份绑定 uniforms 的 CPU 生成与 H2D、输入暂存及输出克隆；上游帧输入预先在设备上。
-该随机数准备是验证工具的固定口径，不等同于生产服务的随机数生成成本，需结合服务结果判断。
-报告 batch 延迟、有效帧/s、设备事件 p50/p95、配对 batch bootstrap 区间。
-设备事件可能含主机提交空隙，不能称为纯 kernel 时间；循环回放不增加独立样本数。
-内存峰值含常驻 stock 图，不是候选独占内存。服务图范围不能由独立帧工具推断。
-
-## 5. 服务多并发
-
-服务测试不再要求或校验帧级正确性证书；旧命令的 `--correctness` 可省略，保留时不会读取该文件。模型与源码版本仍写入运行元数据，不作为服务启动拦截条件。其他入口的证书要求不变。
-
-先停止占用同一张 NPU 的其他测试。脚本逐个启动/停止自己创建的服务，不操作已有服务；8091 端口必须空闲。
-每组先执行带 seed 的取消/替换检查，然后并发 1/4/16，每档 3 个预热请求、120 个正式请求、1 轮。健康检查每 20 秒一次；每轮执行时每 20 秒显示耗时及客户端最新进度，完整输出保存在 client.log。三种配置合计 9 轮。
-30 条文本明确展开四次，不依赖随机 oversampling。服务采样沿用默认参数；预热/取消检查失败会停止性能实验。
 
 ```bash
-python tools/qwen3_tts_ar_graph/service_bench.py \
-  --input /softwarePlatform/y00899301/qwen3_tts_kv_frame_graph_run01/capture \
-  --correctness /softwarePlatform/y00899301/qwen3_tts_kv_frame_graph_run01/check/correctness.json \
-  --results /softwarePlatform/y00899301/qwen3_tts_kv_frame_graph_run01/service \
-  --model /softwarePlatform/l00927835/Qwen3-TTS-12Hz-1.7B-CustomVoice \
-  --device npu:0 \
-  --port 8091 \
-  --vllm-repo /vllm-workspace/vllm \
-  --ascend-repo /vllm-workspace/vllm-ascend
+cat /softwarePlatform/y00899301/qwen3_tts_ar_graph_commercial_kv_run01/bench/report.md
 ```
 
-三套 deploy 保持 Codec 分块策略相同，仅配置执行模式和 max_num_seqs=16。
-后台每秒落盘一次 host batch 计数，不同步设备。每轮 batch-before/after 快照包含 benchmark 的预热请求。
-报告请求吞吐、音频吞吐、TTFP、E2E、RTF、underrun、错误率和真实 batch 分布；完整上游结果保留在 result.json。
-不同 API 请求的输出长度可能不同，吞吐同时报告请求/s 与音频秒/s。不将客户端并发数视为实际 batch。
+## 4. 独立 profiling
 
-## 6. 独立 profiling
+六个固定诊断 batch，三组模式、两种采样、batch 1/4/16。核对 FIA 算子、短 GEMM 输入形状、图启动数量及设备空隙。
+profiling 不混入正式计时；缓存后端和图元数据保存在 manifest.json。
 
 ```bash
 python tools/qwen3_tts_ar_graph/experiment.py profile \
-  --input /softwarePlatform/y00899301/qwen3_tts_kv_frame_graph_run01/capture \
-  --correctness /softwarePlatform/y00899301/qwen3_tts_kv_frame_graph_run01/check/correctness.json \
-  --results /softwarePlatform/y00899301/qwen3_tts_kv_frame_graph_run01/profile \
+  --input /softwarePlatform/y00899301/qwen3_tts_ar_graph_run01/capture \
+  --results /softwarePlatform/y00899301/qwen3_tts_ar_graph_commercial_kv_run01/profile \
   --model /softwarePlatform/l00927835/Qwen3-TTS-12Hz-1.7B-CustomVoice \
   --device npu:0 \
+  --stock-comparison record \
+  --stock-batch-policy record-stable \
+  --correctness /softwarePlatform/y00899301/qwen3_tts_ar_graph_commercial_kv_run01/check/correctness.json \
   --warmup 20 \
   --vllm-repo /vllm-workspace/vllm \
   --ascend-repo /vllm-workspace/vllm-ascend
 ```
 
-固定六帧构造六个诊断 batch，batch 1/4/16，三组执行模式和两种采样。
-用于检查图间空隙、Head/采样算子和 memcpy；不把 profiler 延迟混入 bench。
+## 5. 三组服务自动比较
 
-## 需要重新采集时
-
-用新目录 prepare，再单独终端启动 stock 服务，最后发送顺序请求。不要与 benchmark 同时运行。
+先停止手动服务，释放 NPU 与端口。脚本依次启动/停止 stock、kv_step、kv_frame，部署配置只改变 Code Predictor 模式。
+每组先做取消/替换检查，再按并发 1/4/16 测试，每档预热 3 请求、正式 120 请求、1 轮。
+本地请求绕过代理；健康检查每 20 秒，客户端每 20 秒输出进度。服务测试不读取或校验正确性证书。
+服务报告同时保留音频时长、吞吐、TTFP、E2E、RTF、underrun、错误率、实际 batch 分布。输出可能与 stock 不同，结合音频时长分析吞吐。
 
 ```bash
-python tools/qwen3_tts_ar_graph/experiment.py collect \
-  --prepare \
-  --results /softwarePlatform/y00899301/qwen3_tts_kv_frame_graph_capture02 \
+python tools/qwen3_tts_ar_graph/service_bench.py \
+  --input /softwarePlatform/y00899301/qwen3_tts_ar_graph_run01/capture \
+  --results /softwarePlatform/y00899301/qwen3_tts_ar_graph_commercial_kv_run01/service \
   --model /softwarePlatform/l00927835/Qwen3-TTS-12Hz-1.7B-CustomVoice \
-  --device npu:0
-
-vllm-omni serve /softwarePlatform/l00927835/Qwen3-TTS-12Hz-1.7B-CustomVoice \
-  --deploy-config /softwarePlatform/y00899301/qwen3_tts_kv_frame_graph_capture02/deploy.yaml \
-  --host 127.0.0.1 --port 8091 --trust-remote-code --omni
+  --device npu:0 \
+  --stock-batch-policy record-stable \
+  --vllm-repo /vllm-workspace/vllm \
+  --ascend-repo /vllm-workspace/vllm-ascend \
+  --port 8091
 ```
 
-服务就绪后，在另一终端：
+各组日志位于 service/stock/server.log、service/kv_step/server.log、service/kv_frame/server.log。
+各并发轮的 client.log、result.json 与 batch-before/after.json 保留在对应 c1/c4/c16/round0 目录。
+
+```bash
+cat /softwarePlatform/y00899301/qwen3_tts_ar_graph_commercial_kv_run01/service/report.md
+```
+
+## 6. 分别启动模型进行手动测试
+
+三条命令分别运行，停止前一服务后再启动下一服务，避免占用同一 NPU/端口。
+KV 服务预热捕获全部五个 batch bucket；最大活动请求数为 16。
+
+### stock
 
 ```bash
 cd /softwarePlatform/y00899301/vllm_debug_omni/vllm-omni-tts
-python tools/qwen3_tts_ar_graph/experiment.py collect \
-  --results /softwarePlatform/y00899301/qwen3_tts_kv_frame_graph_capture02 \
-  --model /softwarePlatform/l00927835/Qwen3-TTS-12Hz-1.7B-CustomVoice \
-  --device npu:0 \
-  --url http://127.0.0.1:8091
+
+vllm-omni serve \
+  /softwarePlatform/l00927835/Qwen3-TTS-12Hz-1.7B-CustomVoice \
+  --deploy-config /softwarePlatform/y00899301/vllm_debug_omni/vllm-omni-tts/vllm_omni/deploy/qwen3_tts_ar_stock.yaml \
+  --host 0.0.0.0 \
+  --port 8091 \
+  --trust-remote-code \
+  --omni
 ```
 
-后续将 `--input` 改为该目录。采集会同步写帧文件，不用于性能评估。
-
-## 本地 CPU 测试
+### kv_step
 
 ```bash
-python -m pytest tests/model_executor/models/qwen3_tts/test_cached_ar.py tests/model_executor/models/qwen3_tts/test_ar_graph_tools.py tests/model_executor/models/qwen3_tts/test_code_predictor_dtype.py -q -o addopts= --confcutdir=tests/model_executor/models/qwen3_tts
+cd /softwarePlatform/y00899301/vllm_debug_omni/vllm-omni-tts
+
+vllm-omni serve \
+  /softwarePlatform/l00927835/Qwen3-TTS-12Hz-1.7B-CustomVoice \
+  --deploy-config /softwarePlatform/y00899301/vllm_debug_omni/vllm-omni-tts/vllm_omni/deploy/qwen3_tts_ar_kv_step.yaml \
+  --host 0.0.0.0 \
+  --port 8091 \
+  --trust-remote-code \
+  --omni
 ```
 
-CPU 不模拟 NPU kernel 数值，也不能确认 graph capture 成功。NPU 上必须先执行 probe 和 check。
+### kv_frame
+
+```bash
+cd /softwarePlatform/y00899301/vllm_debug_omni/vllm-omni-tts
+
+vllm-omni serve \
+  /softwarePlatform/l00927835/Qwen3-TTS-12Hz-1.7B-CustomVoice \
+  --deploy-config /softwarePlatform/y00899301/vllm_debug_omni/vllm-omni-tts/vllm_omni/deploy/qwen3_tts_ar_kv_frame.yaml \
+  --host 0.0.0.0 \
+  --port 8091 \
+  --trust-remote-code \
+  --omni
+```
+
+## CPU 回归
+
+```bash
+python -m pytest -o addopts= --confcutdir=tests/model_executor/models/qwen3_tts tests/model_executor/models/qwen3_tts/test_cached_ar.py tests/model_executor/models/qwen3_tts/test_ar_graph_tools.py tests/model_executor/models/qwen3_tts/test_code_predictor_dtype.py -q
+```
+
+CPU 验证缓存和状态逻辑，模拟 FIA 参数与图管理；不能替代 NPU 算子数值和真实捕获检查。

@@ -279,6 +279,8 @@ def binding(args, root, frames):
         buckets=BUCKETS,
         check_batches=CHECK_BATCHES,
         stock_batch_policy=getattr(args, "stock_batch_policy", "strict"),
+        stock_comparison=getattr(args, "stock_comparison", "strict"),
+        kv_implementation="fia_gqa_short_projection_v1",
         modes=["stock", "eager", "kv_step", "kv_frame"],
         sampling=["greedy", "sampling"],
         temperature=0.9,
@@ -483,6 +485,70 @@ def stock_row_difference(batch_codes, single_codes, batch_logits, single_logits,
     return result
 
 
+def validate_outputs(codes, logits, vocab):
+    if len(logits) != 15 or any(not torch.isfinite(row).all() for row in logits):
+        raise AssertionError("Non-finite or missing predictor logits")
+    if torch.any((codes < 0) | (codes >= vocab)):
+        raise AssertionError("Invalid codec token")
+
+
+@torch.inference_mode()
+def teacher_forced_logits(executor, inputs, codes):
+    """Cached logits conditioned on STOCK codes, before free-run divergence.
+
+    Diagnostic only: uses the same padded row geometry and short projections
+    as the cached executor. It never samples or touches a captured graph.
+    """
+    size = codes.shape[0]
+    bucket = next(n for n in executor.buckets if n >= size)
+    b = executor._allocate(bucket)
+    b["hidden"].zero_()
+    b["embed"].zero_()
+    b["hidden"][:size].copy_(inputs["last_talker_hidden"].reshape(size, 1, -1))
+    b["embed"][:size].copy_(inputs["layer0_embed"].reshape(size, 1, -1))
+    executor._project(b)
+    result = []
+    w = executor.wrapper
+    for step in range(executor.groups - 1):
+        hidden = executor._backbone(b, step)
+        result.append(w.lm_head[step](hidden[:, -1])[:size].detach().clone())
+        if step + 1 < executor.groups - 1:
+            token = torch.zeros(bucket, dtype=torch.long, device=codes.device)
+            token[:size].copy_(codes[:, step + 1])
+            embed = w.model.codec_embedding[step](token).unsqueeze(1)
+            b["inputs"][:, step + 2 : step + 3].copy_(w.small_to_mtp_projection(embed))
+    return result
+
+
+def stock_comparison_record(context, expected, actual, stock_logits, forced_logits):
+    difference = actual != expected
+    positions = []
+    for position, (stock, cached) in enumerate(zip(stock_logits, forced_logits), 1):
+        delta = (cached.float() - stock.float()).abs()
+        outside = ~torch.isclose(cached, stock, atol=0.02, rtol=0.02)
+        positions.append(
+            dict(
+                position=position,
+                max_abs=delta.max().item(),
+                mean_abs=delta.mean().item(),
+                outside_tolerance=outside.sum().item(),
+                elements=outside.numel(),
+            )
+        )
+    return dict(
+        **context,
+        code_equal=not difference.any().item(),
+        differing_frames=difference.any(dim=1).sum().item(),
+        frame_count=expected.shape[0],
+        differing_residual_tokens=difference[:, 1:].sum().item(),
+        residual_tokens=difference[:, 1:].numel(),
+        different_positions=difference.nonzero().tolist(),
+        stock_codes=expected.tolist() if difference.any() else None,
+        cached_codes=actual.tolist() if difference.any() else None,
+        teacher_forced_positions=positions,
+    )
+
+
 @torch.inference_mode()
 def check(args, progress):
     from vllm_omni.model_executor.models.common.qwen3_code_predictor_ar import CachedARExecutor
@@ -506,6 +572,10 @@ def check(args, progress):
     stock_logits, audit, expected = [], [], None
     failure_details = None
     stock_variations = []
+    stock_comparisons = []
+    teacher = CachedARExecutor(w, "eager")
+    record_stock = getattr(args, "stock_comparison", "strict") == "record"
+    cached_expected, cached_logits, forced_logits = None, [], []
     try:
         for size, sample, batch in matrix:
             inputs = batch_inputs(batch, args.device)
@@ -521,24 +591,36 @@ def check(args, progress):
             finally:
                 for hook in hooks:
                     hook.remove()
+            cached_logits, calls = [], []
+            hook = w.model.register_forward_hook(lambda *unused: calls.append(1))
+            try:
+                cached_expected = engines["eager"](**inputs, audit=cached_logits).clone()
+            finally:
+                hook.remove()
+            if len(calls) != 15:
+                raise AssertionError(f"Expected 15 actual backbone calls, got {len(calls)}")
+            cached_logits = [logits[:size] for logits in cached_logits]
+            validate_outputs(expected, stock_logits, w.config.vocab_size)
+            validate_outputs(cached_expected, cached_logits, w.config.vocab_size)
+            forced_logits = teacher_forced_logits(teacher, inputs, expected)
+            validate_outputs(expected, forced_logits, w.config.vocab_size)
+            comparison = stock_comparison_record(context, expected, cached_expected, stock_logits, forced_logits)
+            stock_comparisons.append(comparison)
+            if not record_stock:
+                if not comparison["code_equal"]:
+                    raise AssertionError(f"codes differ from stock: {context}")
+                for left, right in zip(forced_logits, stock_logits):
+                    torch.testing.assert_close(left, right, atol=0.02, rtol=0.02)
+            order = torch.arange(size - 1, -1, -1, device=args.device)
+            reordered = {k: v[order] if torch.is_tensor(v) else v for k, v in inputs.items()}
+            changed = dict(inputs, sample_uniforms=uniforms_for(batch, w.config.vocab_size, args.device, salt=1))
+            # Same batch shape and same history, independent of stock rounding.
+            changed_expected = engines["eager"](**changed).clone()
             for name, executor in engines.items():
                 context["engine"] = name
-                audit, calls = [], []
-                if name == "eager":
-                    hook = w.model.register_forward_hook(lambda *unused: calls.append(1))
-                    try:
-                        actual = executor(**inputs, audit=audit)
-                    finally:
-                        hook.remove()
-                    if len(calls) != 15:
-                        raise AssertionError(f"Expected 15 actual backbone calls, got {len(calls)}")
-                    for position, (left, right) in enumerate(zip(audit, stock_logits)):
-                        context["position"] = position + 1
-                        torch.testing.assert_close(left[:size], right, atol=0.02, rtol=0.02)
-                else:
-                    # Capture hooks establish real forward count; replay count is separate.
+                if name != "eager":
                     bucket = next(n for n in BUCKETS if n >= size)
-                    if (bucket, sample) not in executor.graphs:
+                    if executor.graph_key(bucket, sample) not in executor.graphs:
                         count = []
                         hook = w.model.register_forward_hook(lambda *unused: count.append(1))
                         try:
@@ -547,23 +629,21 @@ def check(args, progress):
                             hook.remove()
                         if len(count) != 60:  # 3 warmups + capture, each 15 forwards
                             raise AssertionError(f"Unexpected warmup/capture backbone count: {len(count)}")
-                    actual = executor(**inputs)
-                    audit = [logits[:size].detach().clone() for logits in executor.last_logits(size, sample)]
-                    for position, (left, right) in enumerate(zip(audit, stock_logits)):
-                        context["position"] = position + 1
-                        torch.testing.assert_close(left, right, atol=0.02, rtol=0.02)
-                if not torch.equal(actual, expected):
-                    raise AssertionError(f"codes differ: {context}")
+                actual = executor(**inputs)
+                audit = [logits[:size].detach().clone() for logits in executor.last_logits(size, sample)]
+                validate_outputs(actual, audit, w.config.vocab_size)
+                for position, (left, right) in enumerate(zip(audit, cached_logits)):
+                    context["position"] = position + 1
+                    torch.testing.assert_close(left, right, atol=0.02, rtol=0.02)
+                if not torch.equal(actual, cached_expected):
+                    raise AssertionError(f"KV codes differ from cached eager: {context}")
                 saved = actual.clone()
-                order = torch.arange(size - 1, -1, -1, device=args.device)
-                reordered = {k: v[order] if torch.is_tensor(v) else v for k, v in inputs.items()}
-                if not torch.equal(executor(**reordered), expected[order]):
+                if not torch.equal(executor(**reordered), cached_expected[order]):
                     raise AssertionError("Request row reordering changed codes")
                 if not torch.equal(executor(**inputs), saved) or not torch.equal(actual, saved):
                     raise AssertionError("Replay/cache/output lifetime violation")
-                changed = dict(inputs, sample_uniforms=uniforms_for(batch, w.config.vocab_size, args.device, salt=1))
-                if not torch.equal(executor(**changed), w(**changed)):
-                    raise AssertionError("Updated uniforms mismatch")
+                if not torch.equal(executor(**changed), changed_expected):
+                    raise AssertionError("Updated uniforms mismatch against cached eager")
                 rows.append(dict(context, passed=True))
             # Independent single-row baseline also catches padding/layout effects.
             for i in range(size):
@@ -635,8 +715,9 @@ def check(args, progress):
             batch = batches(frames[::-1], size, 1)[0]
             x = batch_inputs(batch, args.device)
             x.update(sample_uniforms=uniforms_for(batch, w.config.vocab_size, args.device, 2))
+            transition_expected = teacher(**x).clone()
             for executor in engines.values():
-                if not torch.equal(executor(**x), w(**x)):
+                if not torch.equal(executor(**x), transition_expected):
                     raise AssertionError("Bucket transition/request replacement mismatch")
     except Exception as exc:
         torch.save(
@@ -646,7 +727,16 @@ def check(args, progress):
                 stock_logits=stock_logits,
                 audit=audit,
                 expected=expected,
+                cached_expected=cached_expected,
+                cached_logits=cached_logits,
+                teacher_forced_logits=forced_logits,
+                stock_comparisons=stock_comparisons,
                 caches={name: engine.snapshot() for name, engine in engines.items()},
+                teacher_cache=teacher.snapshot(),
+                graph_state={
+                    name: dict(mode=engine.mode, keys=list(engine.graphs), graph_count=engine.graph_count)
+                    for name, engine in engines.items()
+                },
                 failure_details=failure_details,
             ),
             args.results / "failure.pt",
@@ -667,16 +757,45 @@ def check(args, progress):
             print("[Stock 对照详情] " + json.dumps(failure_details["summary"], ensure_ascii=False), flush=True)
         print(f"诊断文件: {args.results / 'correctness.json'}；{args.results / 'failure.pt'}", flush=True)
         raise
+    write_json(args.results / "stock_comparison.json", stock_comparisons)
+    comparison_summary = dict(
+        checks=len(stock_comparisons),
+        frame_executions=sum(r["frame_count"] for r in stock_comparisons),
+        differing_frames=sum(r["differing_frames"] for r in stock_comparisons),
+        residual_tokens=sum(r["residual_tokens"] for r in stock_comparisons),
+        differing_residual_tokens=sum(r["differing_residual_tokens"] for r in stock_comparisons),
+        teacher_forced_outside_tolerance=sum(
+            p["outside_tolerance"] for r in stock_comparisons for p in r["teacher_forced_positions"]
+        ),
+        teacher_forced_max_abs=max(p["max_abs"] for r in stock_comparisons for p in r["teacher_forced_positions"]),
+    )
+    comparison_summary["frame_difference_rate"] = (
+        comparison_summary["differing_frames"] / comparison_summary["frame_executions"]
+    )
+    comparison_summary["residual_token_difference_rate"] = (
+        comparison_summary["differing_residual_tokens"] / comparison_summary["residual_tokens"]
+    )
+    comparison_summary["teacher_forced_elements"] = sum(
+        p["elements"] for r in stock_comparisons for p in r["teacher_forced_positions"]
+    )
+    comparison_summary["teacher_forced_outside_rate"] = (
+        comparison_summary["teacher_forced_outside_tolerance"] / comparison_summary["teacher_forced_elements"]
+    )
     write_json(
         args.results / "correctness.json",
         dict(
             passed=True,
+            kv_execution_consistent=True,
+            stock_comparison=getattr(args, "stock_comparison", "strict"),
+            stock_comparison_summary=comparison_summary,
+            stock_codes_equal=comparison_summary["differing_residual_tokens"] == 0,
+            stock_logits_within_tolerance=comparison_summary["teacher_forced_outside_tolerance"] == 0,
             probe_only=args.probe_only,
             binding=bind,
             checks=len(rows),
             unique_frames=len(frames),
             graph_verified=args.device.startswith("npu"),
-            correctness_scope="cached_vs_stock_same_batch",
+            correctness_scope="cached_eager_vs_graph_same_batch; stock differences separately reported",
             stock_batch_policy=getattr(args, "stock_batch_policy", "strict"),
             stock_batch_invariant=not stock_variations,
             stock_batch_variations=stock_variations,
@@ -684,7 +803,8 @@ def check(args, progress):
         ),
     )
     progress.message(
-        f"同 batch 对照通过 {len(rows)} 项；stock 跨 batch 稳定差异 {len(stock_variations)} 项。"
+        f"KV 同 batch 执行对照通过 {len(rows)} 项；stock codes 差异 {comparison_summary['differing_frames']} 帧次；"
+        f"stock 跨 batch 稳定差异 {len(stock_variations)} 项。"
         "存在差异时不代表跨 batch 输出一致；CPU 结果不授权 NPU 性能测试。"
     )
 
@@ -771,7 +891,9 @@ def bench(args, progress):
                 graph_count=sum(1 if candidate == "kv_frame" else 15 for _ in executor.graphs),
                 memory_peak_bytes=api.max_memory_allocated(),
                 graph_owner="CodePredictor",
-                attention="npu_fusion_attention: prefill causal / decode dense cached",
+                attention="npu_fused_infer_attention_score: native GQA, full static KV, effective lengths",
+                projection="short sequence: prefill=2, decode=1",
+                implementation="fia_gqa_short_projection_v1",
             )
         )
         del run, executor
@@ -845,6 +967,8 @@ def profile(args, progress):
         dict(
             binding=binding(args, root, frames),
             scope="6 diagnostic batches; profiler timings are not benchmark timings",
+            kv_attention="npu_fused_infer_attention_score; native GQA; effective KV lengths",
+            kv_projection="prefill=2 / decode=1; no full-sequence padding",
         ),
     )
 
@@ -860,8 +984,9 @@ def report(args, progress):
         "",
         "不设置性能通过门槛；仅代表本次抽样帧级结果。",
         "",
-        "| 模式 | batch | 配置 | 墙钟 p50/p95 ms | 设备事件 p50/p95 ms | 帧/s | 相对 stock |",
-        "|---|---:|---|---|---|---:|---:|",
+        "| 模式 | batch | 配置 | stock 墙钟 p50/p95 ms | 候选墙钟 p50/p95 ms | "
+        "候选设备事件 p50/p95 ms | 帧/s | 相对 stock | 配对 95% 区间 |",
+        "|---|---:|---|---|---|---|---:|---:|---|",
     ]
     for (sample, size, candidate), group in groups.items():
         base = [r for r in group if r["engine"] == "stock"]
@@ -890,6 +1015,8 @@ def report(args, progress):
             device_p95_ms=float(np.quantile(device, 0.95)),
             frames_per_second=float(size * 1000 / wall.mean()),
             exploratory_paired_batch_ci=ci,
+            baseline_wall_p50_ms=float(np.median([r["wall_ms"] for r in base])),
+            baseline_wall_p95_ms=float(np.quantile([r["wall_ms"] for r in base], 0.95)),
             baseline_wall_mean_ms=float(np.mean([r["wall_ms"] for r in base])),
             candidate_wall_mean_ms=float(wall.mean()),
             backbone_calls=15,
@@ -897,9 +1024,10 @@ def report(args, progress):
         summary.append(item)
         lines.append(
             f"| {'sampling' if sample else 'greedy'} | {size} | {candidate} | "
+            f"{item['baseline_wall_p50_ms']:.3f}/{item['baseline_wall_p95_ms']:.3f} | "
             f"{item['wall_p50_ms']:.3f}/{item['wall_p95_ms']:.3f} | "
             f"{item['device_p50_ms']:.3f}/{item['device_p95_ms']:.3f} | "
-            f"{item['frames_per_second']:.2f} | {ratio:.3f}× |"
+            f"{item['frames_per_second']:.2f} | {ratio:.3f}× | [{ci[0]:.3f}, {ci[1]:.3f}] |"
         )
     lines += [
         "",
@@ -908,13 +1036,46 @@ def report(args, progress):
         "区间是配对 batch 的探索性 bootstrap；帧被循环复用，不作为泛化证据。",
         "服务并发、实际 batch 分布和音频指标另见服务实验产物。",
     ]
+    direct = []
+    lines += [
+        "",
+        "## kv_frame 与 kv_step",
+        "",
+        "来自各自 ABBA 测量的候选均值比；并非两者直接配对的置信区间。",
+        "",
+        "| 模式 | batch | kv_step 均值 ms | kv_frame 均值 ms | step/frame 耗时比 |",
+        "|---|---:|---:|---:|---:|",
+    ]
+    for item in summary:
+        if item["candidate"] != "kv_frame":
+            continue
+        step = next(
+            (
+                r
+                for r in summary
+                if r["candidate"] == "kv_step" and r["batch"] == item["batch"] and r["sampling"] == item["sampling"]
+            ),
+            None,
+        )
+        if step is None:
+            continue
+        ratio = step["candidate_wall_mean_ms"] / item["candidate_wall_mean_ms"]
+        direct.append(dict(batch=item["batch"], sampling=item["sampling"], step_over_frame=ratio))
+        lines.append(
+            f"| {'sampling' if item['sampling'] else 'greedy'} | {item['batch']} | "
+            f"{step['candidate_wall_mean_ms']:.3f} | {item['candidate_wall_mean_ms']:.3f} | {ratio:.3f}× |"
+        )
+    write_json(args.results / "kv_frame_vs_step.json", direct)
     verified = args.results / "verified_correctness.json"
     if verified.exists():
         cert = read_json(verified)
         lines += [
             "",
             f"正确性策略：{cert.get('stock_batch_policy', 'strict')}。",
-            "缓存执行与相同 batch 的 stock 对照；跨 batch 一致性单独报告。",
+            f"stock 对照策略：{cert.get('stock_comparison', 'strict')}；"
+            f"KV 执行一致性：{cert.get('kv_execution_consistent', '未记录')}。",
+            f"stock 差异统计：{json.dumps(cert.get('stock_comparison_summary', {}), ensure_ascii=False)}。",
+            "record 允许与 stock 有差异；检查通过不代表与 stock 完全一致。",
             f"stock 跨 batch 稳定差异：{len(cert.get('stock_batch_variations', []))} 项；"
             f"跨 batch 输出一致：{cert.get('stock_batch_invariant', '未记录')}。",
         ]
@@ -943,6 +1104,12 @@ def parser():
         else:
             p.add_argument("--input", type=Path, required=True)
         if name in ("check", "bench", "profile"):
+            p.add_argument(
+                "--stock-comparison",
+                choices=("strict", "record"),
+                default="strict",
+                help="record measures stock differences; cached eager/graph consistency remains required",
+            )
             p.add_argument(
                 "--stock-batch-policy",
                 choices=("strict", "record-stable"),
