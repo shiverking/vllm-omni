@@ -1,0 +1,100 @@
+{"id": "smoke001", "text": "The quick brown fox jumps over the lazy dog near the riverbank at sunset.", "source": "repository seed_tts_smoke/en/meta.lst"}
+{"id": "smoke002", "text": "Welcome to the future of text-to-speech synthesis in production systems.", "source": "repository seed_tts_smoke/en/meta.lst"}
+{"id": "smoke003", "text": "Yesterday the team finished rolling out the new authentication flow.", "source": "repository seed_tts_smoke/en/meta.lst"}
+{"id": "smoke004", "text": "She walked carefully across the wet cobblestones, careful not to slip.", "source": "repository seed_tts_smoke/en/meta.lst"}
+{"id": "smoke005", "text": "The conference call is scheduled for nine in the morning, Pacific time.", "source": "repository seed_tts_smoke/en/meta.lst"}
+{"id": "smoke006", "text": "Please remember to save your work before closing the editor.", "source": "repository seed_tts_smoke/en/meta.lst"}
+{"id": "smoke007", "text": "Two plus two equals four, but five hundred and forty three digits is long.", "source": "repository seed_tts_smoke/en/meta.lst"}
+{"id": "smoke008", "text": "I would like a coffee with oat milk and a chocolate croissant please.", "source": "repository seed_tts_smoke/en/meta.lst"}
+{"id": "smoke009", "text": "The library closes at eight on weekdays and six on Saturdays.", "source": "repository seed_tts_smoke/en/meta.lst"}
+{"id": "smoke010", "text": "During the Renaissance, art and science flourished in European cities.", "source": "repository seed_tts_smoke/en/meta.lst"}
+{"id": "smoke011", "text": "He whispered the secret word so quietly that no one else could hear.", "source": "repository seed_tts_smoke/en/meta.lst"}
+{"id": "smoke012", "text": "Our flight departs from gate twenty three at eleven fifteen.", "source": "repository seed_tts_smoke/en/meta.lst"}
+{"id": "smoke013", "text": "The storm knocked out power for six hours, but the backup generator kicked in.", "source": "repository seed_tts_smoke/en/meta.lst"}
+{"id": "smoke014", "text": "Reading a good book on a rainy afternoon is one of life's great pleasures.", "source": "repository seed_tts_smoke/en/meta.lst"}
+{"id": "smoke015", "text": "When the kettle whistled, she poured the hot water over the fresh tea leaves.", "source": "repository seed_tts_smoke/en/meta.lst"}
+{"id": "smoke016", "text": "The algorithm runs in linear time, which is a big improvement over the previous approach.", "source": "repository seed_tts_smoke/en/meta.lst"}
+{"id": "smoke017", "text": "In the distance, the mountains were shrouded in thick morning fog.", "source": "repository seed_tts_smoke/en/meta.lst"}
+{"id": "smoke018", "text": "Our company reported record revenue for the fourth quarter of the fiscal year.", "source": "repository seed_tts_smoke/en/meta.lst"}
+{"id": "smoke019", "text": "She explained the new policy in detail during the staff meeting this morning.", "source": "repository seed_tts_smoke/en/meta.lst"}
+{"id": "smoke020", "text": "The children laughed and played in the garden until the sun began to set.", "source": "repository seed_tts_smoke/en/meta.lst"}
+{"id": "smoke021", "text": "A long line of cars stretched along the coastal highway after the lighthouse opened.", "source": "repository seed_tts_smoke/en/meta.lst"}
+{"id": "smoke022", "text": "The chef recommended the seared scallops with a lemon butter sauce as the special.", "source": "repository seed_tts_smoke/en/meta.lst"}
+{"id": "smoke023", "text": "Our quarterly engineering review begins promptly at two in the afternoon on Thursday.", "source": "repository seed_tts_smoke/en/meta.lst"}
+{"id": "smoke024", "text": "Despite the heavy rain, the marathon runners kept a steady pace through downtown.", "source": "repository seed_tts_smoke/en/meta.lst"}
+{"id": "smoke025", "text": "She finished the crossword puzzle in under fifteen minutes while sipping her tea.", "source": "repository seed_tts_smoke/en/meta.lst"}
+{"id": "smoke026", "text": "The new release adds streaming output, faster startup, and better error reporting.", "source": "repository seed_tts_smoke/en/meta.lst"}
+{"id": "smoke027", "text": "His grandfather taught him how to whittle small wooden birds from cedar offcuts.", "source": "repository seed_tts_smoke/en/meta.lst"}
+{"id": "smoke028", "text": "Travelers were advised to check the timetable since trains were running on a holiday schedule.", "source": "repository seed_tts_smoke/en/meta.lst"}
+{"id": "smoke029", "text": "The startup launched a public beta after eighteen months of closed development.", "source": "repository seed_tts_smoke/en/meta.lst"}
+{"id": "smoke030", "text": "At night the desert sky filled with stars so bright the Milky Way was clearly visible.", "source": "repository seed_tts_smoke/en/meta.lst"}
+{"id": "extra001", "text": "Could you tell me which platform the next train leaves from?", "source": "original English prompts written for this experiment"}
+{"id": "extra002", "text": "The meeting starts at nine thirty, but please arrive ten minutes early.", "source": "original English prompts written for this experiment"}
+{"id": "extra003", "text": "I thought I had lost my keys until I found them inside my coat pocket.", "source": "original English prompts written for this experiment"}
+{"id": "extra004", "text": "Good morning, this is the front desk. How may I help you today?", "source": "original English prompts written for this experiment"}
+{"id": "extra005", "text": "Please turn left after the library and continue for two blocks.", "source": "original English prompts written for this experiment"}
+{"id": "extra006", "text": "There are twelve apples in the basket and three more on the table.", "source": "original English prompts written for this experiment"}
+{"id": "extra007", "text": "The total comes to forty-seven dollars and eighty-five cents.", "source": "original English prompts written for this experiment"}
+{"id": "extra008", "text": "Our office will be closed on Monday, January fifteenth.", "source": "original English prompts written for this experiment"}
+{"id": "extra009", "text": "Dr. Morgan will review the results and call you tomorrow afternoon.", "source": "original English prompts written for this experiment"}
+{"id": "extra010", "text": "The new API returns a JSON response when the request succeeds.", "source": "original English prompts written for this experiment"}
+{"id": "extra011", "text": "Why does the moon look larger when it is close to the horizon?", "source": "original English prompts written for this experiment"}
+{"id": "extra012", "text": "I would like a cup of tea, no sugar, and a glass of water, please.", "source": "original English prompts written for this experiment"}
+{"id": "extra013", "text": "The parcel was delivered at 14:25 on September 3, 2026.", "source": "original English prompts written for this experiment"}
+{"id": "extra014", "text": "Wait a moment. Did you say fifteen boxes or fifty boxes?", "source": "original English prompts written for this experiment"}
+{"id": "extra015", "text": "Yes, that is correct. The blue folder belongs to the finance team.", "source": "original English prompts written for this experiment"}
+{"id": "extra016", "text": "No, I have not finished the report yet, but I will send it before lunch.", "source": "original English prompts written for this experiment"}
+{"id": "extra017", "text": "The museum opens at ten and closes at six, except on public holidays.", "source": "original English prompts written for this experiment"}
+{"id": "extra018", "text": "A soft breeze moved through the trees as the children walked home.", "source": "original English prompts written for this experiment"}
+{"id": "extra019", "text": "Please enter the six-digit code shown on your screen to continue.", "source": "original English prompts written for this experiment"}
+{"id": "extra020", "text": "The temperature fell from twenty degrees to seven degrees overnight.", "source": "original English prompts written for this experiment"}
+{"id": "extra021", "text": "Can we move the appointment from Thursday to Friday morning?", "source": "original English prompts written for this experiment"}
+{"id": "extra022", "text": "I am sorry for the delay. Your order is now ready for collection.", "source": "original English prompts written for this experiment"}
+{"id": "extra023", "text": "The recipe calls for two eggs, a little salt, and half a cup of milk.", "source": "original English prompts written for this experiment"}
+{"id": "extra024", "text": "The bus was late, so we decided to walk the rest of the way.", "source": "original English prompts written for this experiment"}
+{"id": "extra025", "text": "My grandmother used to tell this story every winter when the evenings grew dark.", "source": "original English prompts written for this experiment"}
+{"id": "extra026", "text": "Is there a quieter room where we can discuss the details?", "source": "original English prompts written for this experiment"}
+{"id": "extra027", "text": "The Wi-Fi password is printed on the small card beside the television.", "source": "original English prompts written for this experiment"}
+{"id": "extra028", "text": "After updating the DNS settings, wait a few minutes before trying again.", "source": "original English prompts written for this experiment"}
+{"id": "extra029", "text": "The CPU is busy, but memory usage remains below sixty percent.", "source": "original English prompts written for this experiment"}
+{"id": "extra030", "text": "We measured 3.75 meters from the door to the edge of the carpet.", "source": "original English prompts written for this experiment"}
+{"id": "extra031", "text": "Welcome aboard. Please keep your seat belt fastened while the sign is illuminated.", "source": "original English prompts written for this experiment"}
+{"id": "extra032", "text": "How long does it usually take to reach the airport at this time of day?", "source": "original English prompts written for this experiment"}
+{"id": "extra033", "text": "The photograph shows a narrow bridge crossing a river in early spring.", "source": "original English prompts written for this experiment"}
+{"id": "extra034", "text": "She paused at the doorway, listened carefully, and then stepped inside.", "source": "original English prompts written for this experiment"}
+{"id": "extra035", "text": "First save your work, then close the application and restart your computer.", "source": "original English prompts written for this experiment"}
+{"id": "extra036", "text": "The deadline has changed. All applications must now arrive by June twentieth.", "source": "original English prompts written for this experiment"}
+{"id": "extra037", "text": "Thank you for waiting. A member of our team will be with you shortly.", "source": "original English prompts written for this experiment"}
+{"id": "extra038", "text": "Would you prefer the window seat, or would you rather sit near the aisle?", "source": "original English prompts written for this experiment"}
+{"id": "extra039", "text": "We ordered eight chairs, but only six arrived with the delivery this morning.", "source": "original English prompts written for this experiment"}
+{"id": "extra040", "text": "The invoice number is 40821, and the balance is $126.40.", "source": "original English prompts written for this experiment"}
+{"id": "extra041", "text": "The train from Oxford arrives at 8:05 a.m. on platform four.", "source": "original English prompts written for this experiment"}
+{"id": "extra042", "text": "Please read chapters two through five before our next class.", "source": "original English prompts written for this experiment"}
+{"id": "extra043", "text": "The small dog waited patiently while its owner unlocked the garden gate.", "source": "original English prompts written for this experiment"}
+{"id": "extra044", "text": "I understand your concern. Let us check the information together.", "source": "original English prompts written for this experiment"}
+{"id": "extra045", "text": "When the rain finally stopped, sunlight appeared between the clouds.", "source": "original English prompts written for this experiment"}
+{"id": "extra046", "text": "The store offers a ten percent discount on purchases over one hundred dollars.", "source": "original English prompts written for this experiment"}
+{"id": "extra047", "text": "Which of these two routes has fewer traffic lights?", "source": "original English prompts written for this experiment"}
+{"id": "extra048", "text": "Your reservation is confirmed for two adults and one child.", "source": "original English prompts written for this experiment"}
+{"id": "extra049", "text": "The experiment ran for ninety seconds and produced twenty-four measurements.", "source": "original English prompts written for this experiment"}
+{"id": "extra050", "text": "Take your time. There is no need to answer the question immediately.", "source": "original English prompts written for this experiment"}
+{"id": "extra051", "text": "Every evening, the baker writes down the ingredients needed for the next morning. This simple habit helps the team prepare before the first customers arrive.", "source": "original English prompts written for this experiment"}
+{"id": "extra052", "text": "We had planned to travel on Saturday, but the forecast changed overnight. Instead, we stayed home, made breakfast, and watched the rain from the kitchen window.", "source": "original English prompts written for this experiment"}
+{"id": "extra053", "text": "The technician checked the cable, restarted the router, and tested the connection again. This time the signal remained stable throughout the afternoon.", "source": "original English prompts written for this experiment"}
+{"id": "extra054", "text": "Before you begin, place all the parts on a clean table. Check that the screws, brackets, and instruction sheet are included in the package.", "source": "original English prompts written for this experiment"}
+{"id": "extra055", "text": "The visitor asked where the old theater used to stand. A local resident pointed across the square and described how the neighborhood had changed.", "source": "original English prompts written for this experiment"}
+{"id": "extra056", "text": "There are two possible explanations for the missing records. Either the upload did not finish, or the files were saved under a different project name.", "source": "original English prompts written for this experiment"}
+{"id": "extra057", "text": "I enjoyed the first part of the concert, especially the quiet opening. The final piece was much louder, and the audience applauded for several minutes.", "source": "original English prompts written for this experiment"}
+{"id": "extra058", "text": "The school library has extended its opening hours during exam week. Students can now study there until eight in the evening from Monday through Thursday.", "source": "original English prompts written for this experiment"}
+{"id": "extra059", "text": "Please check the spelling of your name and the date on the ticket. If either detail is incorrect, contact the booking office before you travel.", "source": "original English prompts written for this experiment"}
+{"id": "extra060", "text": "Our team tested the feature with several different input sizes. The results were consistent, although the largest examples required more time to complete.", "source": "original English prompts written for this experiment"}
+{"id": "extra061", "text": "Really? I had no idea the exhibition was opening today!", "source": "original English prompts written for this experiment"}
+{"id": "extra062", "text": "Well, that changes things. We should probably call before we leave.", "source": "original English prompts written for this experiment"}
+{"id": "extra063", "text": "Hello? Can you hear me clearly now?", "source": "original English prompts written for this experiment"}
+{"id": "extra064", "text": "Stop here, please. This is the entrance I was looking for.", "source": "original English prompts written for this experiment"}
+{"id": "extra065", "text": "All done. You can remove the device now.", "source": "original English prompts written for this experiment"}
+{"id": "extra066", "text": "The answer is not quite that simple; several factors affect the result.", "source": "original English prompts written for this experiment"}
+{"id": "extra067", "text": "Although the road was steep, the cyclists maintained a steady pace and reached the village before noon.", "source": "original English prompts written for this experiment"}
+{"id": "extra068", "text": "If the first attempt fails, note the error message and try once more after checking the connection.", "source": "original English prompts written for this experiment"}
+{"id": "extra069", "text": "The label says two hundred and fifty milliliters, but this measuring cup is marked in ounces.", "source": "original English prompts written for this experiment"}
+{"id": "extra070", "text": "From a distance the building looked empty. As we approached, however, we could hear music coming from an upstairs room.", "source": "original English prompts written for this experiment"}
