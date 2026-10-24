@@ -62,6 +62,19 @@ class AblationTests(unittest.TestCase):
         self.assertFalse(torch.equal(full, short))
         self.assertTrue(torch.isfinite(short).all())
 
+    @torch.inference_mode()
+    def test_deployed_quantizer_ignores_tail_placeholders(self):
+        quantizer = self.model.quantizer
+        codes = torch.randint(0, 32, (1, 2, 4))
+        expected = quantizer.rvq_first.decode(codes[:, :1])
+        quantizer.active_codebooks = 1
+        try:
+            torch.testing.assert_close(quantizer.decode(codes), expected, atol=0, rtol=0)
+            codes[:, 1] = 0
+            torch.testing.assert_close(quantizer.decode(codes), expected, atol=0, rtol=0)
+        finally:
+            del quantizer.active_codebooks
+
     def test_wav_and_invalid_keep(self):
         with self.assertRaises(ValueError):
             with retain_codebooks(self.model.quantizer, 0):

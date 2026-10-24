@@ -858,6 +858,9 @@ class SplitResidualVectorQuantizer(nn.Module):
     def decode(self, codes: torch.Tensor) -> torch.Tensor:
         """Decode the given codes to the quantized representation."""
         # codes is [B, K, T], with T frames, K nb of codebooks.
+        keep = getattr(self, "active_codebooks", None)
+        if keep is not None:
+            codes = codes[:, :keep]
         quantized = self.rvq_first.decode(codes[:, : self.n_q_semantic])
         if codes.shape[1] > self.n_q_semantic:
             quantized += self.rvq_rest.decode(codes[:, self.n_q_semantic :])

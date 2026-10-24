@@ -36,7 +36,10 @@ class CachedARExecutor:
         self.dtype = next(wrapper.parameters()).dtype
         if mode != "eager" and self.device.type != "npu":
             raise ValueError("NPU graph mode requires an NPU; use eager explicitly for CPU diagnostics")
-        self.groups = wrapper._num_groups
+        self.groups = getattr(wrapper, "keep_codebooks", wrapper._num_groups)
+        logger.info(
+            "Cached AR: mode=%s keep_codebooks=%d backbone_calls_per_frame=%d", mode, self.groups, self.groups - 1
+        )
         self.vocab = int(wrapper.config.vocab_size)
         self.buffers = {}
         self.graphs = {}
@@ -65,7 +68,8 @@ class CachedARExecutor:
         b = dict(
             hidden=torch.zeros(batch, 1, embed_dim, **opts),
             embed=torch.zeros(batch, 1, embed_dim, **opts),
-            codes=torch.zeros(batch, self.groups, device=self.device, dtype=torch.long),
+            # Preserve the 16-column transport ABI; discarded slots are placeholders.
+            codes=torch.zeros(batch, w._num_groups, device=self.device, dtype=torch.long),
             inputs=torch.zeros(batch, self.groups, hidden, **opts),
             cache=(torch.zeros(shape, **opts), torch.zeros(shape, **opts)),
             uniforms=torch.full((batch, self.groups - 1, self.vocab), 0.5, device=self.device, dtype=torch.float32),
@@ -95,7 +99,7 @@ class CachedARExecutor:
         if self.mode != "kv_frame" or self._projected_embeddings is not None:
             return
         w = self.wrapper
-        name = "_kv_frame_projected_embeddings"
+        name = f"_kv_frame_projected_embeddings_keep{self.groups}"
         table = getattr(w, name, None)
         if table is None:
             started = time.perf_counter()
@@ -122,6 +126,7 @@ class CachedARExecutor:
     def optimization_metadata(self):
         table = self._projected_embeddings
         return dict(
+            keep_codebooks=self.groups,
             optimization=FRAME_OPTIMIZATION if self.mode == "kv_frame" else "none",
             projected_embedding_bytes=0 if table is None else table.numel() * table.element_size(),
             projected_embedding_tables=0 if table is None else self.groups - 2,
@@ -327,6 +332,7 @@ class CachedARExecutor:
                 self._frame(b, sampling, audit)
             self.batch_counts[(batch, bucket)] += 1
             self.last_stats = dict(
+                keep_codebooks=self.groups,
                 backbone_calls=self.groups - 1,
                 graph_replays=1 if self.mode == "kv_frame" else self.groups - 1 if self.mode == "kv_step" else 0,
                 batch=batch,

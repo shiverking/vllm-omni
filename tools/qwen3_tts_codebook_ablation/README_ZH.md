@@ -78,3 +78,57 @@ python -m http.server 8092 --bind 0.0.0.0 \
 ```
 
 访问服务器 IP 的 8092 端口 /listen.html。生成日志保存在采集目录 server/server.log。
+
+
+## 真正提前结束生成：keep10 vs full16
+
+内部部署字段 `code_predictor_keep_codebooks: 10` 仅支持 kv_frame。
+full16 每帧执行 15 次主干；keep10 生成 c0～c9，每帧执行 9 次主干。
+两组均按 batch 1/2/4/8/16 捕获整帧图。传输保持16列，末6列只是零占位；
+Talker 的下一帧 embedding 求和与 Codec 的量化向量求和均排除这些占位。
+这会改变后续 Talker 上下文及随机流消耗，因此真实音频可能与离线删减不同，必须重新试听。
+
+### 中文完整服务性能（无需采集或证书）
+
+```bash
+python tools/qwen3_tts_codebook_ablation/service_bench.py \
+  --results /softwarePlatform/y00899301/qwen3_tts_keep10_perf_run01/service \
+  --model /softwarePlatform/l00927835/Qwen3-TTS-12Hz-1.7B-CustomVoice \
+  --device npu:0 --requests 120 --concurrencies 1 4 16 --port 8091 \
+  --vllm-repo /vllm-workspace/vllm --ascend-repo /vllm-workspace/vllm-ascend
+```
+
+依次启动 full16、keep10，Code2Wav 与 Talker 设置相同。每档预热3请求、正式120请求、1轮。
+正式计时前分别保存12条真实中文试听音频到 full16/audio 与 keep10/audio。
+两组 server.log 分别保留；report.md、summary.json 包含 TTFP、E2E、RTF、吞吐、音频总时长和错误率。
+若时长明显改变，应结合音频秒吞吐与听感判断，不能将少说话算作加速。
+重新运行覆盖本工具产物，不删除原采集数据。
+
+### 固定帧性能（可选，使用已有 AR capture）
+
+```bash
+python tools/qwen3_tts_codebook_ablation/frame_bench.py \
+  --input /softwarePlatform/y00899301/qwen3_tts_ar_graph_run01/capture \
+  --results /softwarePlatform/y00899301/qwen3_tts_keep10_perf_run01/frame \
+  --model /softwarePlatform/l00927835/Qwen3-TTS-12Hz-1.7B-CustomVoice \
+  --device npu:0 --warmup 20 --executions-per-round 60 --batches 1 2 4 8 16
+```
+
+采用原60帧、greedy及共同uniforms随机模式、ABBA四轮。
+同帧前10码差异记录于 prefix_differences.json；不阻止独立性能测量。
+计时包括输入复制和相同的整帧uniforms构造；该口径与服务实际只生成所需随机数不同。
+无AR采集产物可直接做服务测试，不需要为服务测试补做帧级测试。
+
+### 单独启动服务（两套分别运行）
+
+```bash
+vllm-omni serve /softwarePlatform/l00927835/Qwen3-TTS-12Hz-1.7B-CustomVoice \
+  --deploy-config /softwarePlatform/y00899301/vllm_debug_omni/vllm-omni-tts/vllm_omni/deploy/qwen3_tts_ar_kv_frame_keep16.yaml \
+  --host 0.0.0.0 --port 8091 --trust-remote-code --omni
+```
+
+```bash
+vllm-omni serve /softwarePlatform/l00927835/Qwen3-TTS-12Hz-1.7B-CustomVoice \
+  --deploy-config /softwarePlatform/y00899301/vllm_debug_omni/vllm-omni-tts/vllm_omni/deploy/qwen3_tts_ar_kv_frame_keep10.yaml \
+  --host 0.0.0.0 --port 8091 --trust-remote-code --omni
+```

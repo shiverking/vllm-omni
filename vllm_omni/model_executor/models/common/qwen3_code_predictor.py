@@ -758,6 +758,11 @@ class CodePredictorWrapper(nn.Module):
                 is_npu,
             )
         self.ar_execution = prefix_graph_cfg.get("code_predictor_ar_execution", "stock")
+        self.keep_codebooks = int(prefix_graph_cfg.get("code_predictor_keep_codebooks", self._num_groups))
+        if self.keep_codebooks not in (10, self._num_groups):
+            raise ValueError("Codebook generation experiment supports keep10 or all codebooks")
+        if self.keep_codebooks != self._num_groups and self.ar_execution != "kv_frame":
+            raise ValueError("Reduced codebooks require kv_frame")
         if self.ar_execution not in ("stock", "kv_step", "kv_frame"):
             raise ValueError(f"Unknown code_predictor_ar_execution: {self.ar_execution}")
         if self.ar_execution != "stock" and (
