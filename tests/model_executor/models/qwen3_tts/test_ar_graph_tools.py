@@ -60,18 +60,6 @@ def test_uniforms_bound_to_identity_not_batch(capture):
     assert torch.equal(exp.uniforms_for(frames[::-1], 64, "cpu"), together.flip(0))
 
 
-def test_certificate_rejects_changed_scope(tmp_path):
-    path = tmp_path / "correctness.json"
-    args = SimpleNamespace(correctness=path)
-    exp.write_json(path, dict(passed=True, probe_only=False, binding={"code": "original"}))
-    exp.certificate(args, {"code": "original"})
-    with pytest.raises(ValueError):
-        exp.certificate(args, {"code": "changed"})
-    exp.write_json(path, dict(passed=True, probe_only=True, binding={"code": "original"}))
-    with pytest.raises(ValueError):
-        exp.certificate(args, {"code": "original"})
-
-
 def test_import_is_read_only_and_detects_source_change(capture, tmp_path):
     output = tmp_path / "imported"
     output.mkdir()
@@ -116,8 +104,9 @@ def test_failure_saved_before_performance(capture, tmp_path, models, monkeypatch
     assert not exp.read_json(output / "correctness.json")["passed"]
 
 
+@pytest.mark.parametrize("certificate_kind", ["omitted", "missing", "failed", "stale"])
 @torch.inference_mode()
-def test_bench_wiring_with_cpu_standins(capture, tmp_path, models, monkeypatch):  # noqa: F811
+def test_bench_wiring_with_cpu_standins(capture, tmp_path, models, monkeypatch, certificate_kind):  # noqa: F811
     import importlib
 
     w, eager = models
@@ -127,18 +116,22 @@ def test_bench_wiring_with_cpu_standins(capture, tmp_path, models, monkeypatch):
     output = tmp_path / "bench"
     output.mkdir()
     cert = tmp_path / "certificate.json"
-    exp.write_json(cert, dict(passed=True, probe_only=False, binding={}))
+    if certificate_kind == "failed":
+        exp.write_json(cert, dict(passed=False))
+    elif certificate_kind == "stale":
+        cert.write_text("not even valid JSON", encoding="utf-8")
     args = SimpleNamespace(
         input=capture,
         results=output,
         device="npu:0",
         model=exp.MODEL,
-        correctness=cert,
         warmup=20,
         executions_per_round=60,
     )
     monkeypatch.setattr(exp, "load_predictor", lambda *unused: w)
     monkeypatch.setattr(exp, "binding", lambda *unused: {})
+    if certificate_kind != "omitted":
+        args.correctness = cert
     monkeypatch.setattr(exp, "BUCKETS", [1])
     original_inputs, original_uniforms = exp.batch_inputs, exp.uniforms_for
     monkeypatch.setattr(exp, "batch_inputs", lambda frames, device: original_inputs(frames, "cpu"))
@@ -150,54 +143,8 @@ def test_bench_wiring_with_cpu_standins(capture, tmp_path, models, monkeypatch):
     result = exp.read_json(output / "summary.json")
     assert len(result) == 4
     assert all(row["speedup"] == 1.0 for row in result)
-
-
-@pytest.mark.parametrize(
-    "payload,reason",
-    [
-        ({"passed": False, "error": "logits differ", "context": {"position": 3}}, "正确性检查未通过"),
-        ({"passed": True, "probe_only": True, "binding": {}}, "三帧预检"),
-        ({"passed": True, "binding": {"code": {"executor.py": "old"}}}, "绑定差异"),
-        ([], "无法读取"),
-    ],
-)
-def test_certificate_explains_rejection(tmp_path, capsys, payload, reason):
-    path = tmp_path / "correctness.json"
-    exp.write_json(path, payload)
-    args = SimpleNamespace(correctness=path, results=tmp_path / "results")
-    with pytest.raises(ValueError, match="性能测试未启动"):
-        exp.certificate(args, {})
-    assert reason in capsys.readouterr().out
-    report = exp.read_json(args.results / "certificate_diagnostic.json")
-    assert report["reasons"]
-    if isinstance(payload, dict) and payload.get("error"):
-        assert report["previous_error"] == payload["error"]
-        assert report["previous_context"] == payload["context"]
-
-
-@pytest.mark.parametrize("contents", [None, "{invalid"])
-def test_certificate_unreadable(tmp_path, capsys, contents):
-    path = tmp_path / "correctness.json"
-    if contents is not None:
-        path.write_text(contents, encoding="utf-8")
-    with pytest.raises(ValueError, match="证书校验失败"):
-        exp.certificate(SimpleNamespace(correctness=path), {})
-    assert "无法读取" in capsys.readouterr().out
-
-
-def test_binding_differences_reports_exact_fields():
-    differences = exp.binding_differences(
-        {"code": {"executor.py": "old"}, "frames": {"a": None}},
-        {"code": {"executor.py": "new"}, "frames": {"b": None}},
-    )
-    assert [row["field"] for row in differences] == [
-        "binding.code.executor.py",
-        "binding.frames.a",
-        "binding.frames.b",
-    ]
-    assert differences[0]["saved"] == "old"
-    assert differences[0]["current"] == "new"
-    assert differences[1]["current_present"] is False
+    assert not (output / "verified_correctness.json").exists()
+    assert not exp.read_json(output / "manifest.json")["correctness_certificate_checked"]
 
 
 @torch.inference_mode()
@@ -599,3 +546,34 @@ def test_record_policy_still_rejects_cached_graph_differences(capture, tmp_path,
     assert not cert["passed"]
     assert cert["context"]["engine"] == "kv_step"
     assert (output / "failure.pt").exists()
+
+
+@pytest.mark.parametrize("command", ["bench", "profile"])
+def test_performance_cli_has_no_previous_check_requirement(command):
+    args = exp.parser().parse_args([command, "--input", "capture", "--results", "out"])
+    assert args.correctness is None
+    args = exp.parser().parse_args(
+        [command, "--input", "capture", "--results", "out", "--correctness", "missing-or-failed.json"]
+    )
+    assert str(args.correctness) == "missing-or-failed.json"
+
+
+def test_profile_loads_model_without_reading_failed_check(tmp_path, monkeypatch, models):  # noqa: F811
+    import sys
+
+    monkeypatch.setitem(sys.modules, "torch_npu", SimpleNamespace())
+    path = tmp_path / "failed.json"
+    path.write_text("invalid json", encoding="utf-8")
+    args = SimpleNamespace(input=tmp_path, results=tmp_path, device="npu:0", correctness=path)
+    monkeypatch.setattr(exp, "capture_root", lambda path: path)
+    monkeypatch.setattr(exp, "select_frames", lambda root: [])
+
+    class ReachedModelLoadError(Exception):
+        pass
+
+    def loaded(*args):
+        raise ReachedModelLoadError()
+
+    monkeypatch.setattr(exp, "load_predictor", loaded)
+    with pytest.raises(ReachedModelLoadError):
+        exp.profile(args, exp.Progress(tmp_path))

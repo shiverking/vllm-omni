@@ -23,13 +23,20 @@ FIA 不可用、非 BF16、捕获失败或不支持的采样参数会明确报�
 采样参数为 temperature=0.9、top-k=50、top-p=1，也支持 greedy。
 整帧 uniforms 在图外准备；按码本、有效请求行消费 generator，填充行不消耗真实请求随机流。
 
+## 各测试命令独立运行
+
+check、bench、profile、服务测试均可独立运行，没有先通过哪个测试才能运行下一个的要求。
+bench/profile 不读取正确性证书；旧命令中的 `--correctness` 可省略，保留时也忽略。
+各命令仍需实际使用的数据和模型；report 读取已有计时文件进行汇总，不判断其他测试是否通过。
+
 ## 数值检查口径
 
 `--stock-comparison strict|record` 默认 strict；本次命令显式使用 record。
 record 单独记录 stock 与缓存 eager 的 codes 差异，允许测性能；不表示与 stock 完全一致。
 缓存 eager、kv_step、kv_frame 必须 codes 一致，逐位置 logits 使用 atol=rtol=0.02。
 重复运行、随机数更新、行换序、bucket 切换、请求替换和输出生命周期仍严格检查。
-非有限值、非法 token、状态污染、KV 执行差异和图失败均保存诊断并停止对应性能测试。
+检查命令发现非有限值、非法 token、状态污染或 KV 执行差异时保存诊断并结束本次检查，不拦截 bench/profile/服务测试。
+性能命令仍会报告自身的运行错误，例如图捕获失败。
 `--stock-batch-policy record-stable` 单独处理 stock 自身稳定的跨 batch 差异，与上述选项互不替代。
 
 检查输出：
@@ -71,7 +78,7 @@ python tools/qwen3_tts_ar_graph/experiment.py check \
 
 ## 2. 60 帧抽样检查
 
-每个测试请求取首/中/末三帧，不做全量检查。只有此检查的匹配结果可用于帧级 bench/profile；旧证书不可复用。
+每个测试请求取首/中/末三帧，不做全量检查。本检查可选，结果不作为其他命令的前置条件。
 
 ```bash
 python tools/qwen3_tts_ar_graph/experiment.py check \
@@ -100,7 +107,6 @@ python tools/qwen3_tts_ar_graph/experiment.py bench \
   --device npu:0 \
   --stock-comparison record \
   --stock-batch-policy record-stable \
-  --correctness /softwarePlatform/y00899301/qwen3_tts_ar_graph_commercial_kv_run01/check/correctness.json \
   --warmup 20 \
   --executions-per-round 60 \
   --vllm-repo /vllm-workspace/vllm \
@@ -124,7 +130,6 @@ python tools/qwen3_tts_ar_graph/experiment.py profile \
   --device npu:0 \
   --stock-comparison record \
   --stock-batch-policy record-stable \
-  --correctness /softwarePlatform/y00899301/qwen3_tts_ar_graph_commercial_kv_run01/check/correctness.json \
   --warmup 20 \
   --vllm-repo /vllm-workspace/vllm \
   --ascend-repo /vllm-workspace/vllm-ascend

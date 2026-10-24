@@ -309,81 +309,6 @@ def batches(frames, size, count):
     return [[frames[(i * size + j) % len(frames)] for j in range(size)] for i in range(count)]
 
 
-def binding_differences(saved, current, path="binding"):
-    """Compare recorded and current provenance without hiding missing fields."""
-    if isinstance(saved, dict) and isinstance(current, dict):
-        differences = []
-        for key in sorted(saved.keys() | current.keys()):
-            child = f"{path}.{key}"
-            if key not in saved or key not in current:
-                differences.append(
-                    dict(
-                        field=child,
-                        saved=saved.get(key),
-                        current=current.get(key),
-                        saved_present=key in saved,
-                        current_present=key in current,
-                    )
-                )
-            else:
-                differences.extend(binding_differences(saved[key], current[key], child))
-        return differences
-    if saved != current:
-        return [dict(field=path, saved=saved, current=current)]
-    return []
-
-
-def certificate(args, expected):
-    reasons, differences = [], []
-    cert = {}
-    try:
-        cert = read_json(args.correctness)
-        if not isinstance(cert, dict):
-            raise ValueError("证书根节点必须是 JSON 对象")
-    except (OSError, ValueError) as exc:
-        reasons.append(f"无法读取正确性证书: {exc}")
-        cert = {}
-    else:
-        if not cert.get("passed"):
-            reasons.append("正确性检查未通过，或缺少 passed 字段；先解决检查失败。")
-        if cert.get("probe_only"):
-            reasons.append("该证书仅覆盖三帧预检；请执行不带 --probe-only 的 60 帧抽样检查。")
-        differences = binding_differences(cert.get("binding"), expected)
-        if differences:
-            reasons.append(f"证书与本次运行存在 {len(differences)} 项绑定差异；需在当前配置下重新检查。")
-    if not reasons:
-        if getattr(args, "results", None) is not None:
-            write_json(Path(args.results) / "verified_correctness.json", cert)
-        return
-    diagnostic = dict(
-        certificate=str(args.correctness),
-        reasons=reasons,
-        passed=cert.get("passed"),
-        probe_only=cert.get("probe_only"),
-        previous_error=cert.get("error"),
-        previous_context=cert.get("context"),
-        differences=differences,
-    )
-    print(f"\n[证书校验失败] {args.correctness}", flush=True)
-    for reason in reasons:
-        print(f"  - {reason}", flush=True)
-    for key in ("previous_error", "previous_context"):
-        if diagnostic[key] is not None:
-            print(f"  {key}: {json.dumps(diagnostic[key], ensure_ascii=False)}", flush=True)
-    for difference in differences[:30]:
-        print("  " + json.dumps(difference, ensure_ascii=False), flush=True)
-    if len(differences) > 30:
-        print(f"  另有 {len(differences) - 30} 项差异，见诊断文件。", flush=True)
-    if getattr(args, "results", None) is not None:
-        destination = Path(args.results) / "certificate_diagnostic.json"
-        try:
-            write_json(destination, diagnostic)
-            print(f"完整诊断已保存: {destination}", flush=True)
-        except OSError as exc:
-            print(f"诊断文件保存失败: {exc}", flush=True)
-    raise ValueError("正确性证书校验失败；具体原因见上方输出。性能测试未启动。")
-
-
 def collect(args, progress):
     if args.import_from:
         source = args.import_from.resolve()
@@ -805,7 +730,7 @@ def check(args, progress):
     progress.message(
         f"KV 同 batch 执行对照通过 {len(rows)} 项；stock codes 差异 {comparison_summary['differing_frames']} 帧次；"
         f"stock 跨 batch 稳定差异 {len(stock_variations)} 项。"
-        "存在差异时不代表跨 batch 输出一致；CPU 结果不授权 NPU 性能测试。"
+        "存在差异时不代表跨 batch 输出一致；检查结果不拦截其他测试命令。"
     )
 
 
@@ -832,7 +757,6 @@ def bench(args, progress):
     root = capture_root(args.input)
     frames = select_frames(root)
     bind = binding(args, root, frames)
-    certificate(args, bind)
     if not args.device.startswith("npu"):
         raise ValueError("Performance and graph conclusions require NPU")
     w = load_predictor(args, root)
@@ -907,6 +831,8 @@ def bench(args, progress):
         dict(
             binding=bind,
             graphs=metadata,
+            correctness_certificate_required=False,
+            correctness_certificate_checked=False,
             unique_frames=len(frames),
             stock_graph_scope="standalone predictor; service outer MTP scope recorded separately",
             memory_note="peak includes stock resident graphs; not candidate-exclusive",
@@ -927,7 +853,6 @@ def profile(args, progress):
 
     root = capture_root(args.input)
     frames = select_frames(root)
-    certificate(args, binding(args, root, frames))
     if not args.device.startswith("npu"):
         raise ValueError("Native profiling requires NPU")
     w = load_predictor(args, root)
@@ -967,6 +892,8 @@ def profile(args, progress):
         dict(
             binding=binding(args, root, frames),
             scope="6 diagnostic batches; profiler timings are not benchmark timings",
+            correctness_certificate_required=False,
+            correctness_certificate_checked=False,
             kv_attention="npu_fused_infer_attention_score; native GQA; effective KV lengths",
             kv_projection="prefill=2 / decode=1; no full-sequence padding",
         ),
@@ -1066,19 +993,7 @@ def report(args, progress):
             f"{step['candidate_wall_mean_ms']:.3f} | {item['candidate_wall_mean_ms']:.3f} | {ratio:.3f}× |"
         )
     write_json(args.results / "kv_frame_vs_step.json", direct)
-    verified = args.results / "verified_correctness.json"
-    if verified.exists():
-        cert = read_json(verified)
-        lines += [
-            "",
-            f"正确性策略：{cert.get('stock_batch_policy', 'strict')}。",
-            f"stock 对照策略：{cert.get('stock_comparison', 'strict')}；"
-            f"KV 执行一致性：{cert.get('kv_execution_consistent', '未记录')}。",
-            f"stock 差异统计：{json.dumps(cert.get('stock_comparison_summary', {}), ensure_ascii=False)}。",
-            "record 允许与 stock 有差异；检查通过不代表与 stock 完全一致。",
-            f"stock 跨 batch 稳定差异：{len(cert.get('stock_batch_variations', []))} 项；"
-            f"跨 batch 输出一致：{cert.get('stock_batch_invariant', '未记录')}。",
-        ]
+    lines += ["", "本次性能测试独立运行，未读取或校验正确性结果；耗时结果不代表正确性通过。"]
     write_json(args.results / "summary.json", summary)
     (args.results / "report.md").write_text("\n".join(lines), encoding="utf-8")
     progress.message("报告已保存。")
@@ -1119,7 +1034,7 @@ def parser():
         if name == "check":
             p.add_argument("--probe-only", action="store_true")
         if name in ("bench", "profile"):
-            p.add_argument("--correctness", type=Path, required=True)
+            p.add_argument("--correctness", type=Path, help="兼容旧命令；不读取或校验此文件")
             p.add_argument("--warmup", type=int, default=20)
             p.add_argument("--executions-per-round", type=int, default=60)
     return root
