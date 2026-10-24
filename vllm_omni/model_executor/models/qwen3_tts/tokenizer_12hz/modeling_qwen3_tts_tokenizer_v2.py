@@ -199,7 +199,7 @@ class Qwen3TTSTokenizerV2CausalConvNet(nn.Module):
         self.padding = self.kernel_size - self.stride
 
     def _get_extra_padding_for_conv1d(self, hidden_state: torch.Tensor) -> int:
-        # Cache the result per input length — under cudagraph capture the set of lengths
+        # Cache the result per input length â€” under cudagraph capture the set of lengths
         # is fixed, so the LUT converges quickly and replaces the math.ceil call per replay.
         length = hidden_state.shape[-1]
         cache = self.__dict__.get("_pad_lut")
@@ -1313,6 +1313,14 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
         chunk_size=300,
         left_context_size=25,
     ):
+        npu_wrapper = getattr(self, "_npugraph_wrapper", None)
+        if npu_wrapper is not None:
+            return npu_wrapper.chunked_decode_with_cudagraph(
+                codes,
+                caches=caches,
+                chunk_size=chunk_size,
+                left_context_size=left_context_size,
+            )
         # Use CUDA graph if enabled
         if self._cudagraph_enabled and self._cudagraph_wrapper is not None:
             return self._cudagraph_wrapper.chunked_decode_with_cudagraph(
@@ -1633,6 +1641,16 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
         left_context_size=25,
         max_batch_size=0,
     ):
+        npu_wrapper = getattr(self, "_npugraph_wrapper", None)
+        if npu_wrapper is not None:
+            return npu_wrapper.batched_chunked_decode_with_cudagraph(
+                codes,
+                lengths,
+                caches=caches,
+                chunk_size=chunk_size,
+                left_context_size=left_context_size,
+                max_batch_size=max_batch_size,
+            )
         if (
             self._cudagraph_enabled
             and self._cudagraph_wrapper is not None

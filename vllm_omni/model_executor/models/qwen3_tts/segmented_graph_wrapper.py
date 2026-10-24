@@ -11,6 +11,7 @@ reducing kernel launch overhead during inference.
 import bisect
 import os
 from collections import Counter
+from contextlib import nullcontext
 
 import torch
 from torch.cuda import CUDAGraph
@@ -116,6 +117,23 @@ class CUDAGraphDecoderWrapper:
         self._stats_replays: Counter[tuple[str, int, int]] = Counter()
         self._stats_fallbacks: Counter[tuple[str, int]] = Counter()
 
+    def _profile_phase(self, name):
+        if getattr(self, "profile_phases", False):
+            return torch.profiler.record_function("code2wav." + name)
+        return nullcontext()
+
+    def _is_capturing(self):
+        return torch.cuda.is_current_stream_capturing()
+
+    def _new_graph(self):
+        return CUDAGraph()
+
+    def _graph_context(self, graph):
+        return torch.cuda.graph(graph, pool=current_platform.get_global_graph_pool())
+
+    def _synchronize(self, device):
+        torch.accelerator.synchronize(device)
+
     def _derive_icl_suffix_transitions(self) -> dict[int, int]:
         return self._derive_suffix_transitions()
 
@@ -154,7 +172,7 @@ class CUDAGraphDecoderWrapper:
         if (
             not getattr(self, "_stats_enabled", False)
             or getattr(self, "_suppress_stats", False)
-            or torch.cuda.is_current_stream_capturing()
+            or self._is_capturing()
         ):
             return
         self._stats_total_requests += request_count
@@ -166,7 +184,7 @@ class CUDAGraphDecoderWrapper:
         if (
             not getattr(self, "_stats_enabled", False)
             or getattr(self, "_suppress_stats", False)
-            or torch.cuda.is_current_stream_capturing()
+            or self._is_capturing()
         ):
             return
         self._stats_total_requests += request_count
@@ -473,11 +491,11 @@ class CUDAGraphDecoderWrapper:
         static_input = torch.zeros(batch_size, self.num_quantizers, size, dtype=dtype, device=device)
         with torch.no_grad():
             _ = self.decoder._forward_exact(static_input)
-        torch.accelerator.synchronize(device)
+        self._synchronize(device)
 
-        graph = CUDAGraph()
+        graph = self._new_graph()
         with torch.no_grad():
-            with torch.cuda.graph(graph, pool=current_platform.get_global_graph_pool()):
+            with self._graph_context(graph):
                 static_output = self.decoder._forward_exact(static_input)
 
         self.stateless_states[key] = {
@@ -552,11 +570,11 @@ class CUDAGraphDecoderWrapper:
                 target_frames,
                 static_mask,
             )
-        torch.accelerator.synchronize(device)
+        self._synchronize(device)
 
-        graph = CUDAGraph()
+        graph = self._new_graph()
         with torch.no_grad():
-            with torch.cuda.graph(graph, pool=current_platform.get_global_graph_pool()):
+            with self._graph_context(graph):
                 outputs = self._run_combined_suffix(
                     mode,
                     static_codes,
@@ -585,7 +603,7 @@ class CUDAGraphDecoderWrapper:
         static_input = torch.zeros(batch_size, self.num_quantizers, size, dtype=dtype, device=device)
         with torch.no_grad():
             _ = self.decoder._decode_icl_first_chunk(static_input, caches, self.prefix_length)
-        torch.accelerator.synchronize(device)
+        self._synchronize(device)
 
         config = self.decoder.config
         model_dtype = next(self.decoder.parameters()).dtype
@@ -606,9 +624,9 @@ class CUDAGraphDecoderWrapper:
         prefix_attention_mask = torch.ones(batch_size, self.prefix_length, dtype=torch.bool, device=device)
         suffix_attention_mask = torch.ones(batch_size, size, dtype=torch.bool, device=device)
 
-        graph = CUDAGraph()
+        graph = self._new_graph()
         with torch.no_grad():
-            with torch.cuda.graph(graph, pool=current_platform.get_global_graph_pool()):
+            with self._graph_context(graph):
                 static_output = self.decoder._decode_icl_first_chunk(
                     static_input,
                     caches,
@@ -641,7 +659,7 @@ class CUDAGraphDecoderWrapper:
         )
         with torch.no_grad():
             _ = self.decoder._decode_xvec_first_chunk(static_input, {})
-        torch.accelerator.synchronize(device)
+        self._synchronize(device)
 
         config = self.decoder.config
         model_dtype = next(self.decoder.parameters()).dtype
@@ -659,9 +677,9 @@ class CUDAGraphDecoderWrapper:
             device=device,
         )
         caches: dict = {"past_key_values": prefix_cache}
-        graph = CUDAGraph()
+        graph = self._new_graph()
         with torch.no_grad():
-            with torch.cuda.graph(graph, pool=current_platform.get_global_graph_pool()):
+            with self._graph_context(graph):
                 static_output = self.decoder._decode_xvec_first_chunk(static_input, caches)
 
         self.xvec_prefix_states[batch_size] = {
@@ -736,7 +754,7 @@ class CUDAGraphDecoderWrapper:
         request_caches: list[dict],
     ) -> list[torch.Tensor] | None:
         available = set(self.icl_prefix_states)
-        if torch.cuda.is_current_stream_capturing():
+        if self._is_capturing():
             self._record_graph_fallback("icl_prefix:capture", len(codes_list))
             return None
         if not available:
@@ -812,7 +830,7 @@ class CUDAGraphDecoderWrapper:
         if not available:
             self._record_graph_fallback("xvec_prefix:no_graph", len(codes_list))
             return None
-        if torch.cuda.is_current_stream_capturing():
+        if self._is_capturing():
             self._record_graph_fallback("xvec_prefix:capture", len(codes_list))
             return None
         if any(int(codes.shape[-1]) != self.initial_chunk_frames for codes in codes_list):
@@ -871,7 +889,7 @@ class CUDAGraphDecoderWrapper:
             for graph_mode, batch, target in self.combined_states
             if graph_mode == mode and target == target_frames
         }
-        if torch.cuda.is_current_stream_capturing():
+        if self._is_capturing():
             self._record_graph_fallback(f"suffix_{target_frames}:capture", len(codes_list))
             return None
         if not available:
@@ -911,43 +929,47 @@ class CUDAGraphDecoderWrapper:
         static_conv = static_inputs["conv"]
         static_mask = static_inputs["mask"]
         static_caches = state["cache"]
-        static_codes.zero_()
-        static_mask.fill_(1)
+        with self._profile_phase("input_staging"):
+            static_codes.zero_()
+            static_mask.fill_(1)
 
-        for row, (codes, cache, new_frames) in enumerate(zip(codes_list, request_caches, new_frames_list, strict=True)):
-            self._ensure_suffix_buffers(cache)
-            static_codes[row, :, :new_frames].copy_(codes[0, :, -new_frames:])
-            static_quantized[row : row + 1].copy_(cache["suffix_quantized"])
-            static_conv[row : row + 1].copy_(cache["suffix_conv"])
-            if mode == "icl":
-                static_mask[row, : int(cache.get("prefix_pad_frames", 0))] = 0
+            for row, (codes, cache, new_frames) in enumerate(
+                zip(codes_list, request_caches, new_frames_list, strict=True)
+            ):
+                self._ensure_suffix_buffers(cache)
+                static_codes[row, :, :new_frames].copy_(codes[0, :, -new_frames:])
+                static_quantized[row : row + 1].copy_(cache["suffix_quantized"])
+                static_conv[row : row + 1].copy_(cache["suffix_conv"])
+                if mode == "icl":
+                    static_mask[row, : int(cache.get("prefix_pad_frames", 0))] = 0
 
-        self._copy_request_caches_to_batch(request_caches, static_caches)
+            self._copy_request_caches_to_batch(request_caches, static_caches)
         state["graph"].replay()
         self._record_graph_hit(f"suffix_{target_frames}", batch_size, len(codes_list))
-        graph_output, graph_next_quantized, graph_next_conv = state["output"]
-        outputs: list[torch.Tensor] = []
-        for row, (cache, new_frames) in enumerate(zip(request_caches, new_frames_list, strict=True)):
-            actual_suffix_frames = previous_frames + new_frames
-            output = self._trim_replay_output(
-                graph_output[row : row + 1],
-                actual_suffix_frames,
-                target_frames,
-            ).clone()
-            outputs.append(output)
-            if new_frames == expected_new_frames:
-                current_index = int(cache["_suffix_buffer_index"])
-                next_index = 1 - current_index
-                next_quantized = cache["_suffix_quantized_buffers"][next_index]
-                next_conv = cache["_suffix_conv_buffers"][next_index]
-                quantized_valid = int(graph_next_quantized.shape[-1])
-                conv_valid = int(graph_next_conv.shape[1])
-                next_quantized[:, :, :quantized_valid].copy_(graph_next_quantized[row : row + 1])
-                next_conv[:, :conv_valid, :].copy_(graph_next_conv[row : row + 1])
-                cache["_suffix_buffer_index"] = next_index
-                cache["suffix_frames"] = target_frames
-                cache["suffix_quantized"] = next_quantized[:, :, :quantized_valid]
-                cache["suffix_conv"] = next_conv[:, :conv_valid, :]
+        with self._profile_phase("cache_and_output_handoff"):
+            graph_output, graph_next_quantized, graph_next_conv = state["output"]
+            outputs: list[torch.Tensor] = []
+            for row, (cache, new_frames) in enumerate(zip(request_caches, new_frames_list, strict=True)):
+                actual_suffix_frames = previous_frames + new_frames
+                output = self._trim_replay_output(
+                    graph_output[row : row + 1],
+                    actual_suffix_frames,
+                    target_frames,
+                ).clone()
+                outputs.append(output)
+                if new_frames == expected_new_frames:
+                    current_index = int(cache["_suffix_buffer_index"])
+                    next_index = 1 - current_index
+                    next_quantized = cache["_suffix_quantized_buffers"][next_index]
+                    next_conv = cache["_suffix_conv_buffers"][next_index]
+                    quantized_valid = int(graph_next_quantized.shape[-1])
+                    conv_valid = int(graph_next_conv.shape[1])
+                    next_quantized[:, :, :quantized_valid].copy_(graph_next_quantized[row : row + 1])
+                    next_conv[:, :conv_valid, :].copy_(graph_next_conv[row : row + 1])
+                    cache["_suffix_buffer_index"] = next_index
+                    cache["suffix_frames"] = target_frames
+                    cache["suffix_quantized"] = next_quantized[:, :, :quantized_valid]
+                    cache["suffix_conv"] = next_conv[:, :conv_valid, :]
         return outputs
 
     def _batched_request_decode(
@@ -955,7 +977,7 @@ class CUDAGraphDecoderWrapper:
         codes_list: list[torch.Tensor],
         request_caches: list[dict],
     ) -> list[torch.Tensor]:
-        if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+        if torch.cuda.is_available() and self._is_capturing():
             return [self.decoder._forward_exact(codes) for codes in codes_list]
         previous_suppression = getattr(self, "_suppress_stats", False)
         self._suppress_stats = previous_suppression or (
@@ -1103,7 +1125,7 @@ class CUDAGraphDecoderWrapper:
     def _decode_stateless(self, codes: torch.Tensor, *, clone_graph_output: bool) -> torch.Tensor:
         if self.async_chunk:
             raise RuntimeError("Stateless decode is unavailable when async_chunk=True")
-        if not self.enabled or not self._warmed_up or torch.cuda.is_current_stream_capturing():
+        if not self.enabled or not self._warmed_up or self._is_capturing():
             return self.decoder._forward_exact(codes)
 
         batch_size = int(codes.shape[0])
@@ -1185,6 +1207,6 @@ class CUDAGraphDecoderWrapper:
         if not wavs:
             return self.decoder._forward_exact(codes)
         output = torch.cat(wavs, dim=-1)
-        if output.is_cuda and not torch.cuda.is_current_stream_capturing():
+        if output.is_cuda and not self._is_capturing():
             torch.cuda.current_stream(output.device).synchronize()
         return output

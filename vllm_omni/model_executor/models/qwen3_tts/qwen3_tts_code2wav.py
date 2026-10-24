@@ -228,6 +228,16 @@ class Qwen3TTSCode2Wav(nn.Module):
         self._batch_stats_bucket_groups[(group_size, bucket_frames)] += 1
 
     def on_requests_finished(self, finished_req_ids: set[str] | list[str]) -> None:
+        capture_dir = getattr(self, "_code2wav_capture_dir", None)
+        if capture_dir and finished_req_ids:
+            from .code2wav_capture import record_finished
+
+            record_finished(capture_dir, finished_req_ids)
+        telemetry_dir = getattr(self, "_code2wav_telemetry_dir", None)
+        if telemetry_dir and finished_req_ids:
+            from .code2wav_capture import record_batch
+
+            record_batch(self, telemetry_dir, force=True)
         for req_id in finished_req_ids:
             self._decoder_state_cache.pop(req_id, None)
 
@@ -496,6 +506,23 @@ class Qwen3TTSCode2Wav(nn.Module):
             left_context_size=self._decode_left_context_frames,
             max_batch_size=self._decode_batch_max_size,
         )
+        capture_dir = getattr(self, "_code2wav_capture_dir", None)
+        if capture_dir and not any(str(key).startswith(_DUMMY_REQUEST_ID) for key, _ in valid_codes_qf):
+            from .code2wav_capture import record_decode
+
+            record_decode(
+                capture_dir,
+                valid_codes_qf,
+                request_wavs,
+                [finished_flags[i] or segment_finished_flags[i] for i in valid_indices],
+                [request_state_ids[i] for i in valid_indices],
+                self._output_sample_rate,
+            )
+        telemetry_dir = getattr(self, "_code2wav_telemetry_dir", None)
+        if telemetry_dir:
+            from .code2wav_capture import record_batch
+
+            record_batch(self, telemetry_dir, request_lengths)
         if len(request_wavs) != len(valid_codes_qf):
             raise ValueError(
                 f"Qwen3-TTS batched decoder returned {len(request_wavs)} outputs for {len(valid_codes_qf)} requests"
@@ -741,6 +768,29 @@ class Qwen3TTSCode2Wav(nn.Module):
         self.decoder._initial_codec_chunk_frames = initial_codec_chunk_frames
         self.decoder._incremental_chunk_frames = codec_chunk_frames or 25
         self.decoder._incremental_chunk_ramp = list(codec_chunk_ramp or ())
+
+        settings = extra_cfg if isinstance(extra_cfg, dict) else {}
+        execution = settings.get("code2wav_execution", "baseline")
+        if execution not in ("baseline", "npu_graph"):
+            raise ValueError(f"Unsupported code2wav_execution: {execution}")
+        self._code2wav_capture_dir = settings.get("code2wav_capture_dir")
+        self._code2wav_telemetry_dir = settings.get("code2wav_graph_telemetry")
+        if execution == "npu_graph":
+            if device.type != "npu" or not self._async_chunk:
+                raise ValueError("Code2Wav NPU graphs require NPU and async_chunk")
+            if not getattr(model_cfg, "enforce_eager", False):
+                raise ValueError("Set Stage 1 enforce_eager=true: Code2Wav owns the inner NPU graphs")
+            if self._decode_batch_max_size != 4:
+                raise ValueError("Code2Wav NPU graph v1 requires decode_batch_max_size=4")
+            from .npu_segmented_graph_wrapper import NPUGraphDecoderWrapper
+
+            wrapper = NPUGraphDecoderWrapper(
+                self.decoder,
+                settings.get("code2wav_graph_batch_sizes", [1, 2, 4]),
+                telemetry=self._code2wav_telemetry_dir,
+            )
+            wrapper.warmup(device)
+            self.decoder._npugraph_wrapper = wrapper
 
         if hasattr(self.decoder, "enable_cudagraph") and device.type == "cuda":
             try:
