@@ -11,6 +11,7 @@ import json
 import os
 import time
 from collections import Counter
+from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import patch
 
@@ -20,6 +21,19 @@ from vllm.logger import init_logger
 from .segmented_graph_wrapper import CUDAGraphDecoderWrapper
 
 logger = init_logger(__name__)
+
+
+@contextmanager
+def capture_mask_context():
+    """Materialize masks without device-to-host skip probes during capture."""
+    # The SDPA causal-mask shortcut calls fast_all(padding_mask), which reads
+    # a device scalar. An explicit mask preserves padding and sliding-window
+    # semantics while avoiding the unsupported capture-time synchronization.
+    with (
+        patch("transformers.masking_utils.find_packed_sequence_indices", return_value=None),
+        patch("transformers.masking_utils._ignore_causal_mask_sdpa", return_value=False),
+    ):
+        yield
 
 
 class NPUGraphDecoderWrapper(CUDAGraphDecoderWrapper):
@@ -69,7 +83,7 @@ class NPUGraphDecoderWrapper(CUDAGraphDecoderWrapper):
         count = 0
         # Positions in these captures are contiguous and non-packed. Restrict
         # this workaround to initialization; never patch live request execution.
-        with patch("transformers.masking_utils.find_packed_sequence_indices", return_value=None):
+        with capture_mask_context():
             for batch in self.capture_batch_sizes:
                 phases = [("first", None), *[("suffix", n) for n in self._xvec_previous_frames_by_target]]
                 for phase, target in phases:

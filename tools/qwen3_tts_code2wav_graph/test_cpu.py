@@ -112,6 +112,34 @@ class StateTests(unittest.TestCase):
             saved = [got[0], got[0].clone()]
         return caches
 
+    @torch.no_grad()
+    def test_capture_mask_without_host_probe(self):
+        from unittest.mock import patch
+
+        import transformers.masking_utils as masks
+
+        from vllm_omni.model_executor.models.qwen3_tts.npu_segmented_graph_wrapper import capture_mask_context
+
+        original = masks._ignore_causal_mask_sdpa
+        for length in (26, 51, 76, 97):
+            for padded in (False, True):
+                padding = torch.ones(2, length, dtype=torch.bool)
+                if padded:
+                    padding[1, -3:] = False
+                kwargs = dict(
+                    batch_size=2,
+                    q_length=length,
+                    kv_length=length,
+                    attention_mask=padding,
+                    local_size=72,
+                    mask_function=masks.sliding_window_causal_mask_function(72),
+                )
+                expected = masks.sdpa_mask(**kwargs, allow_is_causal_skip=False)
+                with capture_mask_context(), patch.object(masks, "fast_all", side_effect=AssertionError("host probe")):
+                    actual = masks.sdpa_mask(**kwargs)
+                torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+        self.assertIs(masks._ignore_causal_mask_sdpa, original)
+
     def test_graph_shapes(self):
         self.assertEqual(self.wrapper.statistics()["graph_count"], 15)
         self.assertEqual(self.wrapper._xvec_previous_frames_by_target, {26: 1, 51: 26, 76: 51, 97: 72})
