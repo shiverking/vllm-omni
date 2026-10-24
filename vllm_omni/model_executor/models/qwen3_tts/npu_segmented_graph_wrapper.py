@@ -37,7 +37,15 @@ def capture_mask_context():
 
 
 class NPUGraphDecoderWrapper(CUDAGraphDecoderWrapper):
-    def __init__(self, decoder, capture_batch_sizes=(1, 2, 4), telemetry=None):
+    def __init__(self, decoder, capture_batch_sizes=(1, 2, 4), telemetry=None, optimization="current"):
+        from .code2wav_optimization import VARIANTS, prepare_constants
+
+        if optimization not in VARIANTS:
+            raise ValueError(f"Unknown Code2Wav optimization: {optimization}")
+        self.optimization = optimization
+        self._stage_constants = {}
+        if optimization != "current":
+            prepare_constants(decoder)
         super().__init__(
             decoder,
             capture_modes=("xvec",),
@@ -57,6 +65,25 @@ class NPUGraphDecoderWrapper(CUDAGraphDecoderWrapper):
         self._pool = None
         self._stats_enabled = False  # use device-independent, structured counters below
         self._route_calls = 0
+
+    def _capture_xvec_prefix(self, batch_size, device, dtype):
+        from .code2wav_optimization import fixed_stage
+
+        with fixed_stage(self, batch_size, self.initial_chunk_frames):
+            return super()._capture_xvec_prefix(batch_size, device, dtype)
+
+    def _capture_combined_suffix(self, mode, batch_size, target_frames, caches, device, code_dtype):
+        from .code2wav_optimization import fixed_stage
+
+        with fixed_stage(self, batch_size, target_frames):
+            return super()._capture_combined_suffix(mode, batch_size, target_frames, caches, device, code_dtype)
+
+    def _copy_request_caches_to_batch(self, request_caches, static_caches):
+        if self.optimization == "current":
+            return super()._copy_request_caches_to_batch(request_caches, static_caches)
+        # Prefixless CustomVoice has no reference tensors or retained prefix KV.
+        if any(int(c.get("prefix_frames", 0)) for c in request_caches):
+            raise ValueError("Optimized Code2Wav only supports prefixless requests")
 
     def _is_capturing(self):
         return torch.npu.is_current_stream_capturing()
@@ -129,7 +156,18 @@ class NPUGraphDecoderWrapper(CUDAGraphDecoderWrapper):
         # standalone timing keeps counters in memory only.
 
     def statistics(self):
+        from .code2wav_optimization import derived_bytes
+
         return dict(
+            optimization=self.optimization,
+            attention_backend=self.decoder.pre_transformer.config._attn_implementation,
+            derived_buffer_bytes=derived_bytes(self.decoder),
+            stage_constant_bytes=sum(
+                t.numel() * t.element_size()
+                for pos, mask, rope in self._stage_constants.values()
+                for t in (pos, mask, *rope)
+                if t is not None
+            ),
             backend="torch.npu.NPUGraph",
             graph_owner="code2wav",
             outer_graph=False,

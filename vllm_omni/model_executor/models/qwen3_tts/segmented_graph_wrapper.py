@@ -855,7 +855,10 @@ class CUDAGraphDecoderWrapper:
 
         state = self.xvec_prefix_states[batch_size]
         static_input = state["input"]["codes"]
-        static_input.zero_()
+        if getattr(self, "optimization", "current") == "current":
+            static_input.zero_()
+        else:
+            static_input[len(codes_list) :].zero_()
         for row, codes in enumerate(codes_list):
             static_input[row].copy_(codes[0])
 
@@ -930,8 +933,11 @@ class CUDAGraphDecoderWrapper:
         static_mask = static_inputs["mask"]
         static_caches = state["cache"]
         with self._profile_phase("input_staging"):
-            static_codes.zero_()
-            static_mask.fill_(1)
+            if getattr(self, "optimization", "current") == "current":
+                static_codes.zero_()
+                static_mask.fill_(1)
+            else:
+                static_codes[len(codes_list) :].zero_()
 
             for row, (codes, cache, new_frames) in enumerate(
                 zip(codes_list, request_caches, new_frames_list, strict=True)

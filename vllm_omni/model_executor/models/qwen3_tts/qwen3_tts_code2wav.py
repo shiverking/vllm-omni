@@ -476,36 +476,45 @@ class Qwen3TTSCode2Wav(nn.Module):
 
         request_lengths = [int(codes_qf.shape[-1]) for _, codes_qf in valid_codes_qf]
         max_request_length = max(request_lengths)
-        request_codes_shape = (len(valid_codes_qf), q, max_request_length)
-        target_device = ids.device
-        if target_device.type == "cuda" and all(codes_qf.device.type == "cpu" for _, codes_qf in valid_codes_qf):
-            staged_codes = torch.zeros(
-                request_codes_shape,
-                dtype=torch.long,
-                device="cpu",
-                pin_memory=True,
-            )
-            for row, (_, codes_qf) in enumerate(valid_codes_qf):
-                staged_codes[row, :, : codes_qf.shape[-1]].copy_(codes_qf)
-            request_codes = staged_codes.to(device=target_device, non_blocking=True)
-        else:
-            request_codes = torch.zeros(request_codes_shape, dtype=torch.long, device=target_device)
-            for row, (_, codes_qf) in enumerate(valid_codes_qf):
-                request_codes[row, :, : codes_qf.shape[-1]].copy_(codes_qf)
-
         self._record_decode_batch_stats(
             group_size=len(valid_codes_qf),
             bucket_frames=max_request_length,
             actual_frames=request_lengths,
         )
-        request_wavs = decoder.batched_chunked_decode(
-            request_codes,
-            request_lengths,
-            caches=request_states,
-            chunk_size=self._decode_chunk_frames,
-            left_context_size=self._decode_left_context_frames,
-            max_batch_size=self._decode_batch_max_size,
-        )
+        graph_wrapper = getattr(decoder, "_npugraph_wrapper", None)
+        if graph_wrapper is not None and graph_wrapper.optimization != "current" and request_states is not None:
+            request_wavs = [
+                x[0]
+                for x in graph_wrapper._batched_request_decode(
+                    [codes.unsqueeze(0).to(ids.device) for _, codes in valid_codes_qf], request_states
+                )
+            ]
+        else:
+            request_codes_shape = (len(valid_codes_qf), q, max_request_length)
+            target_device = ids.device
+            if target_device.type == "cuda" and all(codes_qf.device.type == "cpu" for _, codes_qf in valid_codes_qf):
+                staged_codes = torch.zeros(
+                    request_codes_shape,
+                    dtype=torch.long,
+                    device="cpu",
+                    pin_memory=True,
+                )
+                for row, (_, codes_qf) in enumerate(valid_codes_qf):
+                    staged_codes[row, :, : codes_qf.shape[-1]].copy_(codes_qf)
+                request_codes = staged_codes.to(device=target_device, non_blocking=True)
+            else:
+                request_codes = torch.zeros(request_codes_shape, dtype=torch.long, device=target_device)
+                for row, (_, codes_qf) in enumerate(valid_codes_qf):
+                    request_codes[row, :, : codes_qf.shape[-1]].copy_(codes_qf)
+
+            request_wavs = decoder.batched_chunked_decode(
+                request_codes,
+                request_lengths,
+                caches=request_states,
+                chunk_size=self._decode_chunk_frames,
+                left_context_size=self._decode_left_context_frames,
+                max_batch_size=self._decode_batch_max_size,
+            )
         capture_dir = getattr(self, "_code2wav_capture_dir", None)
         if capture_dir and not any(str(key).startswith(_DUMMY_REQUEST_ID) for key, _ in valid_codes_qf):
             from .code2wav_capture import record_decode
@@ -788,6 +797,7 @@ class Qwen3TTSCode2Wav(nn.Module):
                 self.decoder,
                 settings.get("code2wav_graph_batch_sizes", [1, 2, 4]),
                 telemetry=self._code2wav_telemetry_dir,
+                optimization=settings.get("code2wav_graph_optimization", "current"),
             )
             wrapper.warmup(device)
             self.decoder._npugraph_wrapper = wrapper

@@ -623,6 +623,12 @@ class Qwen3TTSTokenizerV2DecoderTransformerModel(Qwen3TTSTokenizerV2DecoderPreTr
         if use_cache and past_key_values is None:
             past_key_values = DynamicCache(config=self.config)
 
+        fixed_stage = getattr(self, "_code2wav_fixed_stage", None)
+        if fixed_stage is not None:
+            cache_position = fixed_stage[0]
+            position_ids = cache_position.unsqueeze(0)
+            attention_mask = {"sliding_attention": fixed_stage[1]}
+
         if cache_position is None:
             past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
             cache_position = torch.arange(
@@ -656,7 +662,9 @@ class Qwen3TTSTokenizerV2DecoderTransformerModel(Qwen3TTSTokenizerV2DecoderPreTr
             sliding_attention_mask = self._get_sliding_attention_mask(inputs_embeds)
 
         # create position embeddings to be shared across the decoder layers
-        position_embeddings = self.rotary_emb(hidden_states, position_ids)
+        position_embeddings = (
+            fixed_stage[2] if fixed_stage is not None else self.rotary_emb(hidden_states, position_ids)
+        )
 
         for decoder_layer in self.layers[: self.config.num_hidden_layers]:
             hidden_states = decoder_layer(

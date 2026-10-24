@@ -140,6 +140,32 @@ class StateTests(unittest.TestCase):
                 torch.testing.assert_close(actual, expected, atol=0, rtol=0)
         self.assertIs(masks._ignore_causal_mask_sdpa, original)
 
+    @torch.no_grad()
+    def test_constants_match_current_and_invalidate(self):
+        from vllm_omni.model_executor.models.qwen3_tts.code2wav_optimization import FrozenCodebook
+
+        model = decoder()
+        wrapper = eager_layout_class()(model, optimization="constants")
+        wrapper.warmup(torch.device("cpu"))
+        for batch in (1, 3, 4):
+            left = [dict(prefix_frames=0) for _ in range(batch)]
+            right = [dict(prefix_frames=0) for _ in range(batch)]
+            for length in (1, 25, 25, 25, 25, 3, 25):
+                codes = [torch.randint(0, 32, (1, 2, length)) for _ in range(batch)]
+                a = run(model, wrapper, codes, left)
+                b = run(self.model, self.wrapper, codes, right)
+                for x, y in zip(a, b):
+                    self.assert_tensor(x, y)
+        book = next(m for m in model.modules() if isinstance(m, FrozenCodebook))
+        expected = book.embedding_sum / book.cluster_usage.clamp(min=book.epsilon)[:, None]
+        torch.testing.assert_close(book._normalized_embedding, expected, atol=0, rtol=0)
+        book.load_state_dict(book.state_dict())
+        self.assertIsNone(book._normalized_embedding)
+        book.decode(torch.zeros(1, 1, dtype=torch.long))
+        book.to(dtype=torch.float64)
+        self.assertIsNone(book._normalized_embedding)
+        self.assertGreater(wrapper.statistics()["derived_buffer_bytes"], 0)
+
     def test_graph_shapes(self):
         self.assertEqual(self.wrapper.statistics()["graph_count"], 15)
         self.assertEqual(self.wrapper._xvec_previous_frames_by_target, {26: 1, 51: 26, 76: 51, 97: 72})

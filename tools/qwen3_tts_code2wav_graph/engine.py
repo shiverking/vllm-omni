@@ -72,7 +72,10 @@ def eager_layout_class():
 
                 def first(state=state):
                     caches = {}
-                    state["output"] = self.decoder._decode_xvec_first_chunk(state["input"]["codes"], caches)
+                    from vllm_omni.model_executor.models.qwen3_tts.code2wav_optimization import fixed_stage
+
+                    with fixed_stage(self, state["input"]["codes"].shape[0], self.initial_chunk_frames):
+                        state["output"] = self.decoder._decode_xvec_first_chunk(state["input"]["codes"], caches)
                     state["cache"] = caches
 
                 state["graph"] = SimpleNamespace(replay=first)
@@ -106,9 +109,12 @@ def eager_layout_class():
 
                     def suffix(state=state, target=target):
                         x = state["input"]
-                        state["output"] = self._run_combined_suffix(
-                            "xvec", x["codes"], x["quantized"], x["conv"], state["cache"], target, x["mask"]
-                        )
+                        from vllm_omni.model_executor.models.qwen3_tts.code2wav_optimization import fixed_stage
+
+                        with fixed_stage(self, x["codes"].shape[0], target):
+                            state["output"] = self._run_combined_suffix(
+                                "xvec", x["codes"], x["quantized"], x["conv"], state["cache"], target, x["mask"]
+                            )
 
                     state["graph"] = SimpleNamespace(replay=suffix)
                     suffix()
@@ -119,6 +125,8 @@ def eager_layout_class():
 
 
 def run(model, wrapper, codes, caches):
+    if wrapper is not None and wrapper.optimization != "current":
+        return [x[0] for x in wrapper._batched_request_decode(codes, caches)]
     lengths = [int(x.shape[-1]) for x in codes]
     batch = codes[0].new_zeros((len(codes), codes[0].shape[-2], max(lengths)))
     for i, x in enumerate(codes):
