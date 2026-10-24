@@ -60,6 +60,13 @@ def eager_layout_class():
 
         def warmup(self, device, dtype=torch.long):
             self._device = device
+            if self.pooled:
+                for batch in self.capture_batch_sizes:
+                    self._capture_pool(batch, None, device, dtype)
+                    for target in self._xvec_previous_frames_by_target:
+                        self._capture_pool(batch, target, device, dtype)
+                self._warmed_up = True
+                return
             model_dtype = next(self.decoder.parameters()).dtype
             for batch in self.capture_batch_sizes:
                 state = {
@@ -138,7 +145,7 @@ def run(model, wrapper, codes, caches):
 
 def snapshot_cache(cache):
     """Only semantic state, never ping-pong aliases from another executor."""
-    return copy.deepcopy({k: v for k, v in cache.items() if not k.startswith("_suffix_")})
+    return copy.deepcopy({k: v for k, v in cache.items() if not k.startswith(("_suffix_", "_c2w_"))})
 
 
 def cpu_cache(cache):

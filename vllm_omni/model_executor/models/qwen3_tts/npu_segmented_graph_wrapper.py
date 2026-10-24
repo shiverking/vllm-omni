@@ -18,6 +18,7 @@ from unittest.mock import patch
 import torch
 from vllm.logger import init_logger
 
+from .code2wav_state_pool import PooledGraphMixin
 from .segmented_graph_wrapper import CUDAGraphDecoderWrapper
 
 logger = init_logger(__name__)
@@ -36,7 +37,7 @@ def capture_mask_context():
         yield
 
 
-class NPUGraphDecoderWrapper(CUDAGraphDecoderWrapper):
+class NPUGraphDecoderWrapper(PooledGraphMixin, CUDAGraphDecoderWrapper):
     def __init__(self, decoder, capture_batch_sizes=(1, 2, 4), telemetry=None, optimization="current"):
         from .code2wav_optimization import VARIANTS, prepare_constants
 
@@ -67,12 +68,16 @@ class NPUGraphDecoderWrapper(CUDAGraphDecoderWrapper):
         self._route_calls = 0
 
     def _capture_xvec_prefix(self, batch_size, device, dtype):
+        if self.pooled:
+            return self._capture_pool(batch_size, None, device, dtype)
         from .code2wav_optimization import fixed_stage
 
         with fixed_stage(self, batch_size, self.initial_chunk_frames):
             return super()._capture_xvec_prefix(batch_size, device, dtype)
 
     def _capture_combined_suffix(self, mode, batch_size, target_frames, caches, device, code_dtype):
+        if self.pooled:
+            return self._capture_pool(batch_size, target_frames, device, code_dtype)
         from .code2wav_optimization import fixed_stage
 
         with fixed_stage(self, batch_size, target_frames):
@@ -160,6 +165,7 @@ class NPUGraphDecoderWrapper(CUDAGraphDecoderWrapper):
 
         return dict(
             optimization=self.optimization,
+            state_pool_bytes=self.state_pool.nbytes if getattr(self, "state_pool", None) else 0,
             attention_backend=self.decoder.pre_transformer.config._attn_implementation,
             derived_buffer_bytes=derived_bytes(self.decoder),
             stage_constant_bytes=sum(
@@ -196,7 +202,15 @@ class NPUGraphDecoderWrapper(CUDAGraphDecoderWrapper):
     def log_decode_stats(self):
         logger.info("Code2Wav NPU graph statistics: %s", self.flush_stats())
 
+    def _decode_xvec_prefix_batch(self, codes_list, request_caches):
+        if self.pooled and all(x.shape[-1] == self.initial_chunk_frames for x in codes_list):
+            batch = self._select_batch_bucket(len(codes_list), {1, 2, 4})
+            return self._pool_replay(self.xvec_prefix_states[batch], codes_list, request_caches, None)
+        return super()._decode_xvec_prefix_batch(codes_list, request_caches)
+
     def _decode_suffix_batch(self, mode, target_frames, codes_list, request_caches, new_frames_list):
+        if self.pooled:
+            return self._pool_suffix(target_frames, codes_list, request_caches, new_frames_list)
         expected = target_frames - self._transitions_for_mode(mode)[target_frames]
         if mode != "xvec":
             return None
@@ -235,23 +249,33 @@ class NPUGraphDecoderWrapper(CUDAGraphDecoderWrapper):
         self.routes[("eager", reason, 1, 1)] += 1
         self._maybe_flush()
         with torch.profiler.record_function("code2wav.eager_fallback"):
-            return super()._decode_request_fallback(codes, cache)
+            if not self.pooled:
+                return super()._decode_request_fallback(codes, cache)
+            self.ensure_pool(codes.device)
+            self.state_pool.acquire(cache)
+            output = super()._decode_request_fallback(codes, cache)
+            self.state_pool.store(cache, cache["suffix_quantized"], cache["suffix_conv"], 1 - cache["_c2w_bank"])
+            return output
 
     def _batched_request_decode(self, codes_list, request_caches):
         if self._is_capturing():
             raise RuntimeError("Code2Wav inner NPU graphs cannot run inside an outer capture")
         if any(int(cache.get("prefix_frames", 0)) != 0 for cache in request_caches):
             raise ValueError("Code2Wav NPU graph v1 only supports prefixless CustomVoice")
-        return self.decoder.batched_request_decode(
-            codes_list,
-            request_caches,
-            prefix_length=self.prefix_length,
-            initial_chunk_frames=self.initial_chunk_frames,
-            codec_chunk_frames=self.codec_chunk_frames,
-            transitions_by_mode={"icl": {}, "xvec": self._xvec_previous_frames_by_target},
-            decode_icl_prefix_batch=None,
-            decode_xvec_prefix_batch=self._decode_xvec_prefix_batch,
-            decode_suffix_batch=self._decode_suffix_batch,
-            decode_fallback=self._decode_request_fallback,
-            backend_max_batch_size=4,
-        )
+        try:
+            return self.decoder.batched_request_decode(
+                codes_list,
+                request_caches,
+                prefix_length=self.prefix_length,
+                initial_chunk_frames=self.initial_chunk_frames,
+                codec_chunk_frames=self.codec_chunk_frames,
+                transitions_by_mode={"icl": {}, "xvec": self._xvec_previous_frames_by_target},
+                decode_icl_prefix_batch=None,
+                decode_xvec_prefix_batch=self._decode_xvec_prefix_batch,
+                decode_suffix_batch=self._decode_suffix_batch,
+                decode_fallback=self._decode_request_fallback,
+                backend_max_batch_size=4,
+            )
+        except Exception:
+            self.release_requests(request_caches)
+            raise

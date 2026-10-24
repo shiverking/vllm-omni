@@ -166,6 +166,42 @@ class StateTests(unittest.TestCase):
         self.assertIsNone(book._normalized_embedding)
         self.assertGreater(wrapper.statistics()["derived_buffer_bytes"], 0)
 
+    @torch.no_grad()
+    def test_pooled_state_lifecycle(self):
+        model = decoder()
+        wrapper = eager_layout_class()(model, optimization="pooled")
+        wrapper.warmup(torch.device("cpu"))
+        self.assertEqual(wrapper.statistics()["graph_count"], 15)
+        for batch in (1, 2, 3, 4, 5):
+            caches = [dict(prefix_frames=0) for _ in range(batch)]
+            refs = [dict(prefix_frames=0) for _ in range(batch)]
+            saved = None
+            for length in (1, 25, 25, 25, 25, 3, 25, 2):
+                codes = [torch.randint(0, 32, (1, 2, length)) for _ in caches]
+                actual = run(model, wrapper, codes, caches)
+                expected = run(self.model, self.wrapper, codes, refs)
+                for a, b, c, r in zip(actual, expected, caches, refs):
+                    self.assert_tensor(a, b)
+                    self.assert_tensor(c["suffix_quantized"], r["suffix_quantized"])
+                    self.assert_tensor(c["suffix_conv"], r["suffix_conv"])
+                if saved is not None:
+                    self.assert_tensor(*saved)
+                saved = actual[0], actual[0].clone()
+                caches.reverse()
+                refs.reverse()
+            wrapper.release_requests(caches)
+            self.assertEqual(len(wrapper.state_pool.free), 16)
+            self.assertTrue(all(list(c) == ["prefix_frames"] for c in caches))
+        # Slot exhaustion is explicit and release permits a new request.
+        caches = [dict(prefix_frames=0) for _ in range(16)]
+        wrapper.import_histories(caches, torch.device("cpu"))
+        with self.assertRaisesRegex(RuntimeError, "exhausted"):
+            wrapper.import_histories([dict(prefix_frames=0)], torch.device("cpu"))
+        wrapper.release_requests(caches[:1])
+        wrapper.import_histories([dict(prefix_frames=0)], torch.device("cpu"))
+        wrapper.reset_pool()
+        self.assertEqual(len(wrapper.state_pool.free), 16)
+
     def test_graph_shapes(self):
         self.assertEqual(self.wrapper.statistics()["graph_count"], 15)
         self.assertEqual(self.wrapper._xvec_previous_frames_by_target, {26: 1, 51: 26, 76: 51, 97: 72})

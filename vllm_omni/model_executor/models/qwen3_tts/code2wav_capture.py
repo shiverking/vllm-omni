@@ -36,6 +36,19 @@ def record_decode(directory, requests, waves, finished, external_ids, sample_rat
 def record_batch(owner, directory, lengths=(), force=False):
     from collections import Counter
 
+    if not getattr(owner, "_code2wav_exit_flush_registered", False):
+        import atexit
+        import weakref
+
+        reference = weakref.ref(owner)
+
+        def final_flush():
+            live = reference()
+            if live is not None:
+                record_batch(live, directory, force=True)
+
+        atexit.register(final_flush)
+        owner._code2wav_exit_flush_registered = True
     counters = getattr(owner, "_code2wav_research_batches", None)
     if counters is None:
         counters = Counter()

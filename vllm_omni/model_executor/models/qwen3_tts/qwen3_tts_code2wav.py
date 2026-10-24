@@ -237,9 +237,12 @@ class Qwen3TTSCode2Wav(nn.Module):
         if telemetry_dir and finished_req_ids:
             from .code2wav_capture import record_batch
 
-            record_batch(self, telemetry_dir, force=True)
+            record_batch(self, telemetry_dir)
+        wrapper = getattr(getattr(self, "decoder", None), "_npugraph_wrapper", None)
         for req_id in finished_req_ids:
-            self._decoder_state_cache.pop(req_id, None)
+            cache = self._decoder_state_cache.pop(req_id, None)
+            if wrapper is not None and cache is not None:
+                wrapper.release_requests([cache])
 
     def log_decode_batch_stats(self) -> None:
         if not self._batch_stats_enabled or self._batch_stats_requests == 0:
