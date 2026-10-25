@@ -803,6 +803,11 @@ class Qwen3TTSCode2Wav(nn.Module):
 
         settings = extra_cfg if isinstance(extra_cfg, dict) else {}
         execution = settings.get("code2wav_execution", "baseline")
+        transformer_execution = settings.get("code2wav_transformer_execution", "current")
+        if transformer_execution not in ("current", "growth_kv", "stream_kv"):
+            raise ValueError(f"Unsupported code2wav_transformer_execution: {transformer_execution}")
+        if transformer_execution != "current" and execution != "npu_graph":
+            raise ValueError("Incremental Transformer requires explicit Code2Wav NPU execution")
         if execution not in ("baseline", "npu_graph"):
             raise ValueError(f"Unsupported code2wav_execution: {execution}")
         self._code2wav_capture_dir = settings.get("code2wav_capture_dir")
@@ -822,7 +827,20 @@ class Qwen3TTSCode2Wav(nn.Module):
                 telemetry=self._code2wav_telemetry_dir,
                 optimization=settings.get("code2wav_graph_optimization", "current"),
             )
-            wrapper.warmup(device)
+            if transformer_execution != "stream_kv":
+                wrapper.warmup(device)
+            if transformer_execution != "current":
+                if settings.get("code2wav_graph_optimization", "current") != "current":
+                    raise ValueError("Incremental KV experiments must not combine constants/pooled/fused")
+                from .code2wav_incremental_kv import IncrementalKVExecutor
+
+                wrapper = IncrementalKVExecutor(
+                    self.decoder, transformer_execution,
+                    settings.get("code2wav_incremental_execution", "graph"),
+                    current=wrapper if transformer_execution == "growth_kv" else None,
+                    telemetry=self._code2wav_telemetry_dir,
+                )
+                wrapper.warmup(device)
             self.decoder._npugraph_wrapper = wrapper
 
         if hasattr(self.decoder, "enable_cudagraph") and device.type == "cuda":

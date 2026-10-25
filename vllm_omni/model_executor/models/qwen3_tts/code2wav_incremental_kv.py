@@ -3,11 +3,14 @@
 
 from __future__ import annotations
 
-import torch
-
-from collections import Counter, defaultdict
+import json
+import os
 import threading
 import time
+from collections import Counter, defaultdict
+from pathlib import Path
+
+import torch
 
 
 def causal_window_mask(query, history, window, device, dtype):
@@ -31,7 +34,7 @@ def waveform(decoder, hidden, frames):
 
 
 @torch.no_grad()
-def continuous_reference(decoder, codes, new_frames):
+def continuous_reference(decoder, codes, new_frames, return_kv=False):
     """Full continuous convolution and sliding-attention recomputation.
 
     Diagnostic only: codes contain the complete request history, not a crop.
@@ -41,14 +44,27 @@ def continuous_reference(decoder, codes, new_frames):
     n = conv.shape[1]
     positions = torch.arange(n, device=conv.device)
     mask = causal_window_mask(n, 0, decoder.config.sliding_window, conv.device, conv.dtype)
+    cache = None
+    if return_kv:
+        cfg = decoder.config
+        shape = (
+            cfg.num_hidden_layers,
+            codes.shape[0],
+            cfg.num_key_value_heads,
+            0,
+            getattr(cfg, "head_dim", cfg.hidden_size // cfg.num_attention_heads),
+        )
+        cache = LayerKV(conv.new_empty(shape), conv.new_empty(shape), n)
     hidden = decoder.pre_transformer(
         inputs_embeds=conv,
         attention_mask={"sliding_attention": mask},
         position_ids=positions[None],
         cache_position=positions,
-        use_cache=False,
+        use_cache=return_kv,
+        past_key_values=cache,
     ).last_hidden_state
-    return waveform(decoder, hidden[:, -(new_frames + 12) :], new_frames), hidden
+    result = (waveform(decoder, hidden[:, -(new_frames + 12) :], new_frames), hidden)
+    return (*result, cache.k, cache.v) if return_kv else result
 
 
 class LayerKV:
@@ -82,13 +98,15 @@ class IncrementalStage:
         kvshape = (cfg.num_hidden_layers, batch, cfg.num_key_value_heads, valid, head)
         self.inputs = dict(
             codes=torch.zeros(batch, cfg.num_quantizers, query, device=p.device, dtype=torch.long),
-            k=p.new_zeros(kvshape), v=p.new_zeros(kvshape),
+            k=p.new_zeros(kvshape),
+            v=p.new_zeros(kvshape),
             quantized=p.new_zeros(batch, cfg.codebook_dim, min(previous, self.window)),
             conv=p.new_zeros(batch, min(previous, self.window - 2), cfg.latent_dim),
             hidden=p.new_zeros(batch, min(previous, 12), cfg.latent_dim),
             positions=torch.arange(previous, previous + query, device=p.device)[None].repeat(batch, 1),
         )
         self.cache = LayerKV(self.inputs["k"], self.inputs["v"], query)
+        self.relative_positions = torch.arange(query, device=p.device)
         self.mask = causal_window_mask(query, valid, self.window, p.device, p.dtype)
         self.graph = None
 
@@ -108,10 +126,10 @@ class IncrementalStage:
         context_hidden = torch.cat((x["hidden"], hidden), 1)
         self.outputs = dict(
             wav=waveform(d, context_hidden, n),
-            k=self.cache.k[..., -(self.window - 1):, :],
-            v=self.cache.v[..., -(self.window - 1):, :],
-            quantized=torch.cat((x["quantized"], quantized), -1)[..., -self.window:],
-            conv=torch.cat((x["conv"], conv), 1)[:, -(self.window - 2):],
+            k=self.cache.k[..., -(self.window - 1) :, :],
+            v=self.cache.v[..., -(self.window - 1) :, :],
+            quantized=torch.cat((x["quantized"], quantized), -1)[..., -self.window :],
+            conv=torch.cat((x["conv"], conv), 1)[:, -(self.window - 2) :],
             hidden=context_hidden[:, -12:],
         )
         return self.outputs
@@ -135,23 +153,70 @@ class IncrementalKVExecutor:
         self.capture_seconds = 0.0
         self._lock = threading.Lock()
         self._stream = None
+        self._warmed_up = False
 
     def stage(self, batch, previous, query):
         # Once all state lengths saturate, absolute position is a live input.
         key = (batch, min(previous, self.window), query)
         if key not in self.stages:
             self.stages[key] = IncrementalStage(self.decoder, *key)
+            # Unusual short blocks must not accumulate every possible shape
+            # throughout the lifetime of a serving worker. Captured graphs stay.
+            eager_keys = [k for k, s in self.stages.items() if s.graph is None and k != key]
+            for old in eager_keys[:-31]:
+                del self.stages[old]
         return self.stages[key]
 
+    @torch.no_grad()
     def warmup(self, device, dtype=torch.long):
-        if self.execution == "graph":
-            raise NotImplementedError("NPU graph capture is not installed yet")
+        if self.execution != "graph" or self._warmed_up:
+            return
+        if device.type != "npu":
+            raise ValueError("Graph experiments require NPU; CPU only validates eager")
+        from vllm.logger import init_logger
+
+        logger = init_logger(__name__)
+        started = time.perf_counter()
+        phases = [(0, 1), (1, 25), (26, 25), (51, 25)]
+        if self.mode == "stream_kv":
+            phases.append((self.window, 25))
+        pool = torch.npu.graph_pool_handle()
+        for b in (1, 2, 4):
+            for previous, query in phases:
+                stage = self.stage(b, previous, query)
+                logger.info("Code2Wav %s capture batch=%d previous=%d query=%d", self.mode, b, previous, query)
+                try:
+                    for _ in range(3):
+                        stage.forward()
+                    torch.npu.synchronize(device)
+                    graph = torch.npu.NPUGraph()
+                    with torch.npu.graph(graph, pool=pool):
+                        stage.forward()
+                    stage.graph = graph
+                except Exception as exc:
+                    self.flush_stats(error=dict(batch=b, previous=previous, query=query, error=repr(exc)))
+                    raise RuntimeError(f"Incremental capture failed: {self.mode}/{b}/{previous}/{query}") from exc
+        self.capture_seconds = time.perf_counter() - started
+        self._warmed_up = True
+        self.flush_stats()
 
     def release_requests(self, caches):
         for cache in caches:
             self.owners.pop(id(cache), None)
             cache.clear()
             cache["prefix_frames"] = 0
+
+    def chunked_decode_with_cudagraph(self, codes, caches=None, **kwargs):
+        if caches is None or codes.shape[0] != 1:
+            raise ValueError("Incremental decode requires one request cache and a single new-code row")
+        return self._batched_request_decode([codes], [caches])[0]
+
+    def batched_chunked_decode_with_cudagraph(self, codes, lengths, caches=None, **kwargs):
+        if caches is None or len(caches) != len(lengths):
+            raise ValueError("Incremental decode requires explicit per-request caches")
+        return [
+            x[0] for x in self._batched_request_decode([codes[i : i + 1, :, :n] for i, n in enumerate(lengths)], caches)
+        ]
 
     def _legacy_state(self, cache, row, outputs, total):
         from transformers.cache_utils import DynamicCache
@@ -160,16 +225,18 @@ class IncrementalKVExecutor:
             empty = DynamicCache(config=self.decoder.config)
             cfg = self.decoder.config
             empty.early_initialization(
-                batch_size=1, num_heads=cfg.num_key_value_heads,
+                batch_size=1,
+                num_heads=cfg.num_key_value_heads,
                 head_dim=getattr(cfg, "head_dim", cfg.hidden_size // cfg.num_attention_heads),
-                dtype=outputs["hidden"].dtype, device=outputs["hidden"].device,
+                dtype=outputs["hidden"].dtype,
+                device=outputs["hidden"].device,
             )
             cache.update(past_key_values=empty, decoder_prefix_frames=0)
-        cache["suffix_quantized"] = outputs["quantized"][row:row+1].clone()
-        cache["suffix_conv"] = outputs["conv"][row:row+1].clone()
+        cache["suffix_quantized"] = cache["_ikv"]["quantized"]
+        cache["suffix_conv"] = cache["_ikv"]["conv"]
         cache["ref_hidden"] = cache["suffix_quantized"][..., :0]
         cache["ref_conv"] = cache["suffix_conv"][:, :0]
-        cache["prefix_hidden"] = outputs["hidden"][row:row+1, :0].clone()
+        cache["prefix_hidden"] = cache["_ikv"]["hidden"][:, :0]
         cache["suffix_frames"] = min(total, self.window)
 
     def _commit(self, cache, row, outputs):
@@ -185,7 +252,9 @@ class IncrementalKVExecutor:
                 else:
                     shape[0] = 1
                     shape[-1 if name == "quantized" else 1] = {
-                        "quantized": self.window, "conv": self.window - 2, "hidden": 12
+                        "quantized": self.window,
+                        "conv": self.window - 2,
+                        "hidden": 12,
                     }[name]
                 storage[name] = value.new_empty(shape)
             cache["_ikv_storage"] = storage
@@ -193,17 +262,19 @@ class IncrementalKVExecutor:
         for name, target in cache["_ikv_storage"].items():
             source = outputs[name]
             if name in ("k", "v"):
-                source = source[:, row:row+1]
-                view = target[..., :source.shape[-2], :]
+                source = source[:, row : row + 1]
+                view = target[..., : source.shape[-2], :]
             elif name == "quantized":
-                source = source[row:row+1]
-                view = target[..., :source.shape[-1]]
+                source = source[row : row + 1]
+                view = target[..., : source.shape[-1]]
             else:
-                source = source[row:row+1]
-                view = target[:, :source.shape[1]]
+                source = source[row : row + 1]
+                view = target[:, : source.shape[1]]
             view.copy_(source)
             state[name] = view
             self.routes["state_commit_bytes"] += source.numel() * source.element_size()
+            if name in ("k", "v"):
+                self.routes["kv_commit_bytes"] += source.numel() * source.element_size()
         cache["_ikv"] = state
 
     @torch.no_grad()
@@ -219,6 +290,13 @@ class IncrementalKVExecutor:
             self._lock.release()
 
     def _decode(self, codes_list, caches):
+        if self.execution == "graph":
+            if not self._warmed_up:
+                raise RuntimeError("Call warmup before graph execution")
+            stream = torch.npu.current_stream().npu_stream
+            if self._stream is not None and self._stream != stream:
+                raise RuntimeError("Incremental graph buffers require one ordered NPU stream")
+            self._stream = stream
         if len(codes_list) != len(caches) or len({id(c) for c in caches}) != len(caches):
             raise ValueError("Request/cache rows must be distinct and aligned")
         fresh = {id(c): c for c in caches if id(c) not in self.owners}
@@ -233,25 +311,25 @@ class IncrementalKVExecutor:
             if not 0 < n <= 25:
                 raise ValueError("Expected 1..25 new codec frames")
             previous = cache.get("_ikv_total", 0)
-            groups[(previous, n)].append(i)
+            groups[(min(previous, self.window), n)].append(i)
         result = [None] * len(caches)
         for (previous, query), indices in groups.items():
             for start in range(0, len(indices), 4):
-                rows = indices[start:start+4]
+                rows = indices[start : start + 4]
                 if self.mode == "growth_kv" and previous >= self.window:
                     cs = [caches[i] for i in rows]
                     for c in cs:
                         c.pop("_ikv", None)
                         c.pop("_ikv_storage", None)
                     if self.current is None:
-                        out = [self.decoder.chunked_decode(codes_list[i], caches[i]) for i in rows]
+                        out = [self.decoder.decode_suffix(codes_list[i], caches[i], 0) for i in rows]
                     else:
                         out = self.current._batched_request_decode([codes_list[i] for i in rows], cs)
                     self.routes["rolling_recompute"] += 1
                     self.routes["transformer_positions"] += sum(min(previous, self.window) + query for _ in rows)
                     for i, wav in zip(rows, out):
                         result[i] = wav.clone()
-                        caches[i]["_ikv_total"] = previous + query
+                        caches[i]["_ikv_total"] += query
                     continue
                 batch = next(b for b in (1, 2, 4) if b >= len(rows))
                 stage = self.stage(batch, previous, query)
@@ -260,28 +338,63 @@ class IncrementalKVExecutor:
                     t.zero_()
                 for row, i in enumerate(rows):
                     x["codes"][row].copy_(codes_list[i].reshape_as(x["codes"][row]))
-                    x["positions"][row].copy_(torch.arange(previous, previous+query, device=x["positions"].device))
+                    x["positions"][row].copy_(stage.relative_positions)
+                    x["positions"][row].add_(caches[i].get("_ikv_total", 0))
                     if previous:
                         state = caches[i]["_ikv"]
                         for name in ("k", "v"):
-                            x[name][:, row:row+1].copy_(state[name])
+                            x[name][:, row : row + 1].copy_(state[name])
+                            self.routes["kv_input_bytes"] += state[name].numel() * state[name].element_size()
                         for name in ("quantized", "conv", "hidden"):
-                            x[name][row:row+1].copy_(state[name])
-                outputs = stage.forward()
-                self.routes["eager"] += 1
+                            x[name][row : row + 1].copy_(state[name])
+                if self.execution == "graph" and stage.graph is not None:
+                    stage.graph.replay()
+                    outputs = stage.outputs
+                    self.routes["graph"] += 1
+                else:
+                    outputs = stage.forward()
+                    reason = "eager" if self.execution == "eager" else "eager_short_or_nonstandard_history"
+                    self.routes[reason] += 1
                 self.routes["transformer_positions"] += query * len(rows)
                 self.routes["padding_positions"] += query * (batch - len(rows))
-                wave = outputs["wav"][:len(rows)].clone()
+                wave = outputs["wav"][: len(rows)].clone()
                 for row, i in enumerate(rows):
                     cache = caches[i]
                     self._commit(cache, row, outputs)
-                    cache["_ikv_total"] = previous + query
-                    self._legacy_state(cache, row, outputs, previous + query)
-                    result[i] = wave[row:row+1]
+                    cache["_ikv_total"] = cache.get("_ikv_total", 0) + query
+                    self._legacy_state(cache, row, outputs, cache["_ikv_total"])
+                    result[i] = wave[row : row + 1]
         return result
 
     def statistics(self):
-        return dict(mode=self.mode, execution=self.execution, routes=dict(self.routes),
-                    graphs=sum(s.graph is not None for s in self.stages.values()),
-                    capture_seconds=self.capture_seconds, active_requests=len(self.owners),
-                    attention_backend=self.decoder.config._attn_implementation)
+        return dict(
+            mode=self.mode,
+            execution=self.execution,
+            routes=dict(self.routes),
+            graph_count=sum(s.graph is not None for s in self.stages.values()),
+            capture_seconds=self.capture_seconds,
+            active_requests=len(self.owners),
+            attention_backend=self.decoder.config._attn_implementation,
+            stage_buffer_bytes=sum(
+                t.numel() * t.element_size()
+                for s in self.stages.values()
+                for t in (*s.inputs.values(), s.cache.k, s.cache.v, s.mask, s.relative_positions)
+            ),
+            request_buffer_bytes=sum(
+                t.numel() * t.element_size() for c in self.owners.values() for t in c.get("_ikv_storage", {}).values()
+            ),
+            rolling=self.current.statistics() if self.current is not None else None,
+        )
+
+    def flush_stats(self, error=None):
+        data = self.statistics()
+        if error:
+            data["capture_failure"] = error
+        if self.telemetry:
+            root = Path(self.telemetry)
+            root.mkdir(parents=True, exist_ok=True)
+            path = root / f"code2wav-{os.getpid()}.json"
+            tmp = path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
+            tmp.replace(path)
+        return data
