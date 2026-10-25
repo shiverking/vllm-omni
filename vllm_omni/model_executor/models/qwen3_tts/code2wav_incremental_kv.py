@@ -123,7 +123,7 @@ class IncrementalKVExecutor:
     optimization = "incremental_kv"  # direct request-list service dispatch
 
     def __init__(self, decoder, mode="growth_kv", execution="eager", current=None, telemetry=None):
-        if mode != "growth_kv":
+        if mode not in ("growth_kv", "stream_kv"):
             raise ValueError(f"Unsupported incremental mode: {mode}")
         if execution not in ("eager", "graph"):
             raise ValueError(execution)
@@ -172,6 +172,40 @@ class IncrementalKVExecutor:
         cache["prefix_hidden"] = outputs["hidden"][row:row+1, :0].clone()
         cache["suffix_frames"] = min(total, self.window)
 
+    def _commit(self, cache, row, outputs):
+        """Allocate request buffers once; only copy valid state on later calls."""
+        if "_ikv_storage" not in cache:
+            storage = {}
+            for name, value in outputs.items():
+                if name == "wav":
+                    continue
+                shape = list(value.shape)
+                if name in ("k", "v"):
+                    shape[1], shape[-2] = 1, self.window - 1
+                else:
+                    shape[0] = 1
+                    shape[-1 if name == "quantized" else 1] = {
+                        "quantized": self.window, "conv": self.window - 2, "hidden": 12
+                    }[name]
+                storage[name] = value.new_empty(shape)
+            cache["_ikv_storage"] = storage
+        state = {}
+        for name, target in cache["_ikv_storage"].items():
+            source = outputs[name]
+            if name in ("k", "v"):
+                source = source[:, row:row+1]
+                view = target[..., :source.shape[-2], :]
+            elif name == "quantized":
+                source = source[row:row+1]
+                view = target[..., :source.shape[-1]]
+            else:
+                source = source[row:row+1]
+                view = target[:, :source.shape[1]]
+            view.copy_(source)
+            state[name] = view
+            self.routes["state_commit_bytes"] += source.numel() * source.element_size()
+        cache["_ikv"] = state
+
     @torch.no_grad()
     def _batched_request_decode(self, codes_list, caches):
         if not self._lock.acquire(blocking=False):
@@ -208,6 +242,7 @@ class IncrementalKVExecutor:
                     cs = [caches[i] for i in rows]
                     for c in cs:
                         c.pop("_ikv", None)
+                        c.pop("_ikv_storage", None)
                     if self.current is None:
                         out = [self.decoder.chunked_decode(codes_list[i], caches[i]) for i in rows]
                     else:
@@ -239,10 +274,7 @@ class IncrementalKVExecutor:
                 wave = outputs["wav"][:len(rows)].clone()
                 for row, i in enumerate(rows):
                     cache = caches[i]
-                    cache["_ikv"] = {
-                        name: value[:, row:row+1].clone() if name in ("k", "v") else value[row:row+1].clone()
-                        for name, value in outputs.items() if name != "wav"
-                    }
+                    self._commit(cache, row, outputs)
                     cache["_ikv_total"] = previous + query
                     self._legacy_state(cache, row, outputs, previous + query)
                     result[i] = wave[row:row+1]

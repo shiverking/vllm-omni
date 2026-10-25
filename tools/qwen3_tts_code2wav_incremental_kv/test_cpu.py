@@ -66,6 +66,49 @@ class ReferenceTests(unittest.TestCase):
             runner.release_requests(cache)
             self.assertEqual(len(runner.owners), 0)
 
+    @torch.no_grad()
+    def test_stream_multilayer_and_partition(self):
+        model = support.decoder()
+        # Two layers are essential: historical representations carry old context.
+        import copy
+        layer = copy.deepcopy(model.pre_transformer.layers[0])
+        layer.self_attn.layer_idx = 1
+        model.pre_transformer.layers.append(layer)
+        model.config.num_hidden_layers = 2
+        for sizes in ((1, 25, 25, 25, 25, 25, 25), (1, 3, 25, 7, 25, 25, 25, 25)):
+            runner = IncrementalKVExecutor(model, mode="stream_kv")
+            caches = [dict(prefix_frames=0) for _ in range(3)]
+            histories = [torch.empty(1, 2, 0, dtype=torch.long) for _ in caches]
+            count = 0
+            for n in sizes:
+                codes = [torch.randint(0, 32, (1, 2, n)) for _ in caches]
+                got = runner._batched_request_decode(codes, caches)
+                count += n
+                for row in range(3):
+                    histories[row] = torch.cat((histories[row], codes[row]), -1)
+                    expected, hidden = continuous_reference(model, histories[row], n)
+                    torch.testing.assert_close(got[row], expected, atol=1e-5, rtol=1e-4)
+                    torch.testing.assert_close(caches[row]["_ikv"]["hidden"], hidden[:, -12:], atol=1e-5, rtol=1e-4)
+                    self.assertLessEqual(caches[row]["_ikv"]["k"].shape[-2], 71)
+                caches.reverse()
+                histories.reverse()
+            self.assertEqual(runner.routes["transformer_positions"], count * 3)
+            runner.release_requests(caches)
+
+    @torch.no_grad()
+    def test_capacity_and_release(self):
+        model = support.decoder()
+        runner = IncrementalKVExecutor(model, "stream_kv")
+        caches = [{} for _ in range(16)]
+        code = torch.randint(0, 32, (1, 2, 1))
+        runner._batched_request_decode([code] * 16, caches)
+        with self.assertRaisesRegex(RuntimeError, "16 active"):
+            runner._batched_request_decode([code], [{}])
+        runner.release_requests(caches)
+        got = runner._batched_request_decode([code], [caches[0]])[0]
+        expected, _ = continuous_reference(model, code, 1)
+        torch.testing.assert_close(got, expected, atol=1e-5, rtol=1e-4)
+
 
 if __name__ == "__main__":
     unittest.main()
