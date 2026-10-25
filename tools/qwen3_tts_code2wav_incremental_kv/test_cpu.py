@@ -15,6 +15,7 @@ sys.path.insert(0, str(ROOT))
 from vllm_omni.model_executor.models.qwen3_tts.code2wav_incremental_kv import (  # noqa: E402
     causal_window_mask,
     continuous_reference,
+    IncrementalKVExecutor,
 )
 
 
@@ -40,6 +41,30 @@ class ReferenceTests(unittest.TestCase):
             offset += n
             got, _ = continuous_reference(model, codes[..., :offset], n)
             torch.testing.assert_close(got, expected, atol=1e-5, rtol=1e-4)
+
+    @torch.no_grad()
+    def test_growth_handoff(self):
+        model = support.decoder()
+        runner = IncrementalKVExecutor(model)
+        for batch in (1, 2, 3, 4):
+            cache = [dict(prefix_frames=0) for _ in range(batch)]
+            stock = [dict(prefix_frames=0) for _ in range(batch)]
+            saved = None
+            for n in (1, 25, 25, 25, 25, 3, 25, 25):
+                codes = [torch.randint(0, 32, (1, 2, n)) for _ in cache]
+                got = runner._batched_request_decode(codes, cache)
+                expected = [model.chunked_decode(x, c) for x, c in zip(codes, stock)]
+                for a, b, c, d in zip(got, expected, cache, stock):
+                    torch.testing.assert_close(a, b, atol=1e-5, rtol=1e-4)
+                    for name in ("suffix_quantized", "suffix_conv"):
+                        torch.testing.assert_close(c[name], d[name], atol=1e-5, rtol=1e-4)
+                if saved:
+                    torch.testing.assert_close(*saved)
+                saved = (got[0], got[0].clone())
+                cache.reverse()
+                stock.reverse()
+            runner.release_requests(cache)
+            self.assertEqual(len(runner.owners), 0)
 
 
 if __name__ == "__main__":
