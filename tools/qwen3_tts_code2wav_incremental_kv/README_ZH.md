@@ -120,6 +120,10 @@ python tools/qwen3_tts_code2wav_incremental_kv/experiment.py bench \
 `timings.jsonl` 保存KV搬运字节、实际有效位置数和padding位置数；图统计另存。
 设备事件含提交间隙，不是纯kernel时间。内存峰值包含同时驻留的图与历史快照。
 `bench/profile/` 的六批trace单独采集，历史准备不进入trace或正式时间。
+Ascend profiler无`key_averages()`时，从本次导出的原生CSV/trace记录算子信息；
+`operators.json`保留原列名和单位，不把设备时间误写为CPU时间。
+profiling异常单独记录到`profile_errors.json`，不终止后续配置计时。
+每个候选正式计时结束即保存报告，profiling故障不会丢失已完成的耗时结果。
 bench不读取任何正确性结果，性能结果不代表功能通过。
 
 ## 4. 服务对比

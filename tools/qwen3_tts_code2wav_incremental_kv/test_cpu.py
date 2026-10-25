@@ -170,7 +170,7 @@ class ReferenceTests(unittest.TestCase):
             args.batches = [1, 3]
             args.warmup = 1
             args.executions_per_round = 8
-            args.profile = False
+            args.profile = True
             actual_make = tool.make
 
             def eager_make(args, model, mode, execution):
@@ -184,12 +184,37 @@ class ReferenceTests(unittest.TestCase):
                 patch.object(tool.legacy, "sequences", return_value=sequences),
                 patch.object(tool, "make", side_effect=eager_make),
                 patch.object(tool.legacy, "measured", side_effect=measured),
+                patch.object(tool, "profile", side_effect=RuntimeError("injected profiler failure")),
                 patch.object(
                     torch, "npu", SimpleNamespace(max_memory_allocated=lambda: 0, empty_cache=lambda: None), create=True
                 ),
             ):
                 tool.bench(args, tool.Progress(Path(temp)))
             self.assertTrue(all(r["speedup"] == 1.0 for r in tool.read_json(Path(temp) / "summary.json")))
+            self.assertEqual(len(tool.read_json(Path(temp) / "profile_errors.json")), 4)
+
+    def test_ascend_profile_without_key_averages(self):
+        import tempfile
+        from types import SimpleNamespace
+
+        module_spec = importlib.util.spec_from_file_location(
+            "incremental_profile_tool", Path(__file__).with_name("experiment.py")
+        )
+        tool = importlib.util.module_from_spec(module_spec)
+        module_spec.loader.exec_module(tool)
+        with tempfile.TemporaryDirectory() as temp:
+            directory = Path(temp)
+            old = directory / "old_kernel_details.csv"
+            old.write_text("Name,Duration(us)\nold,99\n", encoding="utf-8")
+            before = set(directory.rglob("*"))
+            output = directory / "run/ASCEND_PROFILER_OUTPUT"
+            output.mkdir(parents=True)
+            (output / "kernel_details.csv").write_text("Name,Duration(us)\nMatMul,12.5\n", encoding="utf-8")
+            result = tool.profile_summary(SimpleNamespace(), directory, before)
+            self.assertEqual(result["source"], "ascend_export")
+            self.assertEqual(len(result["tables"]), 1)
+            self.assertEqual(result["tables"][0]["rows"], [{"Name": "MatMul", "Duration(us)": "12.5"}])
+            self.assertFalse(any("old_kernel" in p for p in result["files"]))
 
     @torch.no_grad()
     def test_kv_layers_against_full_reference(self):

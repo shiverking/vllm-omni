@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import csv
 import hashlib
 import importlib.util
 import json
@@ -461,6 +462,7 @@ def bench(args, progress):
     seq = legacy.sequences(args)
     rows = []
     meta = {}
+    profile_errors = []
     for mode in [x for x in args.variants if x != "current"]:
         for execution in args.executions:
             candidate = make(args, model, mode, execution)
@@ -536,9 +538,16 @@ def bench(args, progress):
                     note="内存峰值包含同时驻留的对照与候选",
                 )
                 write_json(args.results / "graph.json", meta)
+                # Formal results are usable even if optional trace parsing fails.
+                report(args, progress)
                 if args.profile:
-                    profile(args, model, candidate, seq, label, progress)
-                    profile(args, model, anchor, seq, "current", progress)
+                    for executor, profile_label in ((candidate, label), (anchor, "current")):
+                        try:
+                            profile(args, model, executor, seq, profile_label, progress)
+                        except Exception as exc:
+                            profile_errors.append(dict(label=profile_label, error=repr(exc)))
+                            write_json(args.results / "profile_errors.json", profile_errors)
+                            progress.log(f"profiling {profile_label} 异常：{exc}；正式计时已保存，继续后续配置")
             finally:
                 release(candidate, list(getattr(candidate, "owners", {}).values()))
             del candidate, anchor
@@ -551,31 +560,63 @@ def profile(args, model, wrapper, seq, label, progress):
 
     for i, job in enumerate(legacy.make_jobs(seq, 4, 6)):
         codes, caches = prepare(model, wrapper, job, args.device)
-        torch.npu.synchronize()
-        directory = args.results / "profile" / label.replace("/", "-") / f"batch{i}"
-        directory.mkdir(parents=True, exist_ok=True)
-        with torch_npu.profiler.profile(
-            activities=[torch_npu.profiler.ProfilerActivity.CPU, torch_npu.profiler.ProfilerActivity.NPU],
-            record_shapes=True,
-            profile_memory=True,
-            on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(str(directory)),
-        ) as prof:
-            run(model, wrapper, codes, caches)
+        try:
             torch.npu.synchronize()
-        write_json(
-            directory / "operators.json",
-            [
+            directory = args.results / "profile" / label.replace("/", "-") / f"batch{i}"
+            directory.mkdir(parents=True, exist_ok=True)
+            before = set(directory.rglob("*"))
+            options = dict(
+                activities=[torch_npu.profiler.ProfilerActivity.CPU, torch_npu.profiler.ProfilerActivity.NPU],
+                record_shapes=True,
+                profile_memory=True,
+                schedule=torch_npu.profiler.schedule(wait=0, warmup=0, active=1, repeat=1),
+                on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(str(directory)),
+            )
+            config = getattr(torch_npu.profiler, "_ExperimentalConfig", None)
+            levels = getattr(torch_npu.profiler, "ProfilerLevel", None)
+            if config is not None and levels is not None:
+                options["experimental_config"] = config(profiler_level=levels.Level1)
+            with torch_npu.profiler.profile(**options) as prof:
+                run(model, wrapper, codes, caches)
+                torch.npu.synchronize()
+                prof.step()  # Complete RECORD_AND_SAVE before leaving the context.
+            write_json(directory / "operators.json", profile_summary(prof, directory, before))
+        finally:
+            release(wrapper, caches)
+    progress.log(f"独立六批 profiling 完成：{label}")
+
+
+def profile_summary(prof, directory, before):
+    """Ascend profile exports files; unlike torch.profiler it may lack averages."""
+    averages = getattr(prof, "key_averages", None)
+    if callable(averages):
+        return dict(
+            source="key_averages",
+            events=[
                 dict(
                     name=e.key,
                     count=e.count,
                     self_cpu_us=e.self_cpu_time_total,
                     self_device_us=getattr(e, "self_device_time_total", None),
                 )
-                for e in prof.key_averages()
+                for e in averages()
             ],
         )
-        release(wrapper, caches)
-    progress.log(f"独立六批 profiling 完成：{label}")
+    files = [p for p in sorted(directory.rglob("*")) if p.is_file() and p not in before]
+    tables = []
+    for path in files:
+        if path.suffix.lower() == ".csv" and any(
+            key in path.name.lower() for key in ("operator", "kernel", "op_statistic")
+        ):
+            with path.open(encoding="utf-8-sig", newline="") as stream:
+                # Preserve Ascend's column names and units; no invented timing fields.
+                tables.append(dict(file=str(path.relative_to(directory)), rows=list(csv.DictReader(stream))))
+    return dict(
+        source="ascend_export",
+        files=[str(p.relative_to(directory)) for p in files],
+        tables=tables,
+        note="当前 profiler 无 key_averages；使用本次导出的 Ascend 原始 CSV/trace，不影响正式计时",
+    )
 
 
 def report(args, progress):
