@@ -142,6 +142,27 @@ class ReferenceTests(unittest.TestCase):
             result = tool.read_json(Path(temp) / "correctness.json")
             self.assertTrue(result["passed"], result["errors"])
             self.assertTrue((Path(temp) / "listening.json").exists())
+            # Deliberate numerical failures must not skip later chunks or audio.
+            original_compare = tool.compare
+
+            def mismatching_compare(*values):
+                return {**original_compare(*values), "passed": False}
+
+            args.variants = ["growth_kv", "stream_kv"]
+            args.batches = [1]
+            with (
+                patch.object(tool, "load_decoder", return_value=(model, 24000)),
+                patch.object(tool.legacy, "sequences", return_value=sequences),
+                patch.object(tool, "compare", side_effect=mismatching_compare),
+            ):
+                tool.check(args, tool.Progress(Path(temp)))
+            result = tool.read_json(Path(temp) / "correctness.json")
+            self.assertTrue(result["complete"])
+            self.assertFalse(result["passed"])
+            self.assertEqual(result["status"], "completed_with_differences")
+            self.assertEqual(result["errors"], [])
+            self.assertEqual(result["mismatch_records"], 2 * (3 * 5 + 13))
+            self.assertEqual(len(tool.read_json(Path(temp) / "listening.json")), 8)
             chosen, weights, counts = tool.weighted_jobs(sequences, 2, 12, 72)
             self.assertEqual(set(counts), {tool.job_phase(j) for j in chosen})
             self.assertAlmostEqual(sum(weights[tool.job_phase(j)] for j in chosen), sum(counts.values()))

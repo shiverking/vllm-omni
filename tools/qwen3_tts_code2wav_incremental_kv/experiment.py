@@ -163,12 +163,13 @@ def diagnostic(model, candidate, codes, caches, histories, lengths):
     finally:
         for h in handles:
             h.remove()
+        release(candidate, caches)
 
 
 @torch.no_grad()
 def check(args, progress):
     model, rate = load_decoder(args)
-    sequences = legacy.sequences(args)
+    sequences = list(legacy.sequences(args))
     # Deterministic long input exercises several windows and short->full recovery.
     source = torch.cat(sequences[0]["chunks"], -1)
     sizes = [1, 25, 25, 25, 25, 7, 25, 25, 25, 25, 25, 25, 3]
@@ -266,7 +267,8 @@ def check(args, progress):
                                 stock_batch_vs_single=compare(stock[j], single_stock[j], atol, rtol),
                             )
                             checks.append(row)
-                            if not row["passed"]:
+                            artifact_path = args.results / f"failure-{mode}-{execution}.pt"
+                            if not row["passed"] and not artifact_path.exists():
                                 artifact = dict(
                                     row=row,
                                     codes=freeze(codes),
@@ -287,8 +289,11 @@ def check(args, progress):
                                     )
                                 except Exception as exc:
                                     artifact["diagnostic_error"] = repr(exc)
-                                torch.save(artifact, args.results / f"failure-{mode}-{execution}.pt")
-                                raise AssertionError(f"{label} batch={batch} {request['id']} chunk={position}")
+                                torch.save(artifact, artifact_path)
+                                progress.log(
+                                    f"{label} 首次数值差异：batch={batch} {request['id']} chunk={position}；"
+                                    "已记录，继续全部请求和音频导出"
+                                )
                             audio[i]["current"].append(stock[j].detach().cpu())
                             audio[i]["candidate"].append(got[j].detach().cpu())
                             if position + 1 == len(request["chunks"]):
@@ -366,22 +371,44 @@ def check(args, progress):
                     release(eager, eager_caches)
                 write_json(
                     args.results / "correctness.json",
-                    dict(passed=not errors, complete=False, checks=checks, errors=errors, atol=atol, rtol=rtol),
+                    check_summary(checks, errors, False, atol, rtol),
                 )
     write_json(
         args.results / "correctness.json",
-        dict(passed=not errors, complete=True, checks=checks, errors=errors, atol=atol, rtol=rtol),
+        check_summary(checks, errors, not errors, atol, rtol),
     )
     write_json(args.results / "listening-key.json", listening)
     write_json(args.results / "listening.json", [dict(id=x["id"], files=x["files"]) for x in listening])
     (args.results / "report.md").write_text(
-        f"# Transformer 增量 KV 检查\n\n检查记录 {len(checks)}；失败配置 {len(errors)}。\n\n"
+        f"# Transformer 增量 KV 检查\n\n检查记录 {len(checks)}；运行异常配置 {len(errors)}；"
+        f"数值差异记录 {sum(r.get('passed') is False for r in checks)}。\n\n"
+        "数值对照仅记录，不中断请求或音频导出；运行完成不等于正确性通过。\n\n"
         "stream_kv 与连续重算对照；与 current 的差异单列，不代表音质通过。\n\n"
         "盲听文件见 listening.json，解盲和波形指标见 listening-key.json。\n",
         encoding="utf-8",
     )
-    if errors:
-        raise RuntimeError("增量检查存在失败，见 correctness.json；性能命令仍可独立运行")
+    progress.update(done, total, "检查结束（数值差异不拦截）")
+
+
+def check_summary(checks, errors, complete, atol, rtol):
+    differences = sum(row.get("passed") is False for row in checks)
+    return dict(
+        passed=not errors and differences == 0,
+        complete=complete,
+        status="completed_with_runtime_errors"
+        if errors
+        else "completed_with_differences"
+        if complete and differences
+        else "complete"
+        if complete
+        else "running",
+        nonblocking=True,
+        mismatch_records=differences,
+        checks=checks,
+        errors=errors,
+        atol=atol,
+        rtol=rtol,
+    )
 
 
 def prepare(model, wrapper, job, device):

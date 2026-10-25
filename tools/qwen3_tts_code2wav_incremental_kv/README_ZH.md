@@ -84,7 +84,10 @@ python tools/qwen3_tts_code2wav_incremental_kv/experiment.py check \
 stock批处理相对独立执行差异单列；不自动放宽阈值。
 FP32 atol=1e-5/rtol=1e-4；BF16 atol=1e-5/rtol=0.016（torch默认），产物记录实际参数。
 首个失败保存 `failure-模式-执行.pt`：输入、前后状态、波形、模块诊断与图信息。
-该配置停止，继续其他独立配置，最终非零退出并保留 correctness.json。
+数值差异仅记录，不停止当前配置、后续块或音频导出，也不在结束时抛出校验异常。
+每配置只保存首份详细差异，所有差异统计保存在 correctness.json。
+`complete=true` 表示全部执行完成，`passed=false` 仍表示存在差异；二者独立。
+真正的算子／捕获等运行异常记录在 errors 中，无法执行的配置跳过，继续其他配置。
 
 `audio/` 保存batch1、最后所选执行方式的成对PCM16 WAV。
 `listening.json` 是盲听清单；`listening-key.json` 为解盲键、波形差异、边界跳变、RMS、峰值和时长。
