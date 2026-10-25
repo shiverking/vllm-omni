@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 import importlib.util
 import sys
+import tempfile
 import types
 import unittest
 from pathlib import Path
@@ -32,6 +33,52 @@ class Tests(unittest.TestCase):
         finally:
             snake.kernel.cache_clear()
             snake.__dict__.pop("tl", None)
+
+    def test_flat_indexing_and_cropped_strides(self):
+        for b, c, t in ((1, 3, 1), (4, 7, 37), (2, 5, 129)):
+            storage = torch.arange(b * c * (t + 9)).reshape(b, c, t + 9)
+            x = storage[..., 4 : 4 + t]
+            offset = torch.arange(b * c * t)
+            row, time = offset // t, offset % t
+            channel = row % c
+            address = row // c * x.stride(0) + channel * x.stride(1) + time + x.storage_offset()
+            torch.testing.assert_close(storage.flatten()[address], x.flatten())
+            for block in (128, 1024):
+                tasks = (x.numel() + block - 1) // block
+                visited = [
+                    i
+                    for pid in range(40)
+                    for task in range(pid, tasks, 40)
+                    for i in range(task * block, min((task + 1) * block, x.numel()))
+                ]
+                self.assertEqual(sorted(visited), list(range(x.numel())))
+
+    def test_auto_policy_and_override(self):
+        self.assertEqual(snake.select_config((4, 1024, 37), "auto"), ("flat", 1024, 40))
+        self.assertEqual(snake.select_config((1, 96, 1920), "auto"), ("channel", 2048, 32))
+        self.assertEqual(snake.select_config((4, 96, 71040), "auto"), ("channel", 4096, 40))
+        self.assertEqual(snake.select_config((4, 96, 71040), "flat", 512, 16), ("flat", 512, 16))
+        with self.assertRaises(ValueError):
+            snake.select_config((1, 1, 1), "invalid")
+
+    def test_bounded_real_capture(self):
+        capture_spec = importlib.util.spec_from_file_location("snake_capture", Path(__file__).with_name("capture.py"))
+        capture = importlib.util.module_from_spec(capture_spec)
+        capture_spec.loader.exec_module(capture)
+        with tempfile.TemporaryDirectory() as tmp:
+            recorder = capture.Recorder(Path(tmp), 1, 1024)
+            module = types.SimpleNamespace(_cached=True, _exp_alpha=torch.ones(3), _inv_beta=torch.ones(3))
+            x = torch.arange(24.).reshape(1, 3, 8)
+            hook = recorder.hook("snake")
+            hook(module, (x,))
+            x.zero_()
+            hook(module, (x,))
+            hook(module, (torch.zeros(2, 3, 8),))
+            self.assertEqual(len(recorder.rows), 1)
+            saved = torch.load(Path(tmp) / "sample000.pt", weights_only=True)
+            self.assertEqual(saved["x"].sum().item(), 276)
+            self.assertEqual(sum(recorder.counts.values()), 3)
+            self.assertEqual(len(recorder.seen), 2)
 
     def test_rounding_order(self):
         torch.manual_seed(42)

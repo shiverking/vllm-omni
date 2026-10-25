@@ -115,6 +115,7 @@ class SnakeBeta(nn.Module):
             return fused_snake(
                 hidden_states, self._exp_alpha, self._inv_beta,
                 block=self._npu_block, programs=self._npu_programs,
+                layout=getattr(self, "_npu_layout", "channel"),
             )
         if hidden_states.is_cuda and not torch.is_grad_enabled() and self._init_triton():
             try:

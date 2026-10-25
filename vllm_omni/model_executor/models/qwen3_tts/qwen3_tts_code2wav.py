@@ -811,6 +811,7 @@ class Qwen3TTSCode2Wav(nn.Module):
             self.decoder, snake_execution,
             settings.get("code2wav_snake_block", 2048),
             settings.get("code2wav_snake_programs", 32),
+            settings.get("code2wav_snake_layout", "channel"),
         )
         logger.info("Code2Wav SnakeBeta: execution=%s modules=%d", snake_execution, snake_count)
         execution = settings.get("code2wav_execution", "baseline")

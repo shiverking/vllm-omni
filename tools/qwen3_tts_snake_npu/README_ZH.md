@@ -59,3 +59,57 @@ vllm-omni serve \
 不得在已捕获图上动态切换；调整后重启并重新捕获。
 所有测试独立，不要求上一测试通过。本地 CPU 只验证舍入顺序、分块覆盖和接口，
 不证明 NPU 编译、graph 捕获、精度或加速成功。
+
+
+## 第二版：跨通道与固定 auto 策略
+
+保留默认 channel 路径。`--layouts channel flat auto` 可分别测试：
+flat 将 BCT 展平，一个 tile 可跨多个通道，按元素获取对应 alpha/inv_beta，
+避免 T=37 每通道单独补齐。支持外层 stride；不是所有形状都保证更快。
+
+auto 是显式的实验策略，不是运行时自动调优：T<=128 选 flat/1024/40；
+128<T<=4096 选 channel/2048/40（已测 B=1,C=96,T=1920 使用32）；
+T>4096 选 channel/4096/40。未测中间形状为外推，报告保存实际选择。
+`auto` 忽略手动 blocks/programs，每个形状只测一次；手动布局保留完整扫描。
+
+短轴专项扫描（18组）：
+
+```bash
+python tools/qwen3_tts_snake_npu/benchmark.py \
+  --results /softwarePlatform/y00899301/qwen3_tts_snake_npu_run01/flat02 \
+  --device npu:0 --shapes 1,1024,37 4,1024,37 \
+  --layouts flat --blocks 256 512 1024 --programs 16 32 40 \
+  --warmup 10 --iterations 50 --executions graph
+```
+
+auto 六形状检查：
+
+```bash
+python tools/qwen3_tts_snake_npu/benchmark.py \
+  --results /softwarePlatform/y00899301/qwen3_tts_snake_npu_run01/auto02 \
+  --device npu:0 --batches 1 4 --layouts auto \
+  --warmup 10 --iterations 50 --executions graph
+```
+
+真实激活采集（复用 codes，growth_kv eager，原 SnakeBeta）：
+
+```bash
+python tools/qwen3_tts_snake_npu/capture.py \
+  --input /softwarePlatform/y00899301/qwen3_tts_kv_frame_code2wav_graph_run01/capture \
+  --results /softwarePlatform/y00899301/qwen3_tts_snake_npu_run01/activations02 \
+  --model /softwarePlatform/l00927835/Qwen3-TTS-12Hz-1.7B-CustomVoice \
+  --device npu:0 --request-limit 3 --batches 1 4 --max-samples 24 --max-mib 512
+
+python tools/qwen3_tts_snake_npu/benchmark.py \
+  --inputs /softwarePlatform/y00899301/qwen3_tts_snake_npu_run01/activations02 \
+  --results /softwarePlatform/y00899301/qwen3_tts_snake_npu_run01/real02 \
+  --device npu:0 --layouts auto --warmup 10 --iterations 50 --executions graph
+```
+
+每种形状仅保留一个真实样本；batch通过复制真实请求覆盖形状，不代表服务请求分布。
+最多24个样本/512MiB，coverage.json 记录观察、保存与遗漏形状；不是完整输入域精度证明。
+分片逐个加载以控制 NPU 内存。index.json 是本轮入口，重跑可覆盖受管理文件。
+
+服务 opt-in 使用 `qwen3_tts_kv_frame_code2wav_growth_kv_snake_auto.yaml`；
+原 snake.yaml 仍使用第一版固定配置，不修改原实验对照。先做微基准和真实激活实验，
+完整波形与服务性能需另测；命令之间没有通过门槛。

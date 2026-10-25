@@ -47,29 +47,59 @@ def kernel():
         tiles: tl.constexpr,
         tasks: tl.constexpr,
         block: tl.constexpr,
+        total: tl.constexpr,
+        flat: tl.constexpr,
     ):
         # A bounded number of programs traverse channel-local contiguous tiles.
         # Five intermediates stay on chip; explicit casts preserve eager rounding.
         for task in range(tl.program_id(0), tasks, tl.num_programs(0)):
-            channel = (task // tiles) % channels
-            row = task // tiles
-            t = (task % tiles) * block + tl.arange(0, block)
-            offset = row * length + t
+            if flat:
+                # Pack adjacent channels together: no per-channel tail padding.
+                offset = task * block + tl.arange(0, block)
+                row = offset // length
+                channel = row % channels
+                t = offset % length
+                mask = offset < total
+            else:
+                channel = (task // tiles) % channels
+                row = task // tiles
+                t = (task % tiles) * block + tl.arange(0, block)
+                offset = row * length + t
+                mask = t < length
             input_offset = (row // channels) * stride_b + channel * stride_c + t
-            x = tl.load(x_ptr + input_offset, t < length, other=0)
-            a = tl.load(alpha_ptr + channel).to(tl.float32)
-            ib = tl.load(inv_ptr + channel).to(tl.float32)
+            x = tl.load(x_ptr + input_offset, mask, other=0)
+            if flat:
+                a = tl.load(alpha_ptr + channel, mask, other=0).to(tl.float32)
+                ib = tl.load(inv_ptr + channel, mask, other=0).to(tl.float32)
+            else:
+                a = tl.load(alpha_ptr + channel).to(tl.float32)
+                ib = tl.load(inv_ptr + channel).to(tl.float32)
             z = (x.to(tl.float32) * a).to(x.dtype).to(tl.float32)
             s = tl.sin(z).to(x.dtype).to(tl.float32)
             sq = (s * s).to(x.dtype).to(tl.float32)
             term = (ib * sq).to(x.dtype).to(tl.float32)
             y = (x.to(tl.float32) + term).to(x.dtype)
-            tl.store(out_ptr + offset, y, t < length)
+            tl.store(out_ptr + offset, y, mask)
 
     return snake
 
 
-def fused_snake(x, alpha, inv_beta, *, out=None, block=2048, programs=32):
+def select_config(shape, layout="channel", block=2048, programs=32):
+    if layout not in ("channel", "flat", "auto"):
+        raise ValueError(f"Unknown SnakeBeta layout: {layout}")
+    if layout != "auto":
+        return layout, block, programs
+    b, c, t = shape
+    # Frozen experimental policy; intermediate shapes are extrapolations.
+    if t <= 128:
+        return "flat", 1024, 40
+    if t <= 4096:
+        return "channel", 2048, 32 if b == 1 and c == 96 and t == 1920 else 40
+    return "channel", 4096, 40
+
+
+def fused_snake(x, alpha, inv_beta, *, out=None, block=2048, programs=32, layout="channel"):
+    layout, block, programs = select_config(x.shape, layout, block, programs)
     if out is None:
         out = torch.empty(x.shape, dtype=x.dtype, device=x.device)
     validate(x, alpha, inv_beta, out, block, programs)
@@ -81,23 +111,38 @@ def fused_snake(x, alpha, inv_beta, *, out=None, block=2048, programs=32):
         raise ValueError("Experimental SnakeBeta is inference-only")
     b, c, t = x.shape
     tiles = (t + block - 1) // block
-    tasks = b * c * tiles
+    tasks = (x.numel() + block - 1) // block if layout == "flat" else b * c * tiles
     kernel()[(min(programs, tasks),)](
-        x, alpha, inv_beta, out, x.stride(0), x.stride(1), c, t, tiles, tasks, block, enable_fp_fusion=False
+        x,
+        alpha,
+        inv_beta,
+        out,
+        x.stride(0),
+        x.stride(1),
+        c,
+        t,
+        tiles,
+        tasks,
+        block,
+        x.numel(),
+        layout == "flat",
+        enable_fp_fusion=False,
     )
     return out
 
 
-def configure(model, execution="eager", block=2048, programs=32):
+def configure(model, execution="eager", block=2048, programs=32, layout="channel"):
     from .snake_activation import SnakeBeta
 
     if execution not in ("eager", "triton_ascend"):
         raise ValueError(f"Unknown SnakeBeta execution: {execution}")
+    select_config((1, 1, 1), layout, block, programs)
     count = 0
     for module in model.modules():
         if isinstance(module, SnakeBeta):
             module._npu_execution = execution
             module._npu_block = block
             module._npu_programs = programs
+            module._npu_layout = layout
             count += 1
     return count

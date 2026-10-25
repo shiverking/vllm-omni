@@ -7,6 +7,7 @@ import importlib.metadata
 import importlib.util
 import json
 import time
+from itertools import product
 from pathlib import Path
 
 import torch
@@ -61,9 +62,11 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--results", type=Path, required=True)
     parser.add_argument("--device", default="npu:0")
+    parser.add_argument("--layouts", nargs="+", choices=["channel", "flat", "auto"], default=["channel"])
     parser.add_argument("--blocks", nargs="+", type=int, default=[1024, 2048, 4096])
     parser.add_argument("--programs", nargs="+", type=int, default=[16, 32, 40])
     parser.add_argument("--batches", nargs="+", type=int, default=[1, 2, 4])
+    parser.add_argument("--shapes", nargs="+", help="Explicit B,C,T triples, e.g. 4,1024,37")
     parser.add_argument("--kernel-csv", type=Path)
     parser.add_argument("--inputs", type=Path, help="Trusted local .pt: list of {x, alpha, inv_beta} real activations")
     parser.add_argument("--warmup", type=int, default=10)
@@ -95,9 +98,18 @@ def main():
         if args.kernel_csv
         else [(b, c, t) for b in args.batches for c, t in ((96, 1920), (1024, 37), (96, 71040))]
     )
-    samples = torch.load(args.inputs, map_location="cpu", weights_only=True) if args.inputs else shapes
+    if args.shapes:
+        shapes = [tuple(int(v) for v in shape.split(",")) for shape in args.shapes]
+        if any(len(shape) != 3 or min(shape) < 1 for shape in shapes):
+            parser.error("shapes must be positive B,C,T triples")
+    if args.inputs and args.inputs.is_dir():
+        samples = [args.inputs / row["file"] for row in json.loads((args.inputs / "index.json").read_text())]
+    else:
+        samples = torch.load(args.inputs, map_location="cpu", weights_only=True) if args.inputs else shapes
     rows = []
     for index, sample in enumerate(samples):
+        if isinstance(sample, Path):
+            sample = torch.load(sample, map_location="cpu", weights_only=True)
         if args.inputs:
             x, alpha, inv_beta = (sample[k].to(args.device) for k in ("x", "alpha", "inv_beta"))
         else:
@@ -108,67 +120,73 @@ def main():
         ref = snake.reference(x, alpha, inv_beta)
         out = torch.empty(x.shape, device=x.device, dtype=x.dtype)
         original = x.clone()
-        for block in args.blocks:
-            for programs in args.programs:
-                for execution in args.executions:
-                    row = dict(
-                        shape=list(x.shape),
-                        block=block,
-                        programs=programs,
-                        execution=execution,
-                        input_source="real" if args.inputs else "synthetic",
+        configurations = [
+            (layout, block, programs, execution)
+            for layout in args.layouts
+            for block, programs in ([(2048, 32)] if layout == "auto" else product(args.blocks, args.programs))
+            for execution in args.executions
+        ]
+        for layout, block, programs, execution in configurations:
+            row = dict(
+                shape=list(x.shape),
+                layout=layout,
+                selected=snake.select_config(x.shape, layout, block, programs),
+                block=block,
+                programs=programs,
+                execution=execution,
+                input_source="real" if args.inputs else "synthetic",
+            )
+            try:
+                x.copy_(original)
+
+                def candidate():
+                    return snake.fused_snake(x, alpha, inv_beta, out=out, block=block, programs=programs, layout=layout)
+
+                def baseline():
+                    return snake.reference(x, alpha, inv_beta)
+
+                for _ in range(args.warmup):
+                    candidate()
+                    baseline()
+                torch.npu.synchronize()
+                graphs = []
+                if execution == "graph":
+                    for call in (baseline, candidate):
+                        graph = torch.npu.NPUGraph()
+                        with torch.npu.graph(graph):
+                            value = call()
+                        graphs.append((graph, value))
+                    baseline, candidate = graphs[0][0].replay, graphs[1][0].replay
+                candidate()
+                row["difference"] = difference(ref, out)
+                if execution == "graph":
+                    x.mul_(0.5)
+                    candidate()
+                    row["updated_input_difference"] = difference(snake.reference(x, alpha, inv_beta), out)
+                    x.copy_(original)
+                # ABBA, compilation/capture and correctness outside timing.
+                row["timings"] = [
+                    dict(side=side, **measure(call, args.iterations))
+                    for side, call in (
+                        ("baseline", baseline),
+                        ("candidate", candidate),
+                        ("candidate", candidate),
+                        ("baseline", baseline),
                     )
-                    try:
-                        x.copy_(original)
-
-                        def candidate():
-                            return snake.fused_snake(x, alpha, inv_beta, out=out, block=block, programs=programs)
-
-                        def baseline():
-                            return snake.reference(x, alpha, inv_beta)
-
-                        for _ in range(args.warmup):
-                            candidate()
-                            baseline()
-                        torch.npu.synchronize()
-                        graphs = []
-                        if execution == "graph":
-                            for call in (baseline, candidate):
-                                graph = torch.npu.NPUGraph()
-                                with torch.npu.graph(graph):
-                                    value = call()
-                                graphs.append((graph, value))
-                            baseline, candidate = graphs[0][0].replay, graphs[1][0].replay
-                        candidate()
-                        row["difference"] = difference(ref, out)
-                        if execution == "graph":
-                            x.mul_(0.5)
-                            candidate()
-                            row["updated_input_difference"] = difference(snake.reference(x, alpha, inv_beta), out)
-                            x.copy_(original)
-                        # ABBA, compilation/capture and correctness outside timing.
-                        row["timings"] = [
-                            dict(side=side, **measure(call, args.iterations))
-                            for side, call in (
-                                ("baseline", baseline),
-                                ("candidate", candidate),
-                                ("candidate", candidate),
-                                ("baseline", baseline),
-                            )
-                        ]
-                        totals = {
-                            side: sum(v["wall_ms"] for v in row["timings"] if v["side"] == side)
-                            for side in ("baseline", "candidate")
-                        }
-                        row["speedup"] = totals["baseline"] / totals["candidate"]
-                    except Exception as error:
-                        row["error"] = repr(error)
-                    finally:
-                        # Captured output pointers remain alive until both graphs are released.
-                        graphs = []
-                    rows.append(row)
-                    (args.results / "summary.json").write_text(json.dumps(rows, indent=2), encoding="utf-8")
-                    print(json.dumps({k: v for k, v in row.items() if k != "timings"}), flush=True)
+                ]
+                totals = {
+                    side: sum(v["wall_ms"] for v in row["timings"] if v["side"] == side)
+                    for side in ("baseline", "candidate")
+                }
+                row["speedup"] = totals["baseline"] / totals["candidate"]
+            except Exception as error:
+                row["error"] = repr(error)
+            finally:
+                # Captured output pointers remain alive until both graphs are released.
+                graphs = []
+            rows.append(row)
+            (args.results / "summary.json").write_text(json.dumps(rows, indent=2), encoding="utf-8")
+            print(json.dumps({k: v for k, v in row.items() if k != "timings"}), flush=True)
     lines = [
         "# Triton-Ascend SnakeBeta 微基准",
         "",
@@ -180,7 +198,7 @@ def main():
     ]
     for row in rows:
         lines.append(
-            f"|{row['shape']}|{row['block']}/{row['programs']}|{row['execution']}|"
+            f"|{row['shape']}|{row['selected']}|{row['execution']}|"
             f"{row.get('speedup', row.get('error'))}|{row.get('difference', {}).get('max_abs')}|"
         )
     (args.results / "report.md").write_text("\n".join(lines), encoding="utf-8")
