@@ -1,7 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 import importlib.util
+import sys
+import types
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import torch
 
@@ -13,6 +16,23 @@ spec.loader.exec_module(snake)
 
 
 class Tests(unittest.TestCase):
+    def test_jit_language_is_global(self):
+        # Emulate a compiler inspecting globals without inheriting closure cells.
+        language = types.ModuleType("triton.language")
+        language.constexpr = object()
+        triton = types.ModuleType("triton")
+        triton.language = language
+        triton.jit = lambda fn: fn
+        snake.kernel.cache_clear()
+        try:
+            with patch.dict(sys.modules, {"triton": triton, "triton.language": language}):
+                function = snake.kernel()
+                self.assertIs(function.__globals__["tl"], language)
+                self.assertNotIn("tl", function.__code__.co_freevars)
+        finally:
+            snake.kernel.cache_clear()
+            snake.__dict__.pop("tl", None)
+
     def test_rounding_order(self):
         torch.manual_seed(42)
         for dtype in (torch.float32, torch.bfloat16, torch.float16):

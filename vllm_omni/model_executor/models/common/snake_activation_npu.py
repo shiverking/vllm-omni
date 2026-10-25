@@ -28,6 +28,9 @@ def validate(x, alpha, inv_beta, out, block, programs):
 
 @lru_cache(maxsize=1)
 def kernel():
+    # Ascend JIT resolves source names from function globals, not closure cells.
+    # Keep loading lazy so default/CPU paths do not require Triton.
+    global tl
     import triton
     import triton.language as tl
 
