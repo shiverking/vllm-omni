@@ -802,6 +802,17 @@ class Qwen3TTSCode2Wav(nn.Module):
         self.decoder._incremental_chunk_ramp = list(codec_chunk_ramp or ())
 
         settings = extra_cfg if isinstance(extra_cfg, dict) else {}
+        from ..common.snake_activation_npu import configure as configure_snake
+
+        snake_execution = settings.get("code2wav_snake_execution", "eager")
+        if snake_execution != "eager" and device.type != "npu":
+            raise ValueError("Triton-Ascend SnakeBeta requires NPU")
+        snake_count = configure_snake(
+            self.decoder, snake_execution,
+            settings.get("code2wav_snake_block", 2048),
+            settings.get("code2wav_snake_programs", 32),
+        )
+        logger.info("Code2Wav SnakeBeta: execution=%s modules=%d", snake_execution, snake_count)
         execution = settings.get("code2wav_execution", "baseline")
         transformer_execution = settings.get("code2wav_transformer_execution", "current")
         if transformer_execution not in ("current", "growth_kv", "stream_kv"):

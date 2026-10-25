@@ -55,7 +55,7 @@ class SnakeBeta(nn.Module):
             t_len,
             block_t: tl.constexpr,
         ):
-            """Fused SnakeBeta using precomputed exp(α) and 1/(exp(β)+ε)."""
+            """Fused SnakeBeta using precomputed exp(Î±) and 1/(exp(Î²)+Îµ)."""
             bid = tl.program_id(0)
             cid = tl.program_id(1)
             t_off = tl.program_id(2) * block_t + tl.arange(0, block_t)
@@ -107,6 +107,15 @@ class SnakeBeta(nn.Module):
 
     def forward(self, hidden_states):
         """SnakeBeta := x + 1/b * sin^2(x*a)"""
+        if getattr(self, "_npu_execution", "eager") == "triton_ascend":
+            from .snake_activation_npu import fused_snake
+
+            if not self._cached:
+                self.precompute_exp_cache()
+            return fused_snake(
+                hidden_states, self._exp_alpha, self._inv_beta,
+                block=self._npu_block, programs=self._npu_programs,
+            )
         if hidden_states.is_cuda and not torch.is_grad_enabled() and self._init_triton():
             try:
                 return self._triton_forward(hidden_states)
@@ -147,11 +156,11 @@ class SnakeBeta(nn.Module):
 
 
 class Snake(SnakeBeta):
-    """Original Snake activation with a single parameter: x + 1/α * sin²(αx).
+    """Original Snake activation with a single parameter: x + 1/Î± * sinÂ²(Î±x).
 
     Unlike SnakeBeta which has separate alpha (frequency) and beta (magnitude)
     parameters, Snake uses alpha for both.  Only ``alpha`` appears in the
-    state_dict — ``beta`` is absent, keeping checkpoint compatibility with
+    state_dict â€” ``beta`` is absent, keeping checkpoint compatibility with
     CosyVoice3's HiFi-GAN.
 
     The Triton kernel and precomputed-cache path from SnakeBeta are reused;
@@ -160,7 +169,7 @@ class Snake(SnakeBeta):
     """
 
     def __init__(self, in_features, alpha=1.0, alpha_logscale=False):
-        # Initialise SnakeBeta — creates both alpha and beta Parameters.
+        # Initialise SnakeBeta â€” creates both alpha and beta Parameters.
         super().__init__(in_features, alpha=alpha, alpha_logscale=alpha_logscale)
         # Drop beta as a Parameter so it won't appear in state_dict.
         del self.beta
