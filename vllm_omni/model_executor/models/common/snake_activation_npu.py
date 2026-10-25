@@ -85,8 +85,25 @@ def kernel():
 
 
 def select_config(shape, layout="channel", block=2048, programs=32):
-    if layout not in ("channel", "flat", "auto"):
+    if layout not in ("channel", "flat", "auto", "conservative"):
         raise ValueError(f"Unknown SnakeBeta layout: {layout}")
+    if layout == "conservative":
+        # Frozen real-activation measurements, 2026-10-25. No extrapolation
+        # across batch, channels or time: unknown shapes retain eager math.
+        b, c, t = shape
+        measured = {
+            1: {
+                96: (1920, 49920, 63360, 71040),
+                192: (640, 16640, 21120, 22400, 23680),
+                384: (160, 4160, 5280, 5600, 5920),
+                768: (832, 1056, 1120, 1184),
+            },
+            4: {96: (1920, 49920, 63360, 71040), 192: (640, 16640, 21120, 22400, 23680), 384: (4160, 5280, 5600, 5920)},
+        }
+        if t not in measured.get(b, {}).get(c, ()):
+            return "eager", 0, 0
+        block = 2048 if t <= 1920 or (b == 4 and c == 384) else 4096
+        return "channel", block, 32 if (b, c, t) == (1, 96, 1920) else 40
     if layout != "auto":
         return layout, block, programs
     b, c, t = shape
@@ -100,6 +117,10 @@ def select_config(shape, layout="channel", block=2048, programs=32):
 
 def fused_snake(x, alpha, inv_beta, *, out=None, block=2048, programs=32, layout="channel"):
     layout, block, programs = select_config(x.shape, layout, block, programs)
+    if layout == "eager":
+        # This is an intentional policy route, never a kernel-error fallback.
+        value = reference(x, alpha, inv_beta)
+        return value if out is None else out.copy_(value)
     if out is None:
         out = torch.empty(x.shape, dtype=x.dtype, device=x.device)
     validate(x, alpha, inv_beta, out, block, programs)

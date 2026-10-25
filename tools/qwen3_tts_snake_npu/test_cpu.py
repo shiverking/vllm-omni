@@ -17,6 +17,52 @@ spec.loader.exec_module(snake)
 
 
 class Tests(unittest.TestCase):
+    def test_complete_cohort_output_lifetime_and_release(self):
+        source = Path(__file__).with_name("model_experiment.py")
+        spec = importlib.util.spec_from_file_location("snake_model_test", source)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        output = torch.zeros(3)
+
+        def run(model, wrapper, codes, caches):
+            output.add_(1)
+            return [output for _ in codes]
+
+        cohort = [{"chunks": [torch.zeros(1), torch.zeros(1)]}, {"chunks": [torch.zeros(1)]}]
+        with patch.object(module.exp, "run", side_effect=run), patch.object(module.exp, "release") as release:
+            audio, calls = module.execute(None, None, cohort, retain=True)
+        self.assertEqual(calls, 2)
+        self.assertEqual([len(x) for x in audio], [2, 1])
+        self.assertTrue(torch.equal(audio[0][0], torch.ones(3)))
+        self.assertTrue(torch.equal(audio[0][1], torch.full((3,), 2.0)))
+        release.assert_called_once()
+        with (
+            patch.object(module.exp, "run", side_effect=RuntimeError("failure")),
+            patch.object(module.exp, "release") as release,
+        ):
+            with self.assertRaises(RuntimeError):
+                module.execute(None, None, cohort)
+            release.assert_called_once()
+
+    def test_conservative_policy(self):
+        for shape, expected in [
+            ((4, 96, 71040), ("channel", 4096, 40)),
+            ((4, 384, 4160), ("channel", 2048, 40)),
+            ((1, 384, 4160), ("channel", 4096, 40)),
+            ((1, 96, 1920), ("channel", 2048, 32)),
+            ((4, 768, 1184), ("eager", 0, 0)),
+            ((4, 1536, 104), ("eager", 0, 0)),
+            ((4, 384, 160), ("eager", 0, 0)),
+            ((2, 96, 1920), ("eager", 0, 0)),
+            ((4, 96, 67200), ("eager", 0, 0)),
+        ]:
+            self.assertEqual(snake.select_config(shape, "conservative"), expected)
+        x = torch.randn(2, 3, 7)
+        a, ib = torch.rand(3), torch.rand(3)
+        with patch.object(snake, "kernel", side_effect=AssertionError("must not compile")):
+            actual = snake.fused_snake(x, a, ib, layout="conservative")
+        torch.testing.assert_close(actual, snake.reference(x, a, ib), atol=0, rtol=0)
+
     def test_jit_language_is_global(self):
         # Emulate a compiler inspecting globals without inheriting closure cells.
         language = types.ModuleType("triton.language")
@@ -68,7 +114,7 @@ class Tests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             recorder = capture.Recorder(Path(tmp), 1, 1024)
             module = types.SimpleNamespace(_cached=True, _exp_alpha=torch.ones(3), _inv_beta=torch.ones(3))
-            x = torch.arange(24.).reshape(1, 3, 8)
+            x = torch.arange(24.0).reshape(1, 3, 8)
             hook = recorder.hook("snake")
             hook(module, (x,))
             x.zero_()

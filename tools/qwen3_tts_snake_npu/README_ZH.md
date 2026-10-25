@@ -113,3 +113,42 @@ python tools/qwen3_tts_snake_npu/benchmark.py \
 服务 opt-in 使用 `qwen3_tts_kv_frame_code2wav_growth_kv_snake_auto.yaml`；
 原 snake.yaml 仍使用第一版固定配置，不修改原实验对照。先做微基准和真实激活实验，
 完整波形与服务性能需另测；命令之间没有通过门槛。
+
+## 第三版：实测白名单与整段接入
+
+`conservative` 只启用已测且更快的真实形状；旧 `auto` 保留作为对照。
+batch1：C96/C192/C384 已测正收益形状，以及 C768 的832/1056/1120/1184。
+batch4：C96/C192 已测正收益形状、C384 的4160/5280/5600/5920。
+其余形状走原 eager 算子链，包括全部 batch2、C1536 和未采集形状。
+这里的 eager 路由仍可以被外层 NPU graph 捕获，不等于退出图执行。
+4096/2048 和32/40 programs按真实测量冻结，不在测试集上动态调参。
+
+新增 `model_experiment.py`：固定 growth_kv graph，两组仅切换 SnakeBeta。
+`check` 比较逐块及拼接波形，导出成对 WAV，差异记录后继续；`bench` 独立运行，
+不读取检查结果。计时单位为完整请求组，覆盖增长、滚动和短块，含输入暂存、
+输出交接及请求缓存释放。采集 codes 提前搬到设备，JIT/捕获与预热不计时。
+尾组不复制请求；summary.json记录请求组实际大小。设备事件不是纯 kernel 时间。
+两组共享冻结权重、各有独立图/缓存；每次运行前同步切换短块 eager 的 Snake 策略。
+
+```bash
+cd /softwarePlatform/y00899301/vllm_debug_omni/vllm-omni-tts
+python tools/qwen3_tts_snake_npu/model_experiment.py check \
+  --input /softwarePlatform/y00899301/qwen3_tts_kv_frame_code2wav_graph_run01/capture \
+  --results /softwarePlatform/y00899301/qwen3_tts_snake_npu_run01/model_check03 \
+  --model /softwarePlatform/l00927835/Qwen3-TTS-12Hz-1.7B-CustomVoice \
+  --device npu:0 --batches 1 4
+
+python tools/qwen3_tts_snake_npu/model_experiment.py bench \
+  --input /softwarePlatform/y00899301/qwen3_tts_kv_frame_code2wav_graph_run01/capture \
+  --results /softwarePlatform/y00899301/qwen3_tts_snake_npu_run01/model_bench03 \
+  --model /softwarePlatform/l00927835/Qwen3-TTS-12Hz-1.7B-CustomVoice \
+  --device npu:0 --batches 1 4 --warmup 2 --repeats 1
+```
+
+两命令均可追加 `--probe-only` 仅用前三条请求；batch4尾组为3个真实请求，
+底层按自己的阶段分桶，不保证每个调用都是4行。默认复用全部完整请求。
+`--warmup 2` 是每个batch档两组各预热两个完整请求组；每组ABBA四次。
+输出 report.md、summary.json、graphs.json 和 manifest.json。性能结果不代表音质或数值检查通过。
+
+服务接入使用 `vllm_omni/deploy/qwen3_tts_kv_frame_code2wav_growth_kv_snake_conservative.yaml`，
+保持原增长KV和Code Predictor配置，仅改变SnakeBeta路由。先测同codes整体收益再进行服务对照。
