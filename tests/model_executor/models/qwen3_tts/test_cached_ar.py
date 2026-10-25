@@ -35,6 +35,29 @@ def inputs(batch):
     )
 
 
+@pytest.mark.parametrize("sampling", [False, True])
+@pytest.mark.parametrize("batch", [1, 3, 16])
+@torch.inference_mode()
+def test_keep10_prefix_and_real_calls(models, sampling, batch):
+    wrapper, full = models
+    values = inputs(batch)
+    expected = full(**values, do_sample=sampling)
+    wrapper.keep_codebooks = 10
+    reduced = type(full)(wrapper, "eager")
+    calls = []
+    handle = wrapper.model.register_forward_hook(lambda *unused: calls.append(1))
+    values["sample_uniforms"] = values["sample_uniforms"][:, :9]
+    actual = reduced(**values, do_sample=sampling)
+    handle.remove()
+    assert len(calls) == 9
+    assert actual.shape == expected.shape
+    assert torch.equal(actual[:, :10], expected[:, :10])
+    assert torch.count_nonzero(actual[:, 10:]) == 0
+    saved = actual.clone()
+    reduced(**values, do_sample=sampling)
+    assert torch.equal(saved, actual)
+
+
 @pytest.mark.parametrize("batch", [1, 2, 3, 4, 5, 8, 9, 15, 16])
 @pytest.mark.parametrize("sampling", [False, True])
 @torch.inference_mode()
