@@ -44,6 +44,30 @@ class Tests(unittest.TestCase):
                 module.execute(None, None, cohort)
             release.assert_called_once()
 
+    def test_service_only_changes_snake_execution(self):
+        import copy
+
+        import yaml
+
+        directory = Path(__file__).parent
+        with patch.object(sys, "path", [str(directory)] + sys.path):
+            spec = importlib.util.spec_from_file_location("snake_service_test", directory / "service_bench.py")
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+        source = directory.parents[1] / "vllm_omni/deploy/qwen3_tts_kv_frame_code2wav_npu_graph.yaml"
+        config = yaml.safe_load(source.read_text(encoding="utf-8"))
+        a = module.configure_deployment(copy.deepcopy(config), "baseline")
+        b = module.configure_deployment(copy.deepcopy(config), "snake_conservative")
+        extra = b["connectors"]["connector_of_shared_memory"]["extra"]
+        self.assertEqual(extra["code2wav_transformer_execution"], "growth_kv")
+        self.assertEqual(extra["code2wav_incremental_execution"], "graph")
+        self.assertEqual(extra["code2wav_snake_execution"], "triton_ascend")
+        extra["code2wav_snake_execution"] = "eager"
+        self.assertEqual(a, b)
+        self.assertEqual(a["stages"], config["stages"])
+        with self.assertRaises(ValueError):
+            module.configure_deployment(config, "unknown")
+
     def test_conservative_policy(self):
         for shape, expected in [
             ((4, 96, 71040), ("channel", 4096, 40)),

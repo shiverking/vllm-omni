@@ -152,3 +152,27 @@ python tools/qwen3_tts_snake_npu/model_experiment.py bench \
 
 服务接入使用 `vllm_omni/deploy/qwen3_tts_kv_frame_code2wav_growth_kv_snake_conservative.yaml`，
 保持原增长KV和Code Predictor配置，仅改变SnakeBeta路由。先测同codes整体收益再进行服务对照。
+
+## SnakeBeta 服务端到端对照
+
+入口 `service_bench.py` 自动管理两次服务启动与关闭：baseline → snake_conservative。
+两组固定 growth_kv graph、kv_frame、Code2Wav batch上限4，只有SnakeBeta执行选择不同。
+并发1/4/16，每档预热3请求、正式120请求、1轮；健康检查20秒，客户端绕过代理。
+不用先手动启动服务；端口8091应空闲。不读取capture或正确性证书。
+
+```bash
+python tools/qwen3_tts_snake_npu/service_bench.py \
+  --results /softwarePlatform/y00899301/qwen3_tts_snake_npu_run01/service03 \
+  --model /softwarePlatform/l00927835/Qwen3-TTS-12Hz-1.7B-CustomVoice \
+  --device npu:0 \
+  --concurrencies 1 4 16 \
+  --requests 120 \
+  --vllm-repo /vllm-workspace/vllm \
+  --ascend-repo /vllm-workspace/vllm-ascend \
+  --port 8091
+```
+
+结果为service03/report.md、summary.json、status.json。
+服务日志为baseline/server.log和snake_conservative/server.log；客户端日志为各组c1/c4/c16/round0/client.log。
+重复执行覆盖本工具管理的结果文件，不递归删除目录。服务指标不构成数值正确性证明；
+同时比较音频总时长，不能将生成长度变化全部归因算子收益。
