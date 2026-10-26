@@ -473,6 +473,9 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
                 prefix="code_predictor",
             )
 
+        if self.code_predictor.ar_execution != "stock":
+            self.talker_mtp_graph_safe = False
+
         # Constant logit mask: allow only codec ids [1, codebook_vocab_size) plus codec EOS.
         # Register the *disallowed* form so compute_logits doesn't recompute ~mask per step.
         vocab = int(self.talker_config.vocab_size)
@@ -1554,11 +1557,13 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         audio_codes = torch.where(invalid0.expand_as(audio_codes), torch.zeros_like(audio_codes), audio_codes)
 
         # Single gather over stacked [Q-1, V, H] replaces Q-1 serial embedding kernels.
-        residual_ids_t = audio_codes[:, 1:]
+        # Excluded books are transport placeholders, not token-zero embeddings.
+        keep = self.code_predictor.keep_codebooks
+        residual_ids_t = audio_codes[:, 1:keep]
         if self._stacked_codec_embed is None:
             self._build_stacked_codec_embed()
         embed_weight = self._stacked_codec_embed.to(device=dev)
-        row_idx = torch.arange(max_steps, device=dev).unsqueeze(0).expand(bsz, -1)
+        row_idx = torch.arange(keep - 1, device=dev).unsqueeze(0).expand(bsz, -1)
         gathered = embed_weight[row_idx, residual_ids_t]
         summed = (last_id_hidden.squeeze(1) + gathered.sum(dim=1)).unsqueeze(1)
         inputs_embeds_out = (summed + text_step).reshape(bsz, -1)

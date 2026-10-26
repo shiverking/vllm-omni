@@ -742,6 +742,34 @@ class Qwen3TTSCode2Wav(nn.Module):
         self.decoder._incremental_chunk_frames = codec_chunk_frames or 25
         self.decoder._incremental_chunk_ramp = list(codec_chunk_ramp or ())
 
+        settings = extra_cfg if isinstance(extra_cfg, dict) else {}
+        keep = int(settings.get("code_predictor_keep_codebooks", self._num_quantizers))
+        if keep not in (10, self._num_quantizers):
+            raise ValueError("Code2Wav supports keep10 or all codebooks")
+        if keep != self._num_quantizers:
+            if settings.get("code_predictor_ar_execution") != "kv_frame":
+                raise ValueError("Reduced codebooks require kv_frame")
+            self.decoder.quantizer.active_codebooks = keep
+            logger.info("Code2Wav: keeping %d/%d contributions", keep, self._num_quantizers)
+        execution = settings.get("code2wav_execution", "baseline")
+        if execution not in ("baseline", "npu_graph"):
+            raise ValueError(f"Unsupported code2wav_execution: {execution}")
+        if execution == "npu_graph":
+            if device.type != "npu" or not self._async_chunk:
+                raise ValueError("Code2Wav NPU graphs require NPU and async_chunk")
+            if not getattr(model_cfg, "enforce_eager", False):
+                raise ValueError("Set Stage 1 enforce_eager=true: Code2Wav owns the inner NPU graphs")
+            from .npu_segmented_graph_wrapper import NPUGraphDecoderWrapper
+
+            wrapper = NPUGraphDecoderWrapper(
+                self.decoder,
+                settings.get("code2wav_graph_batch_sizes", [1, *range(2, 33, 2)]),
+            )
+            if self._decode_batch_max_size != max(wrapper.capture_batch_sizes):
+                raise ValueError("decode_batch_max_size must match the largest Code2Wav graph bucket")
+            wrapper.warmup(device)
+            self.decoder._npugraph_wrapper = wrapper
+
         if hasattr(self.decoder, "enable_cudagraph") and device.type == "cuda":
             try:
                 self._maybe_enable_decoder_cudagraph(

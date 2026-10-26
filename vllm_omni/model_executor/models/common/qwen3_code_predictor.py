@@ -158,8 +158,8 @@ class CodePredictorAttention(nn.Module):
     """Multi-head self-attention for code predictor.
 
     Uses ``F.scaled_dot_product_attention`` with HF-compatible RoPE and RMSNorm.
-    No KV cache -- the code predictor always re-prefills the full (short)
-    sequence each AR step.
+    Stock re-prefills the full short sequence. Opt-in cached AR
+    processes only new positions and uses native FIA GQA on NPU.
 
     Input : [B, seq_len, hidden_size]
     Output: [B, seq_len, hidden_size]
@@ -275,10 +275,53 @@ class CodePredictorAttention(nn.Module):
             sync=True,
         )[0]
 
+    def _cached_attention(self, q, k, v, cache, position):
+        keys, values = cache
+        end = position + k.shape[2]
+        if position < 0 or end > keys.shape[2]:
+            raise ValueError("Code predictor KV position out of range")
+        keys[:, :, position:end].copy_(k)
+        values[:, :, position:end].copy_(v)
+        causal = position == 0 and q.shape[2] > 1
+        if not current_omni_platform.is_npu():
+            return F.scaled_dot_product_attention(
+                q,
+                keys[:, :, :end],
+                values[:, :, :end],
+                scale=self.scaling,
+                is_causal=causal,
+                enable_gqa=self.is_gqa,
+            )
+        # Native GQA reads the static KV-head cache directly. Do not materialize
+        # the prefix or repeat KV heads: effective lengths exclude stale slots.
+        if q.dtype != torch.bfloat16:
+            raise ValueError("Cached NPU AR requires BF16 FIA attention")
+        if not keys.is_contiguous() or not values.is_contiguous():
+            raise ValueError("Cached NPU AR requires contiguous full KV caches")
+        if not hasattr(torch_npu, "npu_fused_infer_attention_score"):
+            raise RuntimeError("Cached NPU AR requires npu_fused_infer_attention_score; no fallback")
+        return torch_npu.npu_fused_infer_attention_score(
+            query=q.contiguous(),
+            key=keys,
+            value=values,
+            num_heads=self.num_heads,
+            num_key_value_heads=self.num_kv_heads,
+            input_layout="BNSD",
+            atten_mask=self._fusion_causal_mask.contiguous() if causal else None,
+            actual_seq_lengths=[q.shape[2]] * q.shape[0],
+            actual_seq_lengths_kv=[end] * q.shape[0],
+            scale=float(self.scaling),
+            pre_tokens=2147483647,
+            next_tokens=2147483647,
+            sparse_mode=2 if causal else 0,
+        )[0]
+
     def forward(
         self,
         hidden_states: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        kv_cache: tuple[torch.Tensor, torch.Tensor] | None = None,
+        cache_position: int = 0,
     ) -> torch.Tensor:
         bsz, seq_len, _ = hidden_states.shape
         hidden_shape_q = (bsz, seq_len, self.num_heads, self.head_dim)
@@ -300,17 +343,25 @@ class CodePredictorAttention(nn.Module):
         if current_omni_platform.is_npu():
             q = torch_npu.npu_rotary_mul(q, cos, sin)
             k = torch_npu.npu_rotary_mul(k, cos, sin)
-            attn_out = self._forward_npu_attention(q, k, v, bsz, seq_len)
+            attn_out = (
+                self._cached_attention(q, k, v, kv_cache, cache_position)
+                if kv_cache is not None
+                else self._forward_npu_attention(q, k, v, bsz, seq_len)
+            )
         else:
             q = (q * cos) + (_rotate_half(q) * sin)
             k = (k * cos) + (_rotate_half(k) * sin)
-            attn_out = F.scaled_dot_product_attention(
-                q,
-                k,
-                v,
-                scale=self.scaling,
-                is_causal=True,
-                enable_gqa=self.is_gqa,
+            attn_out = (
+                self._cached_attention(q, k, v, kv_cache, cache_position)
+                if kv_cache is not None
+                else F.scaled_dot_product_attention(
+                    q,
+                    k,
+                    v,
+                    scale=self.scaling,
+                    is_causal=True,
+                    enable_gqa=self.is_gqa,
+                )
             )
 
         attn_out = attn_out.transpose(1, 2).reshape(bsz, seq_len, -1)
@@ -364,10 +415,12 @@ class CodePredictorDecoderLayer(nn.Module):
         self,
         hidden_states: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        kv_cache: tuple[torch.Tensor, torch.Tensor] | None = None,
+        cache_position: int = 0,
     ) -> torch.Tensor:
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
-        hidden_states = self.self_attn(hidden_states, position_embeddings)
+        hidden_states = self.self_attn(hidden_states, position_embeddings, kv_cache, cache_position)
         if current_omni_platform.is_npu():
             hidden_states, _, residual = torch_npu.npu_add_rms_norm(
                 hidden_states,
@@ -432,6 +485,8 @@ class CodePredictorBaseModel(nn.Module):
         self,
         inputs_embeds: torch.Tensor,
         position_ids: torch.Tensor,
+        kv_cache: tuple[torch.Tensor, torch.Tensor] | None = None,
+        cache_position: int = 0,
     ) -> torch.Tensor:
         # Run the transformer body in float32 when the model is in fp16.
         # fp16 lacks the dynamic range for stable attention scores and
@@ -449,8 +504,9 @@ class CodePredictorBaseModel(nn.Module):
         hidden_states = inputs_embeds
         with torch.amp.autocast(inputs_embeds.device.type, enabled=use_fp32, dtype=torch.float32):
             position_embeddings = self.rotary_emb(hidden_states, position_ids)
-            for layer in self.layers:
-                hidden_states = layer(hidden_states, position_embeddings)
+            for index, layer in enumerate(self.layers):
+                layer_cache = None if kv_cache is None else (kv_cache[0][index], kv_cache[1][index])
+                hidden_states = layer(hidden_states, position_embeddings, layer_cache, cache_position)
             hidden_states = self.norm(hidden_states)
         return hidden_states.to(input_dtype)
 
@@ -698,6 +754,26 @@ class CodePredictorWrapper(nn.Module):
                 "code_predictor: prefix re-prefill requested but disabled because is_npu=%s",
                 is_npu,
             )
+        self.ar_execution = prefix_graph_cfg.get("code_predictor_ar_execution", "stock")
+        self.keep_codebooks = int(prefix_graph_cfg.get("code_predictor_keep_codebooks", self._num_groups))
+        if self.keep_codebooks not in (10, self._num_groups):
+            raise ValueError("Code Predictor supports keep10 or all codebooks")
+        if self.keep_codebooks != self._num_groups and self.ar_execution != "kv_frame":
+            raise ValueError("Reduced codebooks require kv_frame")
+        if self.ar_execution not in ("stock", "kv_frame"):
+            raise ValueError(f"Unknown code_predictor_ar_execution: {self.ar_execution}")
+        if self.ar_execution != "stock" and (
+            not current_omni_platform.is_npu() or wrapper_config.sampling_mode != "per_call"
+        ):
+            raise ValueError("Cached AR requires NPU Qwen3-TTS per-call sampling")
+        self._ar_executor = None
+        graph_buckets = prefix_graph_cfg.get("code_predictor_graph_batch_sizes")
+        if graph_buckets is not None:
+            sizes = sorted({int(size) for size in graph_buckets})
+            maximum = int(vllm_config.scheduler_config.max_num_seqs)
+            if not sizes or sizes[0] != 1 or sizes[-1] != maximum:
+                raise ValueError("Code Predictor graph buckets must start at 1 and end at max_num_seqs")
+            self._execution_batch_buckets = sizes
         self._prefix_graph_buckets = self._parse_positive_int_set(
             prefix_graph_cfg.get("code_predictor_prefix_graph_buckets")
         )
@@ -1092,6 +1168,25 @@ class CodePredictorWrapper(nn.Module):
         sample_uniforms: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """Predict residual codebooks 1..G-1 autoregressively via re-prefill."""
+        if getattr(self, "ar_execution", "stock") != "stock":
+            if self._ar_executor is None:
+                from .qwen3_code_predictor_ar import CachedARExecutor
+
+                self._prepare_npu_weights()
+                self._ar_executor = CachedARExecutor(self, buckets=self._batch_bucket_sizes())
+                self._ar_executor.prepare_all()
+            return self._ar_executor(
+                layer0_code,
+                layer0_embed,
+                last_talker_hidden,
+                do_sample=do_sample,
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+                generator=generator,
+                generators=generators,
+                sample_uniforms=sample_uniforms,
+            )
         bsz = int(layer0_code.shape[0])
         num_groups = self._num_groups
         if generators is not None and len(generators) != bsz:

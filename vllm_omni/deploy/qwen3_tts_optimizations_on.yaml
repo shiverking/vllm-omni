@@ -1,0 +1,85 @@
+async_chunk: true
+connectors:
+  connector_of_shared_memory:
+    extra:
+      code_predictor_ar_execution: kv_frame
+      codec_chunk_frames: 25
+      codec_left_context_frames: 72
+      codec_streaming: true
+      connector_get_max_wait: 300
+      connector_get_max_wait_first_chunk: 3000
+      connector_get_sleep_s: 0.01
+      decode_batch_max_size: 32
+      initial_codec_chunk_frames: 1
+      code2wav_execution: npu_graph
+      code2wav_graph_batch_sizes: [1, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30, 32]
+      code_predictor_keep_codebooks: 16
+      code_predictor_graph_batch_sizes: [1, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30, 32]
+    name: SharedMemoryConnector
+model_runner: v2
+platforms:
+  musa:
+    model_runner: v1
+  npu:
+    model_runner: v1
+    stages:
+    - compilation_config:
+        cudagraph_capture_sizes: [1, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30, 32]
+        cudagraph_mode: PIECEWISE
+      enforce_eager: false
+      stage_id: 0
+    - stage_id: 1
+      enforce_eager: true
+      compilation_config:
+        cudagraph_mode: NONE
+  rocm:
+    model_runner: v1
+    stages:
+    - enforce_eager: true
+      stage_id: 1
+  xpu:
+    model_runner: v1
+stages:
+- async_scheduling: true
+  default_sampling_params:
+    max_tokens: 4096
+    min_tokens: 2
+    repetition_penalty: 1.05
+    temperature: 0.9
+    top_k: 50
+  devices: '0'
+  enable_prefix_caching: false
+  gpu_memory_utilization: 0.3
+  max_model_len: 4096
+  max_num_batched_tokens: 512
+  max_num_seqs: 32
+  output_connectors:
+    to_stage_1: connector_of_shared_memory
+  silence_ban_frames: 0
+  stage_id: 0
+  subtalker_sampling_params:
+    do_sample: true
+    temperature: 0.9
+    top_k: 50
+    top_p: 1.0
+  trust_remote_code: true
+  dtype: bfloat16
+- async_scheduling: true
+  default_sampling_params:
+    max_tokens: 65536
+    repetition_penalty: 1.0
+    temperature: 0.0
+    top_k: -1
+    top_p: 1.0
+  devices: '0'
+  dtype: bfloat16
+  enable_prefix_caching: false
+  enforce_eager: true
+  gpu_memory_utilization: 0.3
+  input_connectors:
+    from_stage_0: connector_of_shared_memory
+  max_model_len: 65536
+  max_num_batched_tokens: 65536
+  max_num_seqs: 32
+  stage_id: 1
+  trust_remote_code: true
