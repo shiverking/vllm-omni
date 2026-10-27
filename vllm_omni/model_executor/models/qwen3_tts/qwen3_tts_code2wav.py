@@ -767,7 +767,9 @@ class Qwen3TTSCode2Wav(nn.Module):
             )
             if self._decode_batch_max_size != max(wrapper.capture_batch_sizes):
                 raise ValueError("decode_batch_max_size must match the largest Code2Wav graph bucket")
-            wrapper.warmup(device)
+            # NPU load_weights postprocessing may replace parameter storage
+            # (format conversion, and the 310P dtype override). Capture only
+            # after that hook finishes, so graphs use the final weight addresses.
             self.decoder._npugraph_wrapper = wrapper
 
         if hasattr(self.decoder, "enable_cudagraph") and device.type == "cuda":

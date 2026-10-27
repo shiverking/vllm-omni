@@ -78,6 +78,11 @@ def _patched_load_weights(self, weights):
     _prepare_npu_decoder_weights(self.decoder)
     actual_dtype = next(self.decoder.parameters()).dtype
     logger.info("Prepared NPU Code2Wav decoder with runtime dtype %s", actual_dtype)
+    graph_wrapper = getattr(self.decoder, "_npugraph_wrapper", None)
+    if graph_wrapper is not None:
+        # Graphs retain device addresses: finalize dtype and packed weights
+        # before capturing, including on 310P where the runtime dtype changes.
+        graph_wrapper.warmup(device)
     return loaded
 
 
