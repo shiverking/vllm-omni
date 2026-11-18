@@ -1,0 +1,5 @@
+base_config: qwen3_tts_ascend_mrv2_two_stage.yaml
+model_runner: v1
+platforms:
+  npu:
+    model_runner: v1
