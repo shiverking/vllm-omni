@@ -1,0 +1,20 @@
+base_config: qwen3_tts_fused_ascend.yaml
+stages:
+  - stage_id: 0
+    max_num_seqs: 4
+    compilation_config:
+      cudagraph_mode: PIECEWISE
+      cudagraph_capture_sizes: [1, 2, 4]
+    additional_config:
+      talker_stream_decode: true
+      talker_stream_first_audio: false
+      initial_codec_chunk_frames: 4
+      codec_chunk_frames: 8
+      codec_left_context_frames: 72
+      ref_code_context_frames: 72
+      code_predictor_ar_execution: kv_frame
+      code_predictor_fia_gqa: true
+      code_predictor_graph_batch_sizes: [1, 2, 4]
+      code2wav_execution: npu_graph
+      code2wav_graph_batch_sizes: [1, 2, 4]
+      decode_batch_max_size: 4
