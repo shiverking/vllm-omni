@@ -78,6 +78,9 @@ def _patched_load_weights(self, weights):
     _prepare_npu_decoder_weights(self.decoder)
     actual_dtype = next(self.decoder.parameters()).dtype
     logger.info("Prepared NPU Code2Wav decoder with runtime dtype %s", actual_dtype)
+    wrapper = getattr(self.decoder, "_npugraph_wrapper", None)
+    if wrapper is not None:
+        wrapper.warmup(device)
     return loaded
 
 
