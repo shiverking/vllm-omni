@@ -232,22 +232,24 @@ class CodePredictorAttention(nn.Module):
         v: torch.Tensor,
         bsz: int,
         seq_len: int,
+        *,
+        causal: bool = True,
     ) -> torch.Tensor:
         q_f, k_f, v_f = q, k, v
+        kv_len = k.shape[2] if not causal else seq_len
         if self.is_gqa:
             k_f = (
                 k[:, :, None, :, :]
-                .expand(bsz, self.num_kv_heads, self.num_queries_per_kv, seq_len, self.head_dim)
-                .reshape(bsz, self.num_heads, seq_len, self.head_dim)
+                .expand(bsz, self.num_kv_heads, self.num_queries_per_kv, kv_len, self.head_dim)
+                .reshape(bsz, self.num_heads, kv_len, self.head_dim)
             )
             v_f = (
                 v[:, :, None, :, :]
-                .expand(bsz, self.num_kv_heads, self.num_queries_per_kv, seq_len, self.head_dim)
-                .reshape(bsz, self.num_heads, seq_len, self.head_dim)
+                .expand(bsz, self.num_kv_heads, self.num_queries_per_kv, kv_len, self.head_dim)
+                .reshape(bsz, self.num_heads, kv_len, self.head_dim)
             )
 
-        mask = self._fusion_causal_mask
-        mask = mask.contiguous()
+        mask = self._fusion_causal_mask.contiguous() if causal else None
         q_f = q_f.contiguous()
         k_f = k_f.contiguous()
         v_f = v_f.contiguous()
@@ -270,7 +272,7 @@ class CodePredictorAttention(nn.Module):
             actual_seq_qlen=None,
             actual_seq_kvlen=None,
             # Ascend SDPA is_causal migration example uses sparse_mode=2.
-            sparse_mode=2,
+            sparse_mode=2 if causal else 0,
             gen_mask_parallel=True,
             # Keep sync=True for the NPU fused attention path.
             sync=True,
@@ -324,7 +326,10 @@ class CodePredictorAttention(nn.Module):
         k_cache: torch.Tensor,
         v_cache: torch.Tensor,
         write_positions: torch.Tensor,
-        key_mask: torch.Tensor,
+        key_mask: torch.Tensor | None,
+        *,
+        npu_cache_end: int | None = None,
+        npu_fia_gqa: bool = True,
     ) -> torch.Tensor:
         """Attend only the new positions, reusing earlier positions' keys and values.
 
@@ -344,6 +349,25 @@ class CodePredictorAttention(nn.Module):
         cos, sin = position_embeddings
         cos = cos.unsqueeze(1)
         sin = sin.unsqueeze(1)
+        if npu_cache_end is not None:
+            start = npu_cache_end - seq_len
+            q = torch_npu.npu_rotary_mul(q, cos, sin)
+            k = torch_npu.npu_rotary_mul(k, cos, sin)
+            k_cache[:, :, start:npu_cache_end].copy_(k)
+            v_cache[:, :, start:npu_cache_end].copy_(v)
+            causal = start == 0 and seq_len > 1
+            if npu_fia_gqa:
+                attn_out = self._forward_cached_npu_fia(q, k_cache, v_cache, npu_cache_end, causal)
+            else:
+                attn_out = self._forward_npu_attention(
+                    q,
+                    k_cache[:, :, :npu_cache_end],
+                    v_cache[:, :, :npu_cache_end],
+                    bsz,
+                    seq_len,
+                    causal=causal,
+                )
+            return self.o_proj(attn_out.transpose(1, 2).reshape(bsz, seq_len, -1))
         q = (q * cos) + (_rotate_half(q) * sin)
         k = (k * cos) + (_rotate_half(k) * sin)
         k_cache.index_copy_(2, write_positions, k.to(k_cache.dtype))
@@ -363,6 +387,24 @@ class CodePredictorAttention(nn.Module):
             )
         attn_out = attn_out.transpose(1, 2).reshape(bsz, seq_len, -1)
         return self.o_proj(attn_out)
+
+    def _forward_cached_npu_fia(self, q, keys, values, end: int, causal: bool):
+        """Use native GQA over the static KV-head cache."""
+        return torch_npu.npu_fused_infer_attention_score(
+            query=q.contiguous(),
+            key=keys,
+            value=values,
+            num_heads=self.num_heads,
+            num_key_value_heads=self.num_kv_heads,
+            input_layout="BNSD",
+            atten_mask=self._fusion_causal_mask.contiguous() if causal else None,
+            actual_seq_lengths=[q.shape[2]] * q.shape[0],
+            actual_seq_lengths_kv=[end] * q.shape[0],
+            scale=float(self.scaling),
+            pre_tokens=2147483647,
+            next_tokens=2147483647,
+            sparse_mode=2 if causal else 0,
+        )[0]
 
 
 # ===================================================================
@@ -438,16 +480,34 @@ class CodePredictorDecoderLayer(nn.Module):
         k_cache: torch.Tensor,
         v_cache: torch.Tensor,
         write_positions: torch.Tensor,
-        key_mask: torch.Tensor,
+        key_mask: torch.Tensor | None,
+        *,
+        npu_cache_end: int | None = None,
+        npu_fia_gqa: bool = True,
     ) -> torch.Tensor:
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
         hidden_states = self.self_attn.forward_cached(
-            hidden_states, position_embeddings, k_cache, v_cache, write_positions, key_mask
+            hidden_states,
+            position_embeddings,
+            k_cache,
+            v_cache,
+            write_positions,
+            key_mask,
+            npu_cache_end=npu_cache_end,
+            npu_fia_gqa=npu_fia_gqa,
         )
-        hidden_states = residual + hidden_states
-        residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
+        if npu_cache_end is not None:
+            hidden_states, _, residual = torch_npu.npu_add_rms_norm(
+                hidden_states,
+                residual,
+                self.post_attention_layernorm.weight,
+                self.post_attention_layernorm.variance_epsilon,
+            )
+        else:
+            hidden_states = residual + hidden_states
+            residual = hidden_states
+            hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
         return residual + hidden_states
 
@@ -528,7 +588,10 @@ class CodePredictorBaseModel(nn.Module):
         position_ids: torch.Tensor,
         kv_caches: Sequence[tuple[torch.Tensor, torch.Tensor]],
         write_positions: torch.Tensor,
-        key_mask: torch.Tensor,
+        key_mask: torch.Tensor | None,
+        *,
+        npu_cache_end: int | None = None,
+        npu_fia_gqa: bool = True,
     ) -> torch.Tensor:
         """``forward`` for the new positions only (``position_ids`` ``[B, n]``), reusing earlier K/V."""
         input_dtype = inputs_embeds.dtype
@@ -540,7 +603,14 @@ class CodePredictorBaseModel(nn.Module):
             position_embeddings = self.rotary_emb(hidden_states, position_ids)
             for layer, (k_cache, v_cache) in zip(self.layers, kv_caches):
                 hidden_states = layer.forward_cached(
-                    hidden_states, position_embeddings, k_cache, v_cache, write_positions, key_mask
+                    hidden_states,
+                    position_embeddings,
+                    k_cache,
+                    v_cache,
+                    write_positions,
+                    key_mask,
+                    npu_cache_end=npu_cache_end,
+                    npu_fia_gqa=npu_fia_gqa,
                 )
             hidden_states = self.norm(hidden_states)
         return hidden_states.to(input_dtype)
@@ -1239,19 +1309,17 @@ class CodePredictorWrapper(nn.Module):
 
     def _capture_npu_graphs(self) -> None:
         """Capture an NPU graph per bucket using torch_npu's NPUGraph."""
-        max_seq = self._num_groups + 1
         proj_buf = self._proj_buf
         pool = torch.npu.graph_pool_handle()
 
-        for bsz in self._bucket_sizes:
-            static_input = proj_buf[:bsz, :max_seq, :]
-            pos_ids = self._bucket_pos_ids[bsz]
-
-            g = torch.npu.NPUGraph()
-            with torch.npu.graph(g, pool=pool):
+        # Warmup populated the exact prefix shapes, including full-size fallbacks.
+        for key, pos_ids in self._bucket_pos_ids.items():
+            bsz, seq_len = pos_ids.shape
+            static_input = proj_buf[:bsz, :seq_len, :]
+            graph = torch.npu.NPUGraph()
+            with torch.npu.graph(graph, pool=pool):
                 static_output = self._compiled_model_fwd(static_input, pos_ids)
-
-            self._device_graphs[bsz] = (g, static_output)
+            self._device_graphs[key] = (graph, static_output)
 
         logger.info("code_predictor: captured NPU graphs for buckets %s", self._bucket_sizes)
 

@@ -288,6 +288,8 @@ class _Qwen3TTSTalkerCodePredictor310P(
             talker_config=talker_config,
             prefix=prefix,
         )
+        if self.npu_ar_execution != "stock":
+            raise ValueError("Qwen3-TTS cached NPU AR requires BF16 and is unavailable on Ascend 310P")
         self._projected_codec_embed_weight = None
 
     def _prepare_npu_weights(self) -> None:

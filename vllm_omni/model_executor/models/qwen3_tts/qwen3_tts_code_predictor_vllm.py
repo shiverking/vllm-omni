@@ -34,6 +34,9 @@ Qwen3TTSTalkerCodePredictorModelVLLM = CodePredictorBaseModel
 class Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM(CodePredictorWrapper):
     """Qwen3-TTS code predictor (per-call sampling, projection)."""
 
+    npu_ar_execution = "stock"
+    _gumbel_sampling = True
+
     def __init__(
         self,
         *,
@@ -67,6 +70,29 @@ class Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM(CodePredictorWrapp
         self._frame_cache: FrameLocalKVCache | None = None
         self._fused_requested = self._parse_bool_config(extra.get("code_predictor_fused"))
         self._fused = None
+        self._gumbel_sampling = self._parse_bool_config(extra.get("code_predictor_gumbel_sampling", True))
+        self._npu_executor = None
+        self._npu_fia_gqa = self._parse_bool_config(extra.get("code_predictor_fia_gqa", True))
+        if current_omni_platform.is_npu():
+            # Accept the commercial v0.23 switch and allow an explicit whole-frame mode.
+            requested = "kv_step" if self._kv_requested else "stock"
+            self.npu_ar_execution = extra.get("code_predictor_ar_execution", requested)
+            if self.npu_ar_execution not in ("stock", "kv_step", "kv_frame"):
+                raise ValueError(f"Unknown code_predictor_ar_execution: {self.npu_ar_execution!r}")
+            prefix_graphs = self._parse_bool_config(extra.get("code_predictor_prefix_graphs"))
+            if self.npu_ar_execution != "stock" and (prefix_graphs or not self._gumbel_sampling):
+                raise ValueError("NPU cached AR requires Gumbel sampling and disables prefix re-prefill")
+            self._prefix_reprefill_enabled = prefix_graphs
+            self._prefix_graphs_enabled = prefix_graphs
+            buckets = extra.get("code_predictor_graph_batch_sizes")
+            if buckets is None and self.npu_ar_execution != "stock":
+                buckets = extra.get("code_predictor_kv_cache_buckets")
+            if buckets is not None:
+                sizes = self._parse_positive_int_set(buckets)
+                maximum = int(vllm_config.scheduler_config.max_num_seqs)
+                if not sizes or max(sizes) > maximum:
+                    raise ValueError("Code Predictor graph buckets must be within max_num_seqs")
+                self.configure_mtp_execution_buckets(sizes | {1})
 
     def _setup_compile(self) -> None:
         if self._compiled_model_fwd is not None:
@@ -137,10 +163,32 @@ class Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM(CodePredictorWrapp
         sample_uniforms: torch.Tensor | None = None,
     ):
         self._validate_sampling_inputs(int(layer0_code.shape[0]), generators, sample_uniforms)
+        if self.npu_ar_execution != "stock":
+            if self._npu_executor is None:
+                from .npu_code_predictor import CachedARExecutor
+
+                executor = CachedARExecutor(
+                    self, self.npu_ar_execution, self._batch_bucket_sizes(), fia_gqa=self._npu_fia_gqa
+                )
+                executor.prepare_all()
+                self._npu_executor = executor
+            return self._npu_executor(
+                layer0_code,
+                layer0_embed,
+                last_talker_hidden,
+                do_sample=do_sample,
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+                generator=generator,
+                generators=generators,
+                sample_uniforms=sample_uniforms,
+            )
         if self._fused_requested:
             self._setup_compile()
         if (
             self._fused is not None
+            and self._gumbel_sampling
             and do_sample
             and temperature > 0
             and top_p == 1.0
@@ -190,6 +238,16 @@ class Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM(CodePredictorWrapp
         generator: torch.Generator | Sequence[torch.Generator | None] | None,
         uniforms: torch.Tensor | None,
     ) -> torch.Tensor:
+        if not self._gumbel_sampling:
+            scaled = logits * inv_temperature
+            if top_k > 0:
+                threshold = scaled.topk(top_k, dim=-1).values[:, -1:]
+                scaled = scaled.masked_fill(scaled < threshold, float("-inf"))
+            rows = self._normalize_generators(generator, logits.shape[0])
+            probs = torch.softmax(scaled, dim=-1, dtype=torch.float32)
+            if isinstance(rows, list):
+                return self._multinomial(probs, None, rows)
+            return self._multinomial(probs, rows, None)
         if (
             self._fused_sampling
             and current_omni_platform.is_cuda()
