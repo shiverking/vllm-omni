@@ -22,6 +22,11 @@ class OmniNPUWorkerBase(NPUWorker):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        # Use the Omni stage's runner choice; vLLM's process-wide choice can
+        # differ when the two stages select runners independently.
+        self.use_v2_model_runner = bool(getattr(self.vllm_config.model_config, "use_v2_model_runner", False))
+        if self.use_v2_model_runner and is_310p():
+            raise NotImplementedError("Omni Model Runner V2 on Ascend 310P is not supported by this backport")
 
         # Replace vllm-ascend's profiler with OmniProfiler
         profiler_config = self.vllm_config.profiler_config

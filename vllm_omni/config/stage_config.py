@@ -1213,7 +1213,7 @@ def _apply_platform_overrides(
         if stage.model_runner is not None and stage.model_runner not in ("v1", "v2"):
             raise ValueError(f"stage {stage.stage_id}: model_runner must be 'v1' or 'v2', got {stage.model_runner!r}")
     uses_v2 = deploy.model_runner == "v2" or any(stage.model_runner == "v2" for stage in deploy.stages)
-    if uses_v2 and platform in {"npu", "xpu"}:
+    if uses_v2 and platform == "xpu":
         raise NotImplementedError(
             f"Model Runner V2 is not supported on {platform.upper()}: "
             "the platform worker still uses the legacy chunk-transfer data plane."
