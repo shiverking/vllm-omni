@@ -238,13 +238,14 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         # OmniGPUModelRunner will store talker_mtp output under this key in
         # per-request additional_information.
         self.talker_mtp_output_key = ("codes", "audio")
-        self.talker_mtp_graph_safe = True
         # A frame's residual codebooks depend only on the Talker hidden and
         # CB0 of the step that sampled it, so MRV2 may complete the frame at
         # the end of that step instead of in the next step's preprocess.
         self.stream_decode = talker_stream_decode_enabled(vllm_config)
         predictor = Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM
         extra = predictor._stage_connector_extra_config(vllm_config)
+        flag = predictor._parse_bool_config
+        self.talker_mtp_graph_safe = flag(extra.get("talker_mtp_graph", True))
         self.stream_first_audio = self.stream_decode and predictor._parse_bool_config(
             extra.get("talker_stream_first_audio")
         )
@@ -262,13 +263,13 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         # The runners bypass only the outer whole-MTP graph when explicit
         # generators are present, so seeded requests can still share one raw
         # batched MTP call with independent per-row streams.
-        self.talker_mtp_accepts_per_row_generators = True
-        self.mtp_sample_uniforms = True
+        self.talker_mtp_accepts_per_row_generators = flag(extra.get("talker_mtp_per_row_generators", True))
+        self.mtp_sample_uniforms = flag(extra.get("code_predictor_gumbel_sampling", True))
         self.mtp_sample_steps = max(0, int(self.talker_config.num_code_groups) - 1)
         self.mtp_sample_vocab_size = self._codebook_vocab_size
-        self.use_async_omni_output = True
-        self.eager_omni_postprocess_before_async_output = True
-        self.omni_pooler_payload_include_hidden = False
+        self.use_async_omni_output = flag(extra.get("talker_async_output", True))
+        self.eager_omni_postprocess_before_async_output = self.use_async_omni_output
+        self.omni_pooler_payload_include_hidden = not self.use_async_omni_output
         self.model = Qwen3Model(vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model"))
 
         if get_pp_group().is_last_rank:
@@ -327,6 +328,10 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
                 talker_config=self.talker_config,
                 prefix="code_predictor",
             )
+
+        if self.code_predictor.npu_ar_execution != "stock":
+            # The predictor owns the NPU graph replay.
+            self.talker_mtp_graph_safe = False
 
         # Constant logit mask: allow only codec ids [1, codebook_vocab_size) plus codec EOS.
         # Register the *disallowed* form so compute_logits doesn't recompute ~mask per step.
