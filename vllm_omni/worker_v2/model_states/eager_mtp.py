@@ -15,7 +15,13 @@ from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.states import RequestState
 
 from vllm_omni.utils.device_copy import DeviceStager, index_to_device
-from vllm_omni.worker_v2.streaming_audio import StreamingAudioBuffer, StreamingAudioOutput
+from vllm_omni.worker_v2.streaming_audio import (
+    ChunkDecoder,
+    ChunkedAudioBuffer,
+    ChunkedAudioOutput,
+    StreamingAudioBuffer,
+    StreamingAudioOutput,
+)
 
 if TYPE_CHECKING:
     from vllm_omni.worker_v2.model_states.omni_model_state import OmniModelState
@@ -98,6 +104,7 @@ class EagerMTPState:
         self._side_stream: torch.cuda.Stream | None = None
         self._fast_ok: bool | None = None
         self._audio_buffer: StreamingAudioBuffer | None = None
+        self._chunked_audio = ChunkedAudioBuffer()
         self._frame_requests: set[str] = set()
         self._suspended_audio: dict[str, SuspendedAudio] = {}
         self._restore_audio: dict[str, list[torch.Tensor]] = {}
@@ -118,6 +125,7 @@ class EagerMTPState:
         self.settled[slot] = req_id
 
     def release_request(self, req_id: str, slot: int) -> None:
+        self._chunked_audio.discard((req_id,))
         self.stream_pos.pop(req_id, None)
         self.release_stream_slot(req_id, slot)
         self.first_audio_requests.discard(req_id)
@@ -150,6 +158,7 @@ class EagerMTPState:
             owners[req_idx] = None
 
     def suspend_audio(self, req_id: str, req_idx: int) -> None:
+        self._chunked_audio.discard((req_id,))
         decoder = getattr(self.owner.model, "stream_decoder", None)
         position = self.stream_position(req_id, req_idx)
         self.release_stream_slot(req_id, req_idx)
@@ -187,6 +196,7 @@ class EagerMTPState:
             self.ready[req_idx] = req_id
 
     def finish_audio(self, req_ids: set[str]) -> None:
+        self._chunked_audio.discard(req_ids)
         for req_id in req_ids:
             self._suspended_audio.pop(req_id, None)
             self._restore_audio.pop(req_id, None)
@@ -363,7 +373,9 @@ class EagerMTPState:
         sampled_token_ids: torch.Tensor,
         multimodal_outputs: dict[str, Any],
         mtp_batch_descriptor_dispatcher: Callable[[int], Any] | None = None,
-    ) -> None:
+        *,
+        chunk_sampling: tuple[RequestState, torch.Tensor] | None = None,
+    ) -> ChunkedAudioOutput | None:
         """Complete each sampled row's frame in this step and publish it with this step's output.
 
         Consumes the rows recorded by ``run_preprocess``. Writes the frame codes
@@ -373,10 +385,12 @@ class EagerMTPState:
         output copy, so no extra synchronization is needed.
         """
         if not self.owner._eager_mtp:
-            return
+            return None
+        chunk_decoder = getattr(self.owner.model, "npu_stream_decoder", None)
         recorded, self.recorded = self.recorded, None
         if recorded is None or recorded[0] is not input_batch or not recorded[1]:
-            return
+            # For the final audio stage, a prefill-only step has no client PCM.
+            return self._chunked_output(chunk_decoder, input_batch, {}) if chunk_decoder is not None else None
         batch, input_ids = recorded[1], recorded[2]
         entries = batch.entries
         codes_out = multimodal_outputs.get("codes", {}).get("audio")
@@ -394,14 +408,61 @@ class EagerMTPState:
                 input_batch, text_hidden, sampled_token_ids, multimodal_outputs, batch, input_ids,
                 codes_out, valid_out, mtp_batch_descriptor_dispatcher,
             )  # fmt: skip
-            return
+            return None
         if getattr(self.owner.model, "stream_decoder", None) is not None:
             raise RuntimeError("Talker stream decode requires the fused eager-MTP path")
         batch_rows = index_to_device([i for i, _req_idx, _req_id, _prefill in entries], device)
-        req_indices = [req_idx for _i, req_idx, _req_id, _prefill in entries]
         last_tokens = input_batch.query_start_loc.index_select(0, batch_rows + 1).long() - 1
         layer0 = sampled_token_ids.reshape(input_batch.num_reqs, -1)[:, 0].index_select(0, batch_rows)
+        # A row whose input CB0 was EOS can still be forwarded by async
+        # scheduling. Its sample must not become a new codec frame.
+        prefill_rows = index_to_device([int(prefill) for _, _, _, prefill in entries], device).bool()
+        input_valid = self.owner.model.mtp_frame_valid(input_ids.index_select(0, last_tokens)) | prefill_rows
+        valid = self.owner.model.mtp_frame_valid(layer0) & input_valid
+        ended: set[str] = set()
+        if chunk_decoder is not None:
+            if chunk_sampling is None:
+                raise RuntimeError("NPU streaming codec requires sampler counts and sequence limits")
+            req_states, num_sampled = chunk_sampling
+            n = input_batch.num_reqs
+            computed = input_batch.num_computed_tokens_np[:n]
+            scheduled = np.asarray(input_batch.num_scheduled_tokens[:n])
+            limits = np.minimum(
+                req_states.max_seq_len[input_batch.idx_mapping_np[:n]],
+                self.owner.vllm_config.model_config.max_model_len,
+            )
+            # The worker observes normal terminal events in this sampled
+            # output, before the scheduler publishes completion. An EOS can
+            # end a request without producing a frame in this step.
+            room = index_to_device([int(computed[i] + scheduled[i] < limits[i]) for i, _, _, _ in entries], device)
+            accepted = (num_sampled.reshape(-1).index_select(0, batch_rows) > 0) & room.bool()
+            valid &= accepted
+            eos = accepted & input_valid & (layer0 == self.owner.model._codec_eos_token_id)
+            valid_rows, eos_rows = torch.stack((valid, eos)).to("cpu").tolist()
+            ended = {
+                req_id
+                for (i, _, req_id, _), frame, stop in zip(entries, valid_rows, eos_rows, strict=True)
+                if stop or (frame and computed[i] + scheduled[i] + 1 >= limits[i])
+            }
+            # Compact valid requests before MTP. EOS, speculative padding and
+            # rows after the length limit consume no residual RNG or graph rows.
+            valid_out.index_copy_(0, last_tokens, valid.to(valid_out.dtype))
+            inactive_slots = [idx for (_, idx, _, _), keep in zip(entries, valid_rows, strict=True) if not keep]
+            if inactive_slots:
+                self.embeds.index_fill_(0, index_to_device(inactive_slots, device), 0)
+            self.ready.update((idx, req_id) for _, idx, req_id, _ in entries)
+            active = [i for i, keep in enumerate(valid_rows) if keep]
+            if not active:
+                pcm = self._chunked_audio.decode(chunk_decoder, {}, ended)
+                return self._chunked_output(chunk_decoder, input_batch, pcm)
+            if len(active) < bsz:
+                selected = index_to_device(active, device)
+                last_tokens = last_tokens.index_select(0, selected)
+                layer0 = layer0.index_select(0, selected)
+                entries = [entries[i] for i in active]
+                bsz = len(entries)
 
+        req_indices = [req_idx for _, req_idx, _, _ in entries]
         batch_ids = self.owner._mtp_input_ids[:bsz]
         batch_emb = self.owner._mtp_input_embeds[:bsz]
         batch_hidden = self.owner._mtp_hidden[:bsz]
@@ -418,6 +479,7 @@ class EagerMTPState:
             batch_hidden,
             batch_step,
             mtp_batch_descriptor_dispatcher,
+            req_ids=[req_id for _, _, req_id, _ in entries],
         )
         assert codes is not None
         rows = index_to_device(req_indices, device)
@@ -430,12 +492,14 @@ class EagerMTPState:
         if codes_out.ndim != 2:
             raise RuntimeError(f"Eager Talker-MTP expects token-major codes.audio, got {tuple(codes_out.shape)}")
         codes_out.index_copy_(0, last_tokens, codes[:bsz].to(codes_out.dtype))
-        # A decode row whose input CB0 was EOS belongs to a request that already
-        # ended (async scheduling runs it once more); its new sample must not
-        # become a frame. Prefill rows have no codec input.
-        prefill_rows = index_to_device([int(prefill) for _i, _req_idx, _req_id, prefill in entries], device).bool()
-        input_valid = self.owner.model.mtp_frame_valid(input_ids.index_select(0, last_tokens)) | prefill_rows
-        valid = self.owner.model.mtp_frame_valid(layer0) & input_valid
+        if chunk_decoder is not None:
+            # The Predictor graph owns `codes`, which is overwritten at the
+            # next replay. Take one batch snapshot before buffering any row.
+            owned_codes = codes[:bsz].to(dtype=torch.long, copy=True)
+            frames = {req_id: owned_codes[i] for i, (_, _, req_id, _) in enumerate(entries)}
+            pcm = self._chunked_audio.decode(chunk_decoder, frames, ended)
+            return self._chunked_output(chunk_decoder, input_batch, pcm)
+
         valid_out.index_copy_(0, last_tokens, valid.to(valid_out.dtype))
         for _i, req_idx, req_id, _prefill in entries:
             self.ready[req_idx] = req_id
@@ -450,6 +514,15 @@ class EagerMTPState:
             else:
                 scheduled *= self._first_audio_valid.index_select(0, rows)
             first_audio.index_copy_(0, last_tokens, scheduled.to(first_audio.dtype))
+        return None
+
+    @staticmethod
+    def _chunked_output(
+        decoder: ChunkDecoder, input_batch: InputBatch, pcm: dict[str, torch.Tensor]
+    ) -> ChunkedAudioOutput:
+        return ChunkedAudioOutput(
+            [pcm.get(req_id) for req_id in input_batch.req_ids], torch.tensor(decoder.sample_rate, dtype=torch.int32)
+        )
 
     def _embedding_weight(self) -> torch.Tensor | None:
         inner = getattr(self.owner.model, "model", None)
