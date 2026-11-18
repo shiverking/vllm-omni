@@ -7,6 +7,7 @@ from __future__ import annotations
 import threading
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
+from typing import Any, Protocol
 
 import numpy as np
 import torch
@@ -89,6 +90,94 @@ class StreamingAudioBuffer:
                 # Already queued outputs retain this object, never a fresh lookup
                 # by ID. A late copy cannot resurrect a cancelled request.
                 state.finish()
+
+
+class ChunkDecoder(Protocol):
+    first_chunk_frames: int
+    chunk_frames: int
+    sample_rate: int
+
+    def new_cache(self) -> dict[str, Any]: ...
+    def decode_chunks(self, codes: list[torch.Tensor], caches: list[dict[str, Any]]) -> list[torch.Tensor]: ...
+
+
+@dataclass
+class PendingCodecRequest:
+    cache: dict[str, Any]
+    frames: list[torch.Tensor] = field(default_factory=list)
+    started: bool = False
+
+
+class ChunkedAudioBuffer:
+    """Accumulate one frame per active request, then batch complete chunks."""
+
+    def __init__(self) -> None:
+        self.requests: dict[str, PendingCodecRequest] = {}
+
+    def discard(self, req_ids: Iterable[str]) -> None:
+        for req_id in req_ids:
+            self.requests.pop(req_id, None)
+
+    def decode(
+        self, decoder: ChunkDecoder, frames: dict[str, torch.Tensor], ended: set[str]
+    ) -> dict[str, torch.Tensor]:
+        for req_id, frame in frames.items():
+            state = self.requests.get(req_id)
+            if state is None:
+                state = PendingCodecRequest(decoder.new_cache())
+                self.requests[req_id] = state
+            state.frames.append(frame)
+
+        ready = []
+        for req_id in dict.fromkeys((*frames, *sorted(ended))):
+            state = self.requests.get(req_id)
+            if state is None or not state.frames:
+                continue
+            threshold = decoder.chunk_frames if state.started else decoder.first_chunk_frames
+            if len(state.frames) == threshold or req_id in ended:
+                ready.append((req_id, state))
+        if not ready:
+            self.discard(ended)
+            return {}
+
+        try:
+            codes = [torch.stack(state.frames, dim=-1).unsqueeze(0) for _, state in ready]
+            waves = decoder.decode_chunks(codes, [state.cache for _, state in ready])
+            result = {}
+            for (req_id, state), wav in zip(ready, waves, strict=True):
+                state.frames.clear()
+                state.started = True
+                if wav.numel():
+                    result[req_id] = wav.reshape(-1).float()
+            return result
+        except BaseException:
+            # A partially executed decoder batch may have modified these caches.
+            self.discard(req_id for req_id, _ in ready)
+            raise
+        finally:
+            self.discard(ended)
+
+
+@dataclass
+class ChunkedAudioOutput:
+    """Already partitioned PCM, aligned by request order for the native output."""
+
+    chunks: list[torch.Tensor | None]
+    sample_rate: torch.Tensor
+
+    def to_cpu(
+        self,
+        copy_stream: Any,
+        copy_tensor: Callable[[torch.Tensor], torch.Tensor],
+    ) -> ChunkedAudioOutput:
+        return ChunkedAudioOutput(
+            [copy_tensor(chunk) if chunk is not None else None for chunk in self.chunks], self.sample_rate
+        )
+
+    def get_output(self) -> list[dict[str, torch.Tensor] | None]:
+        return [
+            {"model_outputs": chunk, "sr": self.sample_rate} if chunk is not None else None for chunk in self.chunks
+        ]
 
 
 @dataclass

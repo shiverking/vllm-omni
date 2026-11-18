@@ -110,6 +110,26 @@ class NPUGraphDecoderWrapper(CUDAGraphDecoderWrapper):
             self.capture_seconds,
         )
 
+    def _decode_xvec_prefix_batch(self, codes_list, request_caches):
+        exact = [i for i, codes in enumerate(codes_list) if codes.shape[-1] == self.initial_chunk_frames]
+        if len(exact) == len(codes_list):
+            return super()._decode_xvec_prefix_batch(codes_list, request_caches)
+        outputs = [None] * len(codes_list)
+        self._record_graph_fallback("xvec_prefix:short", len(codes_list) - len(exact))
+        for i, codes in enumerate(codes_list):
+            if codes.shape[-1] != self.initial_chunk_frames:
+                outputs[i] = self._decode_request_fallback(codes, request_caches[i])
+        if exact:
+            full = super()._decode_xvec_prefix_batch(
+                [codes_list[i] for i in exact],
+                [request_caches[i] for i in exact],
+            )
+            if full is None:
+                full = [self._decode_request_fallback(codes_list[i], request_caches[i]) for i in exact]
+            for i, output in zip(exact, full, strict=True):
+                outputs[i] = output
+        return outputs
+
     def _decode_suffix_batch(self, mode, target_frames, codes_list, request_caches, new_frames_list):
         if mode != "xvec":
             return None
@@ -119,6 +139,7 @@ class NPUGraphDecoderWrapper(CUDAGraphDecoderWrapper):
             # Short rows must not force unrelated full rows in the same phase
             # to eager. Restore original request order after the two routes.
             outputs = [None] * len(codes_list)
+            self._record_graph_fallback(f"suffix_{target_frames}:short", len(codes_list) - len(exact))
             for i, n in enumerate(new_frames_list):
                 if n != expected:
                     outputs[i] = self._decode_request_fallback(codes_list[i], request_caches[i])

@@ -43,7 +43,7 @@ from vllm_omni.worker_v2.model_states.eager_mtp import EagerMTPState, FrameBatch
 from vllm_omni.worker_v2.model_states.intermediate_buffer import (
     OmniIntermediateBuffer,
 )
-from vllm_omni.worker_v2.streaming_audio import StreamingAudioOutput
+from vllm_omni.worker_v2.streaming_audio import ChunkedAudioOutput, StreamingAudioOutput
 from vllm_omni.worker_v2.warmup import is_warmup_request
 
 logger = init_logger(__name__)
@@ -241,11 +241,19 @@ class OmniModelState(DefaultModelState):
         sampled_token_ids: torch.Tensor,
         multimodal_outputs: dict[str, Any],
         mtp_batch_descriptor_dispatcher: Callable[[int], Any] | None = None,
-    ) -> None:
+        *,
+        chunk_sampling: tuple[RequestState, torch.Tensor] | None = None,
+    ) -> ChunkedAudioOutput | None:
         if self._eager_mtp:
-            self._eager_state.run_eager_mtp(
-                input_batch, text_hidden, sampled_token_ids, multimodal_outputs, mtp_batch_descriptor_dispatcher
+            return self._eager_state.run_eager_mtp(
+                input_batch,
+                text_hidden,
+                sampled_token_ids,
+                multimodal_outputs,
+                mtp_batch_descriptor_dispatcher,
+                chunk_sampling=chunk_sampling,
             )
+        return None
 
     def prepare_streaming_audio_output(
         self, input_batch: InputBatch, req_states: RequestState, outputs: dict[str, Any]
@@ -1324,8 +1332,9 @@ class OmniModelState(DefaultModelState):
             batch_step = self._mtp_text_step[:num_tokens]
             if sample_uniform_buffer is not None:
                 sample_uniforms = self._prepare_mtp_sample_uniforms(generators, num_tokens)
-        elif can_use_graph:
-            cudagraph_mode = CUDAGraphMode.FULL
+        elif can_use_graph or bool(getattr(self.model, "mtp_sample_uniforms_without_graph", False)):
+            if can_use_graph:
+                cudagraph_mode = CUDAGraphMode.FULL
             if sample_uniform_buffer is not None:
                 sample_uniforms = self._prepare_mtp_sample_uniforms(generators, bsz)
         with set_forward_context(

@@ -38,7 +38,7 @@ from vllm_omni.utils.mm_outputs import partition_flat_payload
 from vllm_omni.worker_v2.omni_model_runner import OmniGPUModelRunner
 from vllm_omni.worker_v2.omni_sampler import sample_with_output
 from vllm_omni.worker_v2.output_snapshot import PackedOutputSnapshot, RequestOutputSnapshot, pack_output_snapshot
-from vllm_omni.worker_v2.streaming_audio import StreamingAudioOutput
+from vllm_omni.worker_v2.streaming_audio import ChunkedAudioOutput, StreamingAudioOutput
 
 logger = init_logger(__name__)
 _ASYNC_MM_SNAPSHOT_MAX_BUCKETS_PER_SLOT = 64
@@ -219,7 +219,22 @@ class OmniARModelRunner(OmniGPUModelRunner):
         if sampling_output.multimodal_outputs is not None:
             multimodal_outputs = sampling_output.multimodal_outputs
         run_eager_mtp = getattr(self.model_state, "run_eager_mtp", None)
-        if multimodal_outputs and run_eager_mtp is not None:
+        npu_chunk_audio = getattr(self.model, "npu_stream_decoder", None) is not None
+        chunked_audio = None
+        if npu_chunk_audio:
+            if not callable(run_eager_mtp):
+                raise RuntimeError("NPU streaming codec requires the MRv2 eager MTP post-sample hook")
+            chunked_audio = run_eager_mtp(
+                input_batch,
+                text_hidden,
+                sampler_output.sampled_token_ids,
+                multimodal_outputs or {},
+                self._dispatch_mtp_batch_descriptor,
+                chunk_sampling=(self.req_states, num_sampled),
+            )
+            if chunked_audio is None:
+                raise RuntimeError("NPU streaming codec did not return its request-aligned output")
+        elif multimodal_outputs and run_eager_mtp is not None:
             run_eager_mtp(
                 input_batch,
                 text_hidden,
@@ -281,11 +296,9 @@ class OmniARModelRunner(OmniGPUModelRunner):
         model_runner_output._async_chunk = bool(getattr(self.model_config, "async_chunk", False))
 
         prepare_streaming = getattr(self.model_state, "prepare_streaming_audio_output", None)
-        streaming_audio = (
-            prepare_streaming(input_batch, self.req_states, multimodal_outputs)
-            if need_pooler and multimodal_outputs and callable(prepare_streaming)
-            else None
-        )
+        streaming_audio = chunked_audio
+        if streaming_audio is None and need_pooler and multimodal_outputs and callable(prepare_streaming):
+            streaming_audio = prepare_streaming(input_batch, self.req_states, multimodal_outputs)
 
         # --- Async D2H via OmniAsyncOutput ---
         materialize_native = self._uses_native_output_materializer()
@@ -734,14 +747,18 @@ class OmniAsyncOutput(AsyncModelRunnerOutput):
         finalize_multimodal: Any | None = None,
         check_ep_fault: bool = False,
         pending_aux_output: Any | None = None,
-        streaming_audio: StreamingAudioOutput | None = None,
+        streaming_audio: StreamingAudioOutput | ChunkedAudioOutput | None = None,
         extra_multimodal_outputs: tuple[dict[str, Any], torch.cuda.Event] | None = None,
     ):
         self.model_runner_output = model_runner_output
         self.sampler_output = sampler_output
         self.num_sampled_tokens = num_sampled_tokens
         self.pending_aux_output = pending_aux_output
-        self.copy_event = copy_event if copy_event is not None else torch.cuda.Event(blocking=True)
+        is_npu = num_sampled_tokens.device.type == "npu"
+        device_module = torch.npu if is_npu else torch.cuda
+        if copy_event is None:
+            copy_event = device_module.Event() if is_npu else device_module.Event(blocking=True)
+        self.copy_event = copy_event
         self._async_chunk = bool(async_chunk)
         self._finalize_output = finalize_output
         self._finalize_multimodal = finalize_multimodal
@@ -774,10 +791,10 @@ class OmniAsyncOutput(AsyncModelRunnerOutput):
         @contextlib.contextmanager
         def _stream(to_stream, from_stream):
             try:
-                torch.cuda.set_stream(to_stream)
+                device_module.set_stream(to_stream)
                 yield
             finally:
-                torch.cuda.set_stream(from_stream)
+                device_module.set_stream(from_stream)
 
         with _stream(copy_stream, main_stream):
             copy_stream.wait_stream(main_stream)

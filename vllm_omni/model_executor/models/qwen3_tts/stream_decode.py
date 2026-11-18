@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Eligibility and model options for the single-stage CUDA PCM pipeline."""
+"""Eligibility and model options for the single-stage PCM pipeline."""
 
 import torch
 from vllm.config import VllmConfig
@@ -32,9 +32,11 @@ def talker_stream_decode_enabled(vllm_config: VllmConfig) -> bool:
             "The single-stage PCM pipeline must disable running prefix-cache reset; "
             "select qwen3_tts_fused_single_gpu.yaml"
         )
+    device_type = torch.device(vllm_config.device_config.device).type
+    is_cuda = current_omni_platform.is_cuda() and device_type == "cuda"
+    is_npu = current_omni_platform.is_npu() and device_type == "npu"
     if not (
-        current_omni_platform.is_cuda()
-        and torch.device(vllm_config.device_config.device).type == "cuda"
+        (is_cuda or is_npu)
         and bool(getattr(model, "use_v2_model_runner", False))
         and bool(getattr(model, "async_chunk", False))
         and parallel.tensor_parallel_size == 1
@@ -43,12 +45,16 @@ def talker_stream_decode_enabled(vllm_config: VllmConfig) -> bool:
         and not vllm_config.cache_config.enable_prefix_caching
     ):
         raise ValueError(
-            "talker_stream_decode requires CUDA, MRv2, async_chunk=True, TP=PP=1, "
-            "an in-process worker and enable_prefix_caching=False; "
-            "use qwen3_tts_fused_single_gpu.yaml"
+            "talker_stream_decode requires CUDA or Ascend NPU, MRv2, async_chunk=True, "
+            "TP=PP=1, an in-process worker and enable_prefix_caching=False"
         )
     if Predictor._parse_bool_config(extra.get("talker_first_audio")):
         raise ValueError("talker_stream_decode and talker_first_audio are mutually exclusive")
+    if is_npu:
+        if model.dtype != torch.bfloat16:
+            raise ValueError("Ascend single-stage Qwen3-TTS requires BF16")
+        if Predictor._parse_bool_config(extra.get("talker_stream_first_audio")):
+            raise ValueError("Ascend single-stage Qwen3-TTS delivers its first chunk through MRv2 output")
     return True
 
 

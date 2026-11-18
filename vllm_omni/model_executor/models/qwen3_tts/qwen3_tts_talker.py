@@ -242,6 +242,9 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         # CB0 of the step that sampled it, so MRV2 may complete the frame at
         # the end of that step instead of in the next step's preprocess.
         self.stream_decode = talker_stream_decode_enabled(vllm_config)
+        self._npu_stream_decode = self.stream_decode and torch.device(vllm_config.device_config.device).type == "npu"
+        if self._npu_stream_decode and self.config.tts_model_type != "custom_voice":
+            raise ValueError("Ascend single-stage Qwen3-TTS supports the CustomVoice checkpoint")
         predictor = Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM
         extra = predictor._stage_connector_extra_config(vllm_config)
         flag = predictor._parse_bool_config
@@ -254,6 +257,7 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         self.stream_ref_context_frames = stream_ref_context_frames(vllm_config) if self.stream_decode else 0
         self.mtp_eager_frames = talker_first_audio_enabled(vllm_config) or self.stream_decode
         self.stream_decoder = None
+        self.npu_stream_decoder = None
         self.stream_graphs = None
         self.stream_prime_graphs = None
         # Power-of-two frame counts below the priming chunk: see prime_stream_decoder.
@@ -332,6 +336,7 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         if self.code_predictor.npu_ar_execution != "stock":
             # The predictor owns the NPU graph replay.
             self.talker_mtp_graph_safe = False
+        self.mtp_sample_uniforms_without_graph = self.code_predictor.npu_ar_execution == "kv_frame"
 
         # Constant logit mask: allow only codec ids [1, codebook_vocab_size) plus codec EOS.
         # Register the *disallowed* form so compute_logits doesn't recompute ~mask per step.
@@ -371,7 +376,7 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         self._use_v2_model_runner = bool(getattr(vllm_config.model_config, "use_v2_model_runner", False))
         self.gpu_resident_buffer_keys = _qwen3_tts_gpu_resident_buffer_keys(self._use_v2_model_runner)
 
-        if self._use_v2_model_runner:
+        if self._use_v2_model_runner and self.code_predictor.npu_ar_execution == "stock":
             # Align predictor warmup/capture buckets with the outer MRv2 MTP
             # graph buckets so the compile cache covers every reachable size.
             outer_max_bsz = int(vllm_config.scheduler_config.max_num_seqs)
@@ -574,7 +579,7 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
     @property
     def mm_outputs_fresh_per_step(self) -> bool:
         """Stream-decode outputs come from :meth:`_make_eager_omni_output`, allocated per step."""
-        return self.stream_decoder is not None and self.eager_frames_active
+        return (self.stream_decoder is not None or self.npu_stream_decoder is not None) and self.eager_frames_active
 
     def make_omni_output(self, model_outputs: torch.Tensor | OmniOutput, **kwargs: Any) -> OmniOutput:
         if isinstance(model_outputs, OmniOutput):
@@ -1431,7 +1436,7 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         logger.info("Loaded %d weights for Qwen3TTSTalkerForConditionalGeneration", len(loaded))
         self._build_stacked_codec_embed()
         # The table costs ~0.6 GB at 1.7B and is used by the fused MRv2 prefill path.
-        if self._use_v2_model_runner and self.stream_decode:
+        if self._use_v2_model_runner and self.stream_decode and not self._npu_stream_decode:
             self._prompt_builder.build_projected_text_table()
         if talker_first_audio_enabled(self.vllm_config):
             from .first_frame_decoder import Qwen3TTSFirstFrameDecoder
@@ -1439,6 +1444,11 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             self.first_frame_decoder = Qwen3TTSFirstFrameDecoder(self.model_path)
             decoder_loaded = self.first_frame_decoder.load(self.vllm_config)
             loaded = set(loaded) | {f"first_frame_decoder.{name}" for name in decoder_loaded}
+        elif self._npu_stream_decode:
+            from .npu_stream_decode import NPUStreamDecoder
+
+            self.npu_stream_decoder, decoder_loaded = NPUStreamDecoder.load(self.model_path, self.vllm_config)
+            loaded = set(loaded) | {f"npu_stream_decoder.{name}" for name in decoder_loaded}
         elif self.stream_decode:
             # The in-stage decoder owns every frame. Optional first-audio
             # delivery uses its PCM; later chunks use regular step outputs.
