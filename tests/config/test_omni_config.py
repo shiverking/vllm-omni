@@ -945,10 +945,26 @@ stages:
     assert all(stage.model_config.use_v2_model_runner is expect_v2 for stage in structured.stage_configs)
 
 
-@pytest.mark.parametrize("platform", ["npu", "xpu"])
-def test_mrv2_fails_fast_on_platforms_without_native_workers(platform: str):
+def test_mrv2_fails_fast_on_xpu_without_native_workers():
     with pytest.raises(NotImplementedError, match="Model Runner V2"):
-        _apply_platform_overrides(DeployConfig(model_runner="v2"), platform=platform)
+        _apply_platform_overrides(DeployConfig(model_runner="v2"), platform="xpu")
+
+
+def test_qwen3_tts_npu_mrv2_selects_both_native_workers():
+    deploy = _apply_platform_overrides(
+        DeployConfig(
+            pipeline="qwen3_tts",
+            model_runner="v1",
+            async_chunk=True,
+            platforms={"npu": {"model_runner": "v2"}},
+        ),
+        platform="npu",
+    )
+    pipeline = _resolve_pipeline_or_skip("qwen3_tts")
+    stages = merge_pipeline_deploy(pipeline, deploy)
+    assert len(stages) == 2
+    assert all(stage.yaml_engine_args["use_v2_model_runner"] for stage in stages)
+    assert all(stage.yaml_engine_args["supports_native_mrv2_data_plane"] for stage in stages)
 
 
 def _qwen3_omni_pipeline() -> PipelineConfig:
