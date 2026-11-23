@@ -3,7 +3,6 @@
 
 """Stage input processor for Qwen3-TTS: Talker -> Code2Wav."""
 
-import hashlib
 import math
 import time
 from collections.abc import Mapping
@@ -38,6 +37,7 @@ from vllm_omni.model_executor.stage_input_processors.tts_utils import (
     extract_speaker_from_prompt,
     extract_speaker_from_request,
 )
+from vllm_omni.utils.speaker_cache import codec_reference_cache_key
 
 logger = init_logger(__name__)
 
@@ -454,8 +454,7 @@ def talker2code2wav_async_chunk(
                     entry = entries.get("precomputed_icl_voice") if isinstance(entries, dict) else None
                     voices = getattr(entry, "list_data", None)
                     if voices and voices[0] in cache_voices:
-                        digest = hashlib.sha256(ref_cpu.contiguous().numpy().tobytes()).hexdigest()
-                        ref_context_cache_key = f"{voices[0]}:{ref_context_size}:{ref_cpu.shape[1]}:{digest}"
+                        ref_context_cache_key = codec_reference_cache_key(voices[0], ref_cpu)
 
     # Keep the codebook-major CPU wire format without extracting every
     # tensor element as a Python scalar. Legacy buffered frames can be lists.

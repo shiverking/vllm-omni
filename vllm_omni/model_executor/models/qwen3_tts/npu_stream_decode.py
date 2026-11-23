@@ -62,8 +62,17 @@ class NPUStreamDecoder(nn.Module):
 
         extra = Predictor._stage_connector_extra_config(vllm_config)
         execution = extra.get("code2wav_execution", "npu_graph")
-        if execution not in ("baseline", "npu_graph"):
-            raise ValueError("Ascend single-stage Code2Wav supports baseline or npu_graph")
+        segmented = execution in ("npu_graph", "npu_graph_icl")
+        incremental = execution in ("npu_incremental", "npu_incremental_icl_graph")
+        if execution != "baseline" and not (segmented or incremental):
+            raise ValueError(f"Unsupported Ascend single-stage code2wav_execution: {execution}")
+        reference_cache_voices = extra.get("code2wav_reference_cache_voices", ())
+        if not isinstance(reference_cache_voices, list | tuple) or any(
+            not isinstance(voice, str) or not voice for voice in reference_cache_voices
+        ):
+            raise ValueError("code2wav_reference_cache_voices must be a list of voice names")
+        if reference_cache_voices and execution != "npu_incremental_icl_graph":
+            raise ValueError("Code2Wav reference state caching requires npu_incremental_icl_graph")
         if extra.get("codec_chunk_ramp") or extra.get("codec_chunk_adaptive"):
             raise ValueError("Ascend single-stage Code2Wav requires fixed chunk sizes")
 
@@ -86,12 +95,28 @@ class NPUStreamDecoder(nn.Module):
             sample_rate=holder.sample_rate,
             max_batch_size=max_batch_size,
         )
-        if execution == "npu_graph":
+        if segmented:
             if not buckets or max_batch_size != buckets[-1]:
                 raise ValueError("decode_batch_max_size must match the largest Code2Wav graph bucket")
-            stream.graphs = NPUGraphDecoderWrapper(stream.decoder, buckets)
+            mode = "icl" if execution == "npu_graph_icl" else "xvec"
+            stream.graphs = NPUGraphDecoderWrapper(stream.decoder, buckets, capture_modes=(mode,))
+            stream.graphs.warmup(torch.device(vllm_config.device_config.device))
+        elif incremental:
+            from vllm_omni.platforms.npu.layers.incremental_codec import NPUIncrementalCodec
+
+            with torch.inference_mode():
+                stream.decoder._npu_incremental = NPUIncrementalCodec(
+                    stream.decoder,
+                    slots=capacity,
+                    max_batch=max_batch_size,
+                    chunk_frames=stream.chunk_frames,
+                    initial_chunk_frames=(
+                        stream.first_chunk_frames if execution == "npu_incremental_icl_graph" else None
+                    ),
+                    reference_cache_capacity=len(set(reference_cache_voices)),
+                )
+        if segmented or incremental:
             device = torch.device(vllm_config.device_config.device)
-            stream.graphs.warmup(device)
             logger.info(
                 "Talker Code2Wav capture process high-water: allocated=%.1f MiB reserved=%.1f MiB",
                 torch.npu.max_memory_allocated(device) / (1024**2),
@@ -112,12 +137,41 @@ class NPUStreamDecoder(nn.Module):
     def new_cache() -> dict:
         return {"prefix_frames": 0}
 
+    def prepare_reference(self, cache: dict, ref_codes: torch.Tensor | None, cache_key: str | None) -> None:
+        """Attach the trimmed reference to the pending first generated chunk."""
+        if ref_codes is None or not ref_codes.numel():
+            return
+        if (
+            ref_codes.ndim != 2
+            or ref_codes.shape[0] > self.left_context_frames
+            or ref_codes.shape[1] != self.decoder.config.num_quantizers
+        ):
+            raise ValueError("Code2Wav reference must be trimmed [frames, codebooks]")
+        cache["prefix_frames"] = int(ref_codes.shape[0])
+        cache["_pending_reference_codes"] = ref_codes.transpose(0, 1).unsqueeze(0)
+        if cache_key is not None:
+            cache["npu_reference_cache_key"] = cache_key
+
+    def release_cache(self, cache: dict) -> None:
+        """Release a request's incremental slot when its PCM stream ends."""
+        slot = cache.pop("npu_slot", None)
+        incremental = getattr(self.decoder, "_npu_incremental", None)
+        if slot is not None and incremental is not None:
+            incremental.release(slot)
+
     def decode_chunks(self, codes: list[torch.Tensor], caches: list[dict]) -> list[torch.Tensor]:
         """Receive new codes as one [1, codebooks, frames] tensor per request."""
         if len(codes) != len(caches):
             raise ValueError("Code2Wav requires one cache per request chunk")
         if not codes:
             return []
+        generated_lengths = [code.shape[-1] for code in codes]
+        references = [cache.pop("_pending_reference_codes", None) for cache in caches]
+        if any(ref is not None for ref in references):
+            codes = [
+                torch.cat((ref.to(chunk), chunk), dim=-1) if ref is not None else chunk
+                for ref, chunk in zip(references, codes, strict=True)
+            ]
         lengths = [code.shape[-1] for code in codes]
         if self.graphs is not None:
             # Input is already request-packed and the graph wrapper owns the
@@ -130,12 +184,13 @@ class NPUStreamDecoder(nn.Module):
                 packed,
                 lengths,
                 caches=caches,
-                chunk_size=self.chunk_frames,
+                # An eager short first chunk still requires the entire reference.
+                chunk_size=max(self.chunk_frames, width),
                 left_context_size=self.left_context_frames,
                 max_batch_size=self.max_batch_size,
             )
         chunks = [wave.reshape(-1) for wave in pcm]
-        for wave, length in zip(chunks, lengths, strict=True):
+        for wave, length in zip(chunks, generated_lengths, strict=True):
             if wave.numel() != length * self.samples_per_frame:
-                raise RuntimeError("Code2Wav returned a PCM length different from its input chunk")
+                raise RuntimeError("Code2Wav returned a PCM length different from the generated chunk")
         return chunks

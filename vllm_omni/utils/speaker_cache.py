@@ -9,6 +9,7 @@ has its own slot. Access via :func:`get_speaker_cache`.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import threading
@@ -29,6 +30,13 @@ _CUSTOM_VOICE_SCHEMA_VERSION = 1
 
 _SINGLETON: SpeakerEmbeddingCache | None = None
 _SINGLETON_LOCK = threading.Lock()
+
+
+def codec_reference_cache_key(voice: str, ref_codes: torch.Tensor) -> str:
+    """Fingerprint the effective time-major reference codes already on the CPU."""
+    codes = ref_codes.detach().to(dtype=torch.long).contiguous()
+    digest = hashlib.sha256(codes.numpy().tobytes()).hexdigest()
+    return f"{voice}:{codes.shape[0]}:{codes.shape[1]}:{digest}"
 
 
 def _estimate_tensor_bytes(obj: object) -> int:

@@ -61,6 +61,7 @@ logger = init_logger(__name__)
 PRECOMPUTED_REF_CODE_KEY = "precomputed_ref"
 NORMALIZED_REF_AUDIO_KEY = "_qwen3_tts_normalized_ref_audio"
 REF_AUDIO_CACHE_KEY = "_qwen3_tts_ref_audio_cache_key"
+STREAM_REFERENCE_CACHE_KEY = "_qwen3_tts_stream_reference_cache_key"
 PRECOMPUTED_TEXT_IDS_KEY = "_qwen3_tts_text_ids"
 PRECOMPUTED_REF_IDS_KEY = "_qwen3_tts_ref_ids"
 
@@ -1448,6 +1449,12 @@ class Qwen3TTSPromptEmbedsBuilder:
                         ref_spk_embed_cached = _cached.get("ref_spk_embedding")
                         if isinstance(ref_code_cached, torch.Tensor):
                             ref_code_cached = ref_code_cached.to(device=input_ids.device)
+                            ref_cache_key = _cached.get("ref_context_cache_key")
+                            if (
+                                isinstance(ref_cache_key, str)
+                                and first_value(info_dict.get("precomputed_icl_voice")) == _voice_name
+                            ):
+                                info_dict[STREAM_REFERENCE_CACHE_KEY] = ref_cache_key
                         if isinstance(ref_spk_embed_cached, torch.Tensor):
                             ref_spk_embed_cached = ref_spk_embed_cached.to(device=input_ids.device)
                         voice_clone_prompt = {

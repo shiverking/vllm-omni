@@ -20,9 +20,21 @@ class FakeDecoder:
 
     def __init__(self):
         self.calls = []
+        self.prepared = []
+        self.released = []
 
     def new_cache(self):
         return {"position": 0}
+
+    def prepare_reference(self, cache, codes, cache_key):
+        assert codes.shape[1] == 16
+        self.prepared.append((codes.shape[0], cache_key))
+        cache["reference_cache_key"] = cache_key
+
+    def release_cache(self, cache):
+        key = cache.pop("reference_cache_key", None)
+        if key is not None:
+            self.released.append(key)
 
     def decode_chunks(self, codes, caches):
         self.calls.append([(int(cache["position"]), code.shape[-1]) for code, cache in zip(codes, caches, strict=True)])
@@ -87,6 +99,54 @@ def test_npu_chunked_audio_request_order_cancel_and_reuse():
     assert state.requests["c"].cache["position"] == 4
 
 
+def test_npu_reference_frames_leave_generated_chunk_thresholds_unchanged():
+    state, decoder = ChunkedAudioBuffer(), FakeDecoder()
+    references = {
+        "a": (torch.full((13, 16), 99, dtype=torch.long), "alice-key"),
+        "b": (torch.full((72, 16), 77, dtype=torch.long), "bob-key"),
+    }
+    chunks = {"a": [], "b": []}
+    for offset in range(13):
+        pairs = [("a", _frame(10 + offset)), ("b", _frame(30 + offset))]
+        if offset % 2:
+            pairs.reverse()
+        outputs = state.decode(decoder, dict(pairs), set(), references=references)
+        for req_id, pcm in outputs.items():
+            chunks[req_id].append(pcm)
+    for req_id, pcm in state.decode(decoder, {}, {"a", "b"}).items():
+        chunks[req_id].append(pcm)
+
+    for req_id, start in (("a", 10), ("b", 30)):
+        assert [chunk.numel() for chunk in chunks[req_id]] == [4, 8, 1]
+        assert torch.cat(chunks[req_id]).tolist() == list(range(start, start + 13))
+    assert decoder.prepared == [(13, "alice-key"), (72, "bob-key")]
+    assert sorted(decoder.released) == ["alice-key", "bob-key"]
+    assert state.requests == {}
+    assert state.decode(decoder, {}, {"no-generated-frames"}, references=references) == {}
+
+
+def test_npu_chunked_audio_releases_reference_cache_on_cancel_and_decode_failure(monkeypatch):
+    state, decoder = ChunkedAudioBuffer(), FakeDecoder()
+    references = {req_id: (torch.zeros(15, 16, dtype=torch.long), req_id) for req_id in ("a", "b", "c")}
+    for offset in range(5):
+        state.decode(decoder, {req_id: _frame(offset) for req_id in references}, set(), references=references)
+    state.discard(("a", "a", "untracked"))
+    assert decoder.released == ["a"]
+
+    def fail_decode(_codes, _caches):
+        raise RuntimeError("codec failed")
+
+    monkeypatch.setattr(decoder, "decode_chunks", fail_decode)
+    with pytest.raises(RuntimeError, match="codec failed"):
+        state.decode(decoder, {}, {"b"})
+    assert decoder.released == ["a", "b"]
+    assert set(state.requests) == {"c"}
+
+    state.discard(("c",))
+    assert decoder.released == ["a", "b", "c"]
+    assert state.requests == {}
+
+
 def test_npu_chunk_output_snapshot():
     first, second = torch.arange(4), torch.arange(8)
     pending = ChunkedAudioOutput([first, None, second], torch.tensor(24000))
@@ -103,6 +163,13 @@ def test_npu_chunk_output_snapshot():
 def test_npu_worker_flushes_eos_and_length_before_request_completion():
     decoder = FakeDecoder()
     scopes = []
+    reference_calls = []
+    reference = torch.full((42, 16), 99, dtype=torch.long)
+
+    def read_reference(info):
+        reference_calls.append(info["row"])
+        return info.get("reference")
+
     graph_codes = torch.empty(2, 16, dtype=torch.long)
 
     def mtp(_req_indices, ids, emb, _hidden, _step, _dispatcher, *, req_ids):
@@ -112,6 +179,7 @@ def test_npu_worker_flushes_eos_and_length_before_request_completion():
 
     model = SimpleNamespace(
         npu_stream_decoder=decoder,
+        get_npu_stream_reference=read_reference,
         _codec_eos_token_id=2048,
         mtp_frame_valid=lambda ids: (ids >= 0) & (ids < 2048),
         embed_input_ids=lambda ids: ids.float(),
@@ -121,6 +189,9 @@ def test_npu_worker_flushes_eos_and_length_before_request_completion():
         vllm_config=SimpleNamespace(
             cache_config=SimpleNamespace(enable_prefix_caching=False),
             model_config=SimpleNamespace(max_model_len=20),
+        ),
+        intermediate_buffer=SimpleNamespace(
+            buffers=[{"row": 0, "reference": (reference, "stream-reference-key")}, {"row": 1}]
         ),
         _eager_mtp=True,
         _mtp_input_ids=torch.empty(2, dtype=torch.long),
@@ -166,5 +237,8 @@ def test_npu_worker_flushes_eos_and_length_before_request_completion():
     assert [item["model_outputs"].tolist() for item in result] == [[12, 13], [7]]
     assert scopes == [("a", "b"), ("b",)]
     assert step(["a", "b"], [0, 1], [3, 3], [99, 99], [0, 1]) == [None, None]
+    assert reference_calls == [0, 1]
+    assert decoder.prepared == [(42, "stream-reference-key")]
+    assert decoder.released == ["stream-reference-key"]
     assert state._chunked_audio.requests == {}
     assert scopes == [("a", "b"), ("b",)]

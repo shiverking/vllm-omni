@@ -98,12 +98,15 @@ class ChunkDecoder(Protocol):
     sample_rate: int
 
     def new_cache(self) -> dict[str, Any]: ...
+    def prepare_reference(self, cache: dict[str, Any], ref_codes: torch.Tensor, cache_key: str | None) -> None: ...
+    def release_cache(self, cache: dict[str, Any]) -> None: ...
     def decode_chunks(self, codes: list[torch.Tensor], caches: list[dict[str, Any]]) -> list[torch.Tensor]: ...
 
 
 @dataclass
 class PendingCodecRequest:
     cache: dict[str, Any]
+    release_cache: Callable[[dict[str, Any]], None] | None = None
     frames: list[torch.Tensor] = field(default_factory=list)
     started: bool = False
 
@@ -116,15 +119,23 @@ class ChunkedAudioBuffer:
 
     def discard(self, req_ids: Iterable[str]) -> None:
         for req_id in req_ids:
-            self.requests.pop(req_id, None)
+            state = self.requests.pop(req_id, None)
+            if state is not None and state.release_cache is not None:
+                state.release_cache(state.cache)
 
     def decode(
-        self, decoder: ChunkDecoder, frames: dict[str, torch.Tensor], ended: set[str]
+        self,
+        decoder: ChunkDecoder,
+        frames: dict[str, torch.Tensor],
+        ended: set[str],
+        references: dict[str, tuple[torch.Tensor, str | None]] | None = None,
     ) -> dict[str, torch.Tensor]:
         for req_id, frame in frames.items():
             state = self.requests.get(req_id)
             if state is None:
-                state = PendingCodecRequest(decoder.new_cache())
+                state = PendingCodecRequest(decoder.new_cache(), getattr(decoder, "release_cache", None))
+                if references and req_id in references:
+                    decoder.prepare_reference(state.cache, *references[req_id])
                 self.requests[req_id] = state
             state.frames.append(frame)
 

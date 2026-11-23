@@ -29,6 +29,7 @@ from vllm_omni.model_executor.models.common.ecapa_tdnn import ECAPATimeDelayNet
 from vllm_omni.model_executor.models.output_templates import OmniOutput, OwnedBatchTensor
 from vllm_omni.utils.device_copy import DeviceStager, index_to_device, to_device_nonblocking
 from vllm_omni.utils.speaker_cache import (
+    codec_reference_cache_key,
     get_speaker_cache,
     iter_custom_voice_profiles,
     load_validated_profile_tensors,
@@ -40,6 +41,7 @@ from .configuration_qwen3_tts import Qwen3TTSConfig, Qwen3TTSTalkerConfig
 from .first_audio import talker_first_audio_enabled
 from .prompt_embeds_builder import (
     PRECOMPUTED_TEXT_IDS_KEY,
+    STREAM_REFERENCE_CACHE_KEY,
     Qwen3TTSPromptEmbedsBuilder,
     resolve_x_vector_only,
 )
@@ -243,8 +245,8 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         # the end of that step instead of in the next step's preprocess.
         self.stream_decode = talker_stream_decode_enabled(vllm_config)
         self._npu_stream_decode = self.stream_decode and torch.device(vllm_config.device_config.device).type == "npu"
-        if self._npu_stream_decode and self.config.tts_model_type != "custom_voice":
-            raise ValueError("Ascend single-stage Qwen3-TTS supports the CustomVoice checkpoint")
+        if self._npu_stream_decode and self.config.tts_model_type not in ("custom_voice", "base"):
+            raise ValueError("Ascend single-stage Qwen3-TTS supports Base and CustomVoice checkpoints")
         predictor = Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM
         extra = predictor._stage_connector_extra_config(vllm_config)
         flag = predictor._parse_bool_config
@@ -255,6 +257,9 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         # Model-local voice-clone priming boundary; each deployment selects
         # its reference context independently of the two-stage codec profile.
         self.stream_ref_context_frames = stream_ref_context_frames(vllm_config) if self.stream_decode else 0
+        self._stream_reference_cache_voices = (
+            (extra.get("code2wav_reference_cache_voices") or ()) if self._npu_stream_decode else ()
+        )
         self.mtp_eager_frames = talker_first_audio_enabled(vllm_config) or self.stream_decode
         self.stream_decoder = None
         self.npu_stream_decoder = None
@@ -462,6 +467,7 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             return
 
         expected_dim = int(getattr(self.config.speaker_encoder_config, "enc_dim", 0) or 0)
+        cached_voices = getattr(self, "_stream_reference_cache_voices", ())
         loaded = 0
         for profile in iter_custom_voice_profiles(custom_voice_dir, expected_model_type="qwen3_tts"):
             tensors = load_validated_profile_tensors(
@@ -485,8 +491,14 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
                 "icl_mode": mode == "icl",
                 "ref_text": profile.get("ref_text"),
             }
+            voice = profile["voice_name_lower"]
+            ref_codes = artifacts["ref_code"]
+            if mode == "icl" and voice in cached_voices and ref_codes is not None:
+                artifacts["ref_context_cache_key"] = codec_reference_cache_key(
+                    voice, ref_codes[-self.stream_ref_context_frames :]
+                )
             key = self._speaker_cache.make_cache_key(
-                profile["voice_name_lower"],
+                voice,
                 model_type=f"qwen3_tts_{mode}",
                 created_at=0,
             )
@@ -845,6 +857,7 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
                 full_prompt_embeds, tailing_text_hidden, ref_code_len, ref_code = (
                     self._prompt_builder.build_prompt_embeds(task_type=task_type, info_dict=info_dict)
                 )
+                reference_cache_key = info_dict.pop(STREAM_REFERENCE_CACHE_KEY, None)
                 prompt_embeds_buffer = full_prompt_embeds.detach()
                 if not bool(getattr(self, "_use_v2_model_runner", False)):
                     prompt_embeds_buffer = prompt_embeds_buffer.to("cpu")
@@ -863,6 +876,8 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
                     if not bool(getattr(self, "_use_v2_model_runner", False)):
                         ref_code_buffer = ref_code_buffer.to("cpu")
                     info_update.setdefault("codes", {})["ref"] = ref_code_buffer.contiguous()
+                    if isinstance(reference_cache_key, str):
+                        info_update["meta"]["ref_context_cache_key"] = reference_cache_key
                     # The eager output scans for unpublished ref codes only while some are pending.
                     self._ref_codes_pending = True
                 if ref_code_len is not None:
@@ -1509,6 +1524,12 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         if not isinstance(ref, torch.Tensor) or not ref.numel():
             return None
         return ref.reshape(-1, int(self.talker_config.num_code_groups))[-self.stream_ref_context_frames :]
+
+    def get_npu_stream_reference(self, info: OmniPayload) -> tuple[torch.Tensor, str | None] | None:
+        reference = self.get_stream_ref_context(info)
+        if reference is None:
+            return None
+        return reference, info.get("meta", {}).get("ref_context_cache_key")
 
     def prime_stream_decoder(self, primes: list[tuple[int, torch.Tensor]]) -> None:
         """Prime equal-length reference groups without padding or aliasing live slots."""

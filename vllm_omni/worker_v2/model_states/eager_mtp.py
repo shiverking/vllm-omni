@@ -497,7 +497,15 @@ class EagerMTPState:
             # next replay. Take one batch snapshot before buffering any row.
             owned_codes = codes[:bsz].to(dtype=torch.long, copy=True)
             frames = {req_id: owned_codes[i] for i, (_, _, req_id, _) in enumerate(entries)}
-            pcm = self._chunked_audio.decode(chunk_decoder, frames, ended)
+            references = {}
+            get_reference = getattr(self.owner.model, "get_npu_stream_reference", None)
+            if get_reference is not None:
+                for _, req_idx, req_id, _ in entries:
+                    if req_id not in self._chunked_audio.requests:
+                        ref = get_reference(self.owner.intermediate_buffer.buffers[req_idx])
+                        if ref is not None:
+                            references[req_id] = ref
+            pcm = self._chunked_audio.decode(chunk_decoder, frames, ended, references)
             return self._chunked_output(chunk_decoder, input_batch, pcm)
 
         valid_out.index_copy_(0, last_tokens, valid.to(valid_out.dtype))

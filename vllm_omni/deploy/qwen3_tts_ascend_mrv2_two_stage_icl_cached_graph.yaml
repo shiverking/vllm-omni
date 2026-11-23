@@ -1,0 +1,5 @@
+# MRv2 two-stage control with the same registered-voice Code2Wav cache.
+base_config: qwen3_tts_optimizations_icl_cached_graph.yaml
+platforms:
+  npu:
+    model_runner: v2
