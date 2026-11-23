@@ -81,7 +81,7 @@ class NPUStreamDecoder(nn.Module):
         loaded = holder.load(vllm_config)
         _prepare_npu_decoder_weights(holder.decoder)
         context = int(holder.decoder.config.sliding_window)
-        buckets = sorted(Predictor._parse_positive_int_set(extra.get("code2wav_graph_batch_sizes") or [1]))
+        buckets = sorted(Predictor._parse_positive_int_set(extra.get("code2wav_graph_batch_sizes")))
         max_batch_size = int(extra.get("decode_batch_max_size", max(buckets, default=1)))
         capacity = vllm_config.scheduler_config.max_num_seqs
         if max_batch_size > capacity:
@@ -95,12 +95,15 @@ class NPUStreamDecoder(nn.Module):
             sample_rate=holder.sample_rate,
             max_batch_size=max_batch_size,
         )
+        captured_batches = []
         if segmented:
-            if not buckets or max_batch_size != buckets[-1]:
+            buckets = buckets or [1]
+            if max_batch_size != buckets[-1]:
                 raise ValueError("decode_batch_max_size must match the largest Code2Wav graph bucket")
             mode = "icl" if execution == "npu_graph_icl" else "xvec"
             stream.graphs = NPUGraphDecoderWrapper(stream.decoder, buckets, capture_modes=(mode,))
             stream.graphs.warmup(torch.device(vllm_config.device_config.device))
+            captured_batches = buckets
         elif incremental:
             from vllm_omni.platforms.npu.layers.incremental_codec import NPUIncrementalCodec
 
@@ -110,11 +113,13 @@ class NPUStreamDecoder(nn.Module):
                     slots=capacity,
                     max_batch=max_batch_size,
                     chunk_frames=stream.chunk_frames,
+                    graph_batch_sizes=buckets or None,
                     initial_chunk_frames=(
                         stream.first_chunk_frames if execution == "npu_incremental_icl_graph" else None
                     ),
                     reference_cache_capacity=len(set(reference_cache_voices)),
                 )
+            captured_batches = list(stream.decoder._npu_incremental.graph_batch_sizes)
         if segmented or incremental:
             device = torch.device(vllm_config.device_config.device)
             logger.info(
@@ -129,7 +134,7 @@ class NPUStreamDecoder(nn.Module):
             stream.chunk_frames,
             stream.left_context_frames,
             stream.max_batch_size,
-            buckets if stream.graphs is not None else [],
+            captured_batches,
         )
         return stream, loaded
 

@@ -11,7 +11,7 @@ connectors:
       connector_get_max_wait: 300
       connector_get_max_wait_first_chunk: 3000
       connector_get_sleep_s: 0.01
-      decode_batch_max_size: 32
+      decode_batch_max_size: 8
       initial_codec_chunk_frames: 4
       talker_first_audio: false
       code_predictor_ar_execution: kv_frame
@@ -19,8 +19,7 @@ connectors:
         24, 26, 28, 30, 32]
       code2wav_execution: npu_incremental_icl_graph
       code_predictor_fia_gqa: true
-      code2wav_graph_batch_sizes: [1, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24,
-        26, 28, 30, 32]
+      code2wav_graph_batch_sizes: [1, 2, 4, 8]
     name: SharedMemoryConnector
 model_runner: v2
 platforms:

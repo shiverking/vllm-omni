@@ -42,5 +42,5 @@ stages:
       code_predictor_fia_gqa: true
       code_predictor_graph_batch_sizes: [1, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30, 32]
       code2wav_execution: npu_incremental_icl_graph
-      code2wav_graph_batch_sizes: [1, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30, 32]
-      decode_batch_max_size: 32
+      code2wav_graph_batch_sizes: [1, 2, 4, 8]
+      decode_batch_max_size: 8

@@ -978,6 +978,11 @@ class Qwen3TTSCode2Wav(nn.Module):
         if reference_cache_voices and execution != "npu_incremental_icl_graph":
             raise ValueError("Code2Wav reference state caching requires npu_incremental_icl_graph")
         self._npu_reference_cache_capacity = len(set(reference_cache_voices))
+        self._npu_incremental_graph_batch_sizes = (
+            _get_int_list_config("code2wav_graph_batch_sizes")
+            if execution in ("npu_incremental", "npu_incremental_icl_graph")
+            else None
+        )
         if execution != "baseline":
             if device.type != "npu" or not self._async_chunk:
                 raise ValueError("Code2Wav stateful NPU graphs require async_chunk on NPU")

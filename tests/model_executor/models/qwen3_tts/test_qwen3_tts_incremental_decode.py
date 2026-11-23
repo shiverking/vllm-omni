@@ -1383,13 +1383,17 @@ def test_npu_incremental_codec_icl_replay_matches_continuous_decode(monkeypatch,
         arena.close()
 
 
+@pytest.mark.parametrize("graph_batch_sizes", [None, [1, 2]])
 @torch.inference_mode()
-def test_npu_incremental_codec_reuses_reference_state_without_sharing_request_slots(monkeypatch):
+def test_npu_incremental_codec_reuses_reference_state_without_sharing_request_slots(monkeypatch, graph_batch_sizes):
     from vllm_omni.platforms.npu.layers.incremental_codec import NPUIncrementalCodec
 
     decoder, generator, replays = _make_cpu_incremental_codec_fixture(monkeypatch)
-    cached = NPUIncrementalCodec(decoder, 3, 3, 8, initial_chunk_frames=4, reference_cache_capacity=2)
+    cached = NPUIncrementalCodec(
+        decoder, 3, 3, 8, initial_chunk_frames=4, reference_cache_capacity=2, graph_batch_sizes=graph_batch_sizes
+    )
     uncached = NPUIncrementalCodec(decoder, 3, 3, 8, initial_chunk_frames=4)
+    assert set(cached.graphs) == {(batch, frames) for batch in (graph_batch_sizes or [1, 2, 3]) for frames in (1, 4, 8)}
     prefix_frames = 64
     reference_a, reference_b, reference_c = torch.randint(0, 32, (3, 2, prefix_frames), generator=generator)
     first = torch.randint(0, 32, (3, 2, 4), generator=generator)
@@ -1417,7 +1421,8 @@ def test_npu_incremental_codec_reuses_reference_state_without_sharing_request_sl
 
         replays.clear()
         mixed, live = first_chunks(cached, references, first, keys)
-        assert Counter(replays) == {(1, 8): 8, (3, 4): 1}
+        first_replays = [(2, 4), (1, 4)] if graph_batch_sizes else [(3, 4)]
+        assert replays == [(1, 8)] * 8 + first_replays
         assert len({cache["npu_slot"] for cache in live}) == 3
         check_pcm(mixed[:1], cold[:1])
 
@@ -1428,7 +1433,9 @@ def test_npu_incremental_codec_reuses_reference_state_without_sharing_request_sl
         check_pcm(mixed, expected_first)
 
         order = [2, 1, 0]
+        replays.clear()
         actual = cached.decode_requests(suffix[order], [8] * 3, [live[row] for row in order])
+        assert replays == ([(2, 8), (1, 8)] if graph_batch_sizes else [(3, 8)])
         expected = uncached.decode_requests(suffix[order], [8] * 3, [expected_live[row] for row in order])
         check_pcm(actual, expected)
         for actual_cache, expected_cache in zip(live, expected_live, strict=True):

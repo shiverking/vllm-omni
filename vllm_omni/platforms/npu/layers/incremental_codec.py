@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import time
 from collections import Counter, OrderedDict
+from collections.abc import Iterator
 from types import SimpleNamespace
 
 import torch
@@ -157,11 +158,15 @@ class NPUIncrementalCodec:
         *,
         initial_chunk_frames: int | None = None,
         reference_cache_capacity: int = 0,
+        graph_batch_sizes: list[int] | None = None,
     ) -> None:
         if slots < 1 or max_batch < 1 or chunk_frames < 1:
             raise ValueError("incremental codec slots, batch and chunk frames must be positive")
         if max_batch > slots:
             raise ValueError("incremental codec batch cannot exceed the slot count")
+        batches = tuple(range(1, max_batch + 1)) if graph_batch_sizes is None else tuple(sorted(set(graph_batch_sizes)))
+        if not batches or batches[0] != 1 or batches[-1] > max_batch:
+            raise ValueError("Code2Wav incremental graph buckets must include 1 and fit decode_batch_max_size")
         if initial_chunk_frames is not None and initial_chunk_frames < 1:
             raise ValueError("incremental codec first chunk must be positive")
         if reference_cache_capacity < 0 or (reference_cache_capacity and initial_chunk_frames is None):
@@ -171,7 +176,7 @@ class NPUIncrementalCodec:
             raise ValueError("incremental codec requires a sliding attention window")
         self.decoder = decoder
         self.slots = int(slots)
-        self.max_batch = int(max_batch)
+        self.graph_batch_sizes = batches
         self.chunk_frames = int(chunk_frames)
         self.initial_chunk_frames = initial_chunk_frames
         self.reference_cache_capacity = reference_cache_capacity
@@ -212,13 +217,13 @@ class NPUIncrementalCodec:
         lengths = {1, self.chunk_frames}
         if self.initial_chunk_frames is not None:
             lengths.add(min(self.initial_chunk_frames, self.chunk_frames))
-        for batch in range(1, self.max_batch + 1):
+        for batch in self.graph_batch_sizes:
             for length in sorted(lengths):
                 self._graph(batch, length, capture=True)
         logger.info(
-            "Prepared Qwen3-TTS incremental codec graphs: slots=%d batches=1..%d frames=%s graphs=%d seconds=%.3f",
+            "Prepared Qwen3-TTS incremental codec graphs: slots=%d batches=%s frames=%s graphs=%d seconds=%.3f",
             self.slots,
-            self.max_batch,
+            list(self.graph_batch_sizes),
             sorted(lengths),
             len(self.graphs),
             time.perf_counter() - started,
@@ -347,6 +352,14 @@ class NPUIncrementalCodec:
             return None
         return pieces[0] if len(pieces) == 1 else torch.cat(pieces, dim=-1)
 
+    def _batch_groups(self, indices: list[int]) -> Iterator[list[int]]:
+        # Use exact captured batch sizes without allocating dummy request slots.
+        start = 0
+        for size in reversed(self.graph_batch_sizes):
+            while start + size <= len(indices):
+                yield indices[start : start + size]
+                start += size
+
     @torch.inference_mode()
     def decode_requests(self, codes: torch.Tensor, lengths, caches: list[dict]) -> list[torch.Tensor]:
         if codes.ndim != 3 or codes.shape[0] != len(caches) or len(lengths) != len(caches):
@@ -420,16 +433,14 @@ class NPUIncrementalCodec:
             for index in indices:
                 caches[index]["npu_produced"] = prefix
         for prefix, indices in priming_groups.items():
-            for start in range(0, len(indices), self.max_batch):
-                chosen = indices[start : start + self.max_batch]
+            for chosen in self._batch_groups(indices):
                 slots = [int(caches[index]["npu_slot"]) for index in chosen]
                 reference = codes[chosen, :, :prefix].to(device=self.device, dtype=torch.long)
                 self._decode_same_length(slots, reference, emit=False)
                 for index in chosen:
                     caches[index]["npu_produced"] = prefix
         for length, indices in groups.items():
-            for start in range(0, len(indices), self.max_batch):
-                chosen = indices[start : start + self.max_batch]
+            for chosen in self._batch_groups(indices):
                 slots = [int(caches[index]["npu_slot"]) for index in chosen]
                 if any(prefixes[index] for index in chosen):
                     chosen_codes = torch.stack(
