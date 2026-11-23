@@ -353,6 +353,7 @@ class Qwen3TTSTokenizerV2DecoderAttention(nn.Module):
         attention_mask: torch.Tensor | None,
         past_key_values: Cache | None = None,
         cache_position: torch.LongTensor | None = None,
+        force_eager_attention: bool = False,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         input_shape = hidden_states.shape[:-1]
@@ -371,7 +372,7 @@ class Qwen3TTSTokenizerV2DecoderAttention(nn.Module):
             key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx, cache_kwargs)
 
         attention_interface: Callable = eager_attention_forward
-        if self.config._attn_implementation != "eager":
+        if not force_eager_attention and self.config._attn_implementation != "eager":
             attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
 
         attn_output, attn_weights = attention_interface(
@@ -917,6 +918,13 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
         # CUDA Graph support
         self._cudagraph_enabled = False
         self._cudagraph_wrapper = None
+        self._npu_incremental = None
+
+    def _apply(self, fn: Callable[[torch.Tensor], torch.Tensor], recurse: bool = True):
+        if self._npu_incremental is not None:
+            self._npu_incremental.close()
+            self._npu_incremental = None
+        return super()._apply(fn, recurse=recurse)
 
     def model_local_kv_specs(self):
         """Declare this decoder's attention KV.
@@ -954,6 +962,21 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
         window = int(getattr(config, "sliding_window", 0) or 0)
         if window <= 1:
             return []
+
+        if self._npu_incremental is not None:
+            return [
+                spec_from_hf_config(
+                    config,
+                    name="npu_codec_incremental_slots",
+                    dtype=dtype,
+                    physical_capacity_positions=window - 1,
+                    capacity_source=f"sliding_window({window}) - 1",
+                    scope=ModelLocalKVScope.MODEL,
+                    rows=RowDriver.FIXED,
+                    rows_fixed=self._npu_incremental.slots,
+                    allocation_note="per-slot attention KV retained across incremental chunks",
+                )
+            ]
 
         specs = []
         wrapper = getattr(self, "_cudagraph_wrapper", None)
@@ -1329,6 +1352,9 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
         chunk_size=300,
         left_context_size=25,
     ):
+        incremental = getattr(self, "_npu_incremental", None)
+        if caches is not None and incremental is not None:
+            return incremental.decode_requests(codes, [codes.shape[-1]], [caches])[0][None, None]
         # Use CUDA graph if enabled
         npu_wrapper = getattr(self, "_npugraph_wrapper", None)
         if npu_wrapper is not None:
@@ -1661,6 +1687,9 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
         left_context_size=25,
         max_batch_size=0,
     ):
+        incremental = getattr(self, "_npu_incremental", None)
+        if caches is not None and incremental is not None:
+            return incremental.decode_requests(codes, lengths, caches)
         npu_wrapper = getattr(self, "_npugraph_wrapper", None)
         if npu_wrapper is not None:
             return npu_wrapper.batched_chunked_decode_with_cudagraph(

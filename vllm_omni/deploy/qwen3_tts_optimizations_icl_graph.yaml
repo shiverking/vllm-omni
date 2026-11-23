@@ -1,6 +1,6 @@
-# Base ICL Code2Wav graph preset. Code Predictor and chunk settings follow the optimized preset.
-base_config: qwen3_tts_optimizations_on.yaml
+# Base ICL using the incremental Code2Wav graph adapted to the configured chunks.
+base_config: qwen3_tts_optimizations_icl_eager.yaml
 connectors:
   connector_of_shared_memory:
     extra:
-      code2wav_execution: npu_graph_icl
+      code2wav_execution: npu_incremental_icl_graph

@@ -399,8 +399,14 @@ class Qwen3TTSCode2Wav(nn.Module):
 
     def on_requests_finished(self, finished_req_ids: set[str] | list[str]) -> None:
         for req_id in finished_req_ids:
-            self._decoder_state_cache.pop(req_id, None)
+            self._drop_decoder_state(req_id)
             self._rho_stats.on_request_finished(req_id)
+
+    def _drop_decoder_state(self, req_id: str) -> None:
+        state = self._decoder_state_cache.pop(req_id, None)
+        incremental = getattr(self.decoder, "_npu_incremental", None)
+        if state is not None and incremental is not None and "npu_slot" in state:
+            incremental.release(state["npu_slot"])
 
     def log_decode_batch_stats(self) -> None:
         if not self._batch_stats_enabled or self._batch_stats_requests == 0:
@@ -614,7 +620,7 @@ class Qwen3TTSCode2Wav(nn.Module):
                 strict=False,
             ):
                 if req_id is not None and (finished or segment_finished):
-                    self._decoder_state_cache.pop(req_id, None)
+                    self._drop_decoder_state(req_id)
                     self._rho_stats.on_boundary(req_id, finished=finished, segment_finished=segment_finished)
             return OmniOutput(
                 text_hidden_states=None,
@@ -730,7 +736,7 @@ class Qwen3TTSCode2Wav(nn.Module):
             strict=False,
         ):
             if req_id is not None and (finished or segment_finished):
-                self._decoder_state_cache.pop(req_id, None)
+                self._drop_decoder_state(req_id)
                 self._rho_stats.on_boundary(req_id, finished=finished, segment_finished=segment_finished)
 
         return OmniOutput(
@@ -956,13 +962,15 @@ class Qwen3TTSCode2Wav(nn.Module):
 
         settings = extra_cfg if isinstance(extra_cfg, dict) else {}
         execution = settings.get("code2wav_execution", "baseline")
-        if execution not in ("baseline", "npu_graph", "npu_graph_icl"):
+        if execution not in ("baseline", "npu_graph", "npu_graph_icl", "npu_incremental", "npu_incremental_icl_graph"):
             raise ValueError(f"Unsupported code2wav_execution: {execution}")
+        self._code2wav_execution = execution
         if execution != "baseline":
             if device.type != "npu" or not self._async_chunk:
                 raise ValueError("Code2Wav stateful NPU graphs require async_chunk on NPU")
             if not getattr(model_cfg, "enforce_eager", False):
                 raise ValueError("Set Stage 1 enforce_eager=true: Code2Wav owns the NPU graphs")
+        if execution in ("npu_graph", "npu_graph_icl"):
             from .npu_segmented_graph_wrapper import NPUGraphDecoderWrapper
 
             buckets = _get_int_list_config("code2wav_graph_batch_sizes") or [1, 2, 4]

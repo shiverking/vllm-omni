@@ -24,6 +24,7 @@ from vllm_omni.model_executor.models.qwen3_tts.tokenizer_12hz.configuration_qwen
 from vllm_omni.model_executor.models.qwen3_tts.tokenizer_12hz.modeling_qwen3_tts_tokenizer_v2 import (
     _CONV_CONTEXT_FRAME,
     _DOWNSTREAM_CONTEXT_FRAME,
+    EuclideanCodebook,
     Qwen3TTSTokenizerV2Decoder,
     Qwen3TTSTokenizerV2DecoderTransformerModel,
 )
@@ -1270,6 +1271,124 @@ def test_npu_icl_replays_padded_prefix_and_commits_only_real_rows(monkeypatch):
         ):
             torch.testing.assert_close(actual_layer.keys, expected_layer.keys, atol=1e-5, rtol=1e-4)
             torch.testing.assert_close(actual_layer.values, expected_layer.values, atol=1e-5, rtol=1e-4)
+
+
+@pytest.mark.parametrize("initial_chunk_frames", [None, 4])
+@torch.inference_mode()
+def test_npu_incremental_codec_icl_replay_matches_continuous_decode(monkeypatch, initial_chunk_frames):
+    from vllm_omni.platforms.npu.layers.incremental_codec import NPUIncrementalCodec, _ShapeGraph
+
+    generator = torch.Generator().manual_seed(9068)
+    decoder = _make_small_decoder()
+    for module in decoder.modules():
+        if isinstance(module, EuclideanCodebook):
+            module.embedding_sum.normal_(generator=generator)
+        elif isinstance(module, (nn.Conv1d, nn.ConvTranspose1d, nn.Linear)):
+            module.weight.uniform_(-0.17, 0.17, generator=generator)
+
+    replays = []
+
+    def mock_capture(shape, **_kwargs):
+        shape.output = shape.codes.new_empty(
+            (shape.batch, 1, shape.length * decoder.total_upsample), dtype=decoder.dtype
+        )
+
+        def replay():
+            replays.append((shape.batch, shape.length))
+            shape.output.copy_(shape.compute())
+
+        shape.graph = SimpleNamespace(replay=replay, reset=lambda: None)
+
+    monkeypatch.setattr(
+        torch,
+        "npu",
+        SimpleNamespace(
+            Stream=lambda **_kwargs: None,
+            graph_pool_handle=object,
+            is_current_stream_capturing=lambda: False,
+            synchronize=lambda: None,
+        ),
+        raising=False,
+    )
+    monkeypatch.setattr(_ShapeGraph, "capture", mock_capture)
+    arena = NPUIncrementalCodec(decoder, 2, 2, 8, initial_chunk_frames=initial_chunk_frames)
+
+    def unexpected_capture(*_args, **_kwargs):
+        pytest.fail("a live partial chunk captured a new graph")
+
+    monkeypatch.setattr(_ShapeGraph, "capture", unexpected_capture)
+    captured_lengths = {1, 8} if initial_chunk_frames is None else {1, 4, 8}
+    assert set(arena.graphs) == {(batch, frames) for batch in (1, 2) for frames in captured_lengths}
+
+    # Both requests cross the sliding-window boundary. Their reference prefixes
+    # differ, but the generated first chunks and regular suffixes can batch.
+    prefixes = (53, 72)
+    codes = torch.randint(0, 32, (2, 2, prefixes[-1] + 31), generator=generator)
+    caches = [{"prefix_frames": prefix} for prefix in prefixes]
+    offsets = [0, 0]
+    chunks = [[], []]
+
+    def submit(order, lengths):
+        batched = codes.new_zeros((len(order), codes.shape[1], max(lengths)))
+        for row, (index, length) in enumerate(zip(order, lengths, strict=True)):
+            batched[row, :, :length] = codes[index, :, offsets[index] : offsets[index] + length]
+        outputs = arena.decode_requests(batched, lengths, [caches[index] for index in order])
+        for index, length, waveform in zip(order, lengths, outputs, strict=True):
+            remaining_prefix = max(0, prefixes[index] - offsets[index])
+            assert waveform.numel() == max(0, length - remaining_prefix) * decoder.total_upsample
+            offsets[index] += length
+            chunks[index].append(waveform)
+
+    try:
+        dummy = {"_is_dummy_run": True}
+        (dummy_output,) = arena.decode_requests(codes[:1, :, :1], [1], [dummy])
+        torch.testing.assert_close(dummy_output, decoder(codes[:1, :, :1])[0, 0])
+        assert "npu_slot" not in dummy
+        assert not replays
+
+        submit((0, 1), (prefixes[0] + 4, prefixes[1] + 4))
+        if initial_chunk_frames is not None:
+            assert (2, 4) in replays
+        first_waveform = chunks[0][0].clone()
+        for order in ((1, 0), (0, 1), (1, 0)):
+            submit(order, (8, 8))
+        submit((0, 1), (3, 0))
+        assert (2, 8) in replays
+        assert torch.equal(chunks[0][0], first_waveform)
+
+        for row, cache in enumerate(caches):
+            end = offsets[row]
+            assert arena.frames[cache["npu_slot"]].item() == end == cache["npu_produced"]
+            expected = decoder(codes[row : row + 1, :, :end])[0, 0, prefixes[row] * decoder.total_upsample :]
+            assert expected.abs().max().item() > 1e-4
+            torch.testing.assert_close(torch.cat(chunks[row]), expected, atol=1e-5, rtol=1e-4)
+
+        released = caches[0]["npu_slot"]
+        arena.release(released)
+        assert all(not buffer[released].count_nonzero() for buffer in arena.buffers)
+        assert arena.frames[caches[1]["npu_slot"]].item() == offsets[1]
+        replacement = {"prefix_frames": prefixes[0]}
+        length = prefixes[0] + 4
+        (repeated,) = arena.decode_requests(codes[:1, :, :length], [length], [replacement])
+        assert replacement["npu_slot"] == released
+        torch.testing.assert_close(repeated, first_waveform, atol=1e-5, rtol=1e-4)
+    finally:
+        arena.close()
+
+
+def test_code2wav_finished_requests_release_incremental_slots():
+    released = []
+    model = Qwen3TTSCode2Wav.__new__(Qwen3TTSCode2Wav)
+    nn.Module.__init__(model)
+    model.decoder = SimpleNamespace(_npu_incremental=SimpleNamespace(release=released.append))
+    model._rho_stats = _SegmentRhoTracker(enabled=False)
+    model._decoder_state_cache = {"done": {"npu_slot": 1}, "retained": {"npu_slot": 0}, "dummy": {}}
+
+    model.on_requests_finished(["done", "dummy", "unknown"])
+    model.on_requests_finished(["done"])
+
+    assert released == [1]
+    assert model._decoder_state_cache == {"retained": {"npu_slot": 0}}
 
 
 def test_missing_graph_phase_falls_back_instead_of_returning_empty(monkeypatch):

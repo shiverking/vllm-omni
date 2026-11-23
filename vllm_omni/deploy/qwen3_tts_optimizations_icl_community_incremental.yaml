@@ -1,0 +1,6 @@
+# Base ICL using the backported community incremental Code2Wav decoder.
+base_config: qwen3_tts_optimizations_icl_eager.yaml
+connectors:
+  connector_of_shared_memory:
+    extra:
+      code2wav_execution: npu_incremental
