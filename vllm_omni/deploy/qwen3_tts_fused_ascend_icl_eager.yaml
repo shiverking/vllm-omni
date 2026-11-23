@@ -1,2 +1,3 @@
 # Base ICL single-stage control with batched eager Code2Wav.
 base_config: qwen3_tts_fused_ascend_eager_codec.yaml
+custom_voice_dir: /cache/y00899301/qwen3_tts_base_voices

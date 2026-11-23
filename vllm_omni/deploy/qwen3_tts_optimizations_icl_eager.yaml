@@ -1,5 +1,6 @@
 # Base ICL batched eager control with the same scheduling as the graph variants.
 base_config: qwen3_tts_optimizations_codec_baseline.yaml
+custom_voice_dir: /cache/y00899301/qwen3_tts_base_voices
 platforms:
   npu:
     stages:
