@@ -11,6 +11,7 @@ import torch
 import torch.nn as nn
 from transformers.cache_utils import DynamicCache
 
+from vllm_omni.model_executor.models.qwen3_tts.npu_segmented_graph_wrapper import NPUGraphDecoderWrapper
 from vllm_omni.model_executor.models.qwen3_tts.qwen3_tts_code2wav import (
     Qwen3TTSCode2Wav,
     _SegmentRhoTracker,
@@ -1059,6 +1060,83 @@ def test_xvec_delta_chunks_route_through_all_reachable_graph_phases(monkeypatch)
 def test_graph_batch_overflow_splits_at_largest_bucket():
     assert CUDAGraphDecoderWrapper._split_for_graph_buckets(16, {1, 2, 4, 8}) == [(0, 8), (8, 16)]
     assert CUDAGraphDecoderWrapper._split_for_graph_buckets(10, {1, 2, 4, 8}) == [(0, 8), (8, 10)]
+
+
+def test_npu_graph_router_batches_icl_first_and_suffix_chunks(monkeypatch):
+    calls = []
+
+    def route(name, caches):
+        calls.append((name, [cache["row"] for cache in caches]))
+        return [torch.full((1, 1, 1), cache["row"]) for cache in caches]
+
+    def icl_first(codes, caches, *, prefix_length, initial_chunk_frames):
+        assert (prefix_length, initial_chunk_frames) == (72, 4)
+        assert [code.shape[-1] for code in codes] == [52, 36]
+        return route("icl first eager", caches)
+
+    def icl_suffix(mode, target, _codes, caches, new_frames, *, prefix_length, codec_chunk_frames, transitions_by_mode):
+        assert mode == "icl"
+        assert (prefix_length, codec_chunk_frames) == (72, 8)
+        assert transitions_by_mode[mode][target] == (4 if target == 12 else 72)
+        assert new_frames == [8, 8]
+        return route(f"icl suffix eager {target}", caches)
+
+    decoder = _decoder_stub(
+        config=SimpleNamespace(num_quantizers=2, sliding_window=72),
+        _initial_codec_chunk_frames=4,
+        _incremental_chunk_frames=8,
+        _is_suffix_cache_rolling=lambda previous, cached: previous >= 72 and cached == 72,
+        _decode_icl_prefix_eager_batch=icl_first,
+        _decode_suffix_eager_batch=icl_suffix,
+    )
+    wrapper = NPUGraphDecoderWrapper(decoder, capture_batch_sizes=[1, 2, 4])
+    monkeypatch.setattr(wrapper, "_is_capturing", lambda: False)
+    monkeypatch.setattr(wrapper, "_decode_xvec_prefix_batch", lambda _codes, caches: route("xvec first graph", caches))
+    monkeypatch.setattr(
+        CUDAGraphDecoderWrapper,
+        "_decode_suffix_batch",
+        lambda _self, mode, target, _codes, caches, _lengths: route(f"{mode} suffix graph {target}", caches),
+    )
+    monkeypatch.setattr(
+        wrapper, "_decode_request_fallback", lambda _codes, cache: route("individual eager", [cache])[0]
+    )
+
+    def suffix_cache(prefix_frames, previous, retained):
+        decoded_prefix = 72 if prefix_frames else 0
+        return {
+            "prefix_frames": prefix_frames,
+            "decoder_prefix_frames": decoded_prefix,
+            "past_key_values": SimpleNamespace(get_seq_length=lambda: decoded_prefix),
+            "suffix_frames": previous,
+            "suffix_quantized": torch.zeros(1, 2, retained),
+        }
+
+    caches = [
+        {"prefix_frames": 48},
+        {"prefix_frames": 0},
+        suffix_cache(48, 4, 4),
+        suffix_cache(32, 76, 72),
+        {"prefix_frames": 32},
+        suffix_cache(0, 4, 4),
+        suffix_cache(32, 4, 4),
+        suffix_cache(48, 76, 72),
+        {"prefix_frames": 48},  # Short first chunk requires individual eager.
+    ]
+    for row, cache in enumerate(caches):
+        cache["row"] = row
+    codes = [torch.zeros(1, 2, length, dtype=torch.long) for length in (52, 4, 8, 8, 36, 8, 8, 8, 49)]
+
+    outputs = wrapper._batched_request_decode(codes, caches)
+
+    assert [output.item() for output in outputs] == list(range(len(caches)))
+    assert calls == [
+        ("icl first eager", [0, 4]),
+        ("xvec first graph", [1]),
+        ("icl suffix eager 12", [2, 6]),
+        ("icl suffix eager 80", [3, 7]),
+        ("xvec suffix graph 12", [5]),
+        ("individual eager", [8]),
+    ]
 
 
 def test_missing_graph_phase_falls_back_instead_of_returning_empty(monkeypatch):

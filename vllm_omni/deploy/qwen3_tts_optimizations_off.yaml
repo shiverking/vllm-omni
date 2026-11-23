@@ -3,14 +3,14 @@ async_chunk: true
 connectors:
   connector_of_shared_memory:
     extra:
-      codec_chunk_frames: 25
+      codec_chunk_frames: 8
       codec_left_context_frames: 72
       codec_streaming: true
       connector_get_max_wait: 300
       connector_get_max_wait_first_chunk: 3000
       connector_get_sleep_s: 0.01
       decode_batch_max_size: 32
-      initial_codec_chunk_frames: 1
+      initial_codec_chunk_frames: 4
       talker_first_audio: false
       code_predictor_ar_execution: stock
       code_predictor_graph_batch_sizes: [1, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22,

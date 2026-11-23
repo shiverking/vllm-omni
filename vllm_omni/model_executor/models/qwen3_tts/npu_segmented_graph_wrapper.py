@@ -1,12 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Prefixless Code2Wav NPU graphs with independent request caches."""
+"""Code2Wav NPU graphs for prefixless requests and batched eager for ICL."""
 
 from __future__ import annotations
 
 import threading
 import time
 from contextlib import contextmanager
+from functools import partial
 from unittest.mock import patch
 
 import torch
@@ -111,8 +112,17 @@ class NPUGraphDecoderWrapper(CUDAGraphDecoderWrapper):
         )
 
     def _decode_suffix_batch(self, mode, target_frames, codes_list, request_caches, new_frames_list):
-        if mode != "xvec":
-            return None
+        if mode == "icl":
+            return self.decoder._decode_suffix_eager_batch(
+                mode,
+                target_frames,
+                codes_list,
+                request_caches,
+                new_frames_list,
+                prefix_length=self.prefix_length,
+                codec_chunk_frames=self.codec_chunk_frames,
+                transitions_by_mode={"icl": self._icl_previous_frames_by_target},
+            )
         expected = target_frames - self._transitions_for_mode(mode)[target_frames]
         exact = [i for i, n in enumerate(new_frames_list) if n == expected]
         if len(exact) != len(codes_list):
@@ -160,8 +170,15 @@ class NPUGraphDecoderWrapper(CUDAGraphDecoderWrapper):
             prefix_length=self.prefix_length,
             initial_chunk_frames=self.initial_chunk_frames,
             codec_chunk_frames=self.codec_chunk_frames,
-            transitions_by_mode={"icl": {}, "xvec": self._xvec_previous_frames_by_target},
-            decode_icl_prefix_batch=None,
+            transitions_by_mode={
+                "icl": self._icl_previous_frames_by_target,
+                "xvec": self._xvec_previous_frames_by_target,
+            },
+            decode_icl_prefix_batch=partial(
+                self.decoder._decode_icl_prefix_eager_batch,
+                prefix_length=self.prefix_length,
+                initial_chunk_frames=self.initial_chunk_frames,
+            ),
             decode_xvec_prefix_batch=self._decode_xvec_prefix_batch,
             decode_suffix_batch=self._decode_suffix_batch,
             decode_fallback=self._decode_request_fallback,

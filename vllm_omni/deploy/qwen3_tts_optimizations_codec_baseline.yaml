@@ -1,0 +1,6 @@
+# Code2Wav-only control for the optimized preset.
+base_config: qwen3_tts_optimizations_on.yaml
+connectors:
+  connector_of_shared_memory:
+    extra:
+      code2wav_execution: baseline
