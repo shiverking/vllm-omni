@@ -1,7 +1,36 @@
-# Base ICL single-stage incremental Code2Wav graph.
-base_config: qwen3_tts_fused_ascend_icl_eager.yaml
+# Qwen3-TTS v0.32.0 Ascend BF16, 16 codebooks. V2 single-stage, incremental ICL Code2Wav graphs.
+custom_voice_dir: /cache/y00899301/precomputed_voices
+pipeline: qwen3_tts_fused
+model_runner: v2
+async_chunk: true
+
 stages:
   - stage_id: 0
+    devices: "0"
+    dtype: bfloat16
+    max_num_seqs: 32
+    max_num_batched_tokens: 512
+    max_model_len: 4096
+    gpu_memory_utilization: 0.6
+    trust_remote_code: true
+    enable_prefix_caching: false
+    async_scheduling: true
+    enforce_eager: false
+    silence_ban_frames: 0
+    compilation_config:
+      cudagraph_mode: PIECEWISE
+      cudagraph_capture_sizes: [1, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30, 32]
+    default_sampling_params:
+      temperature: 0.9
+      top_k: 50
+      max_tokens: 4096
+      min_tokens: 2
+      repetition_penalty: 1.05
+    subtalker_sampling_params:
+      do_sample: true
+      temperature: 0.9
+      top_k: 50
+      top_p: 1.0
     additional_config:
       talker_stream_decode: true
       talker_stream_first_audio: false
