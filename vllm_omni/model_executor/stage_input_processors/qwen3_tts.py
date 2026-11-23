@@ -3,6 +3,7 @@
 
 """Stage input processor for Qwen3-TTS: Talker -> Code2Wav."""
 
+import hashlib
 import math
 import time
 from collections.abc import Mapping
@@ -414,6 +415,7 @@ def talker2code2wav_async_chunk(
     ref_context_size = 0
     ref_context_request_id: str | None = None
     ref_context_included = False
+    ref_context_cache_key: str | None = None
     if isinstance(ref_code, torch.Tensor) and ref_code.numel() > 0:
         if ref_code.ndim == 1:
             num_quantizers = len(window_frames[0])
@@ -442,10 +444,18 @@ def talker2code2wav_async_chunk(
         if ref_context_size > 0:
             if emitted_chunks <= 0:
                 ref_context_request_id = request_id
-                ref_frames = list(ref_context.to(device="cpu").unbind(0))
-                window_frames = ref_frames + window_frames
+                ref_cpu = ref_context.to(device="cpu")
+                window_frames = list(ref_cpu.unbind(0)) + window_frames
                 ref_context_included = True
                 left_context_size = ref_context_size
+                cache_voices = cfg.get("code2wav_reference_cache_voices")
+                if cache_voices:
+                    entries = getattr(additional_information, "entries", None)
+                    entry = entries.get("precomputed_icl_voice") if isinstance(entries, dict) else None
+                    voices = getattr(entry, "list_data", None)
+                    if voices and voices[0] in cache_voices:
+                        digest = hashlib.sha256(ref_cpu.contiguous().numpy().tobytes()).hexdigest()
+                        ref_context_cache_key = f"{voices[0]}:{ref_context_size}:{ref_cpu.shape[1]}:{digest}"
 
     # Keep the codebook-major CPU wire format without extracting every
     # tensor element as a Python scalar. Legacy buffered frames can be lists.
@@ -470,6 +480,7 @@ def talker2code2wav_async_chunk(
         meta.ref_context_size = ref_context_size
         meta.ref_context_request_id = ref_context_request_id
         meta.ref_context_included = ref_context_included
+        meta.ref_context_cache_key = ref_context_cache_key
     request_text_tokens = _precomputed_assistant_text_tokens(request)
     if request_text_tokens is not None:
         meta.request_text_tokens = request_text_tokens

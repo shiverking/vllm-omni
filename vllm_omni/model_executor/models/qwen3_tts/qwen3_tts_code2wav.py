@@ -485,6 +485,7 @@ class Qwen3TTSCode2Wav(nn.Module):
         request_state_ids: list[str | None] = [None] * len(request_ids_list)
         ref_context_request_ids: list[str | None] = [None] * len(request_ids_list)
         ref_context_included = [False] * len(request_ids_list)
+        ref_context_cache_keys: list[str | None] = [None] * len(request_ids_list)
         finished_flags = [False] * len(request_ids_list)
         request_text_tokens = [0] * len(request_ids_list)
 
@@ -529,6 +530,8 @@ class Qwen3TTSCode2Wav(nn.Module):
                     request_state_ids[i] = _meta_str(meta["request_id"])
                 if "ref_context_included" in meta:
                     ref_context_included[i] = _meta_bool(meta["ref_context_included"])
+                if "ref_context_cache_key" in meta:
+                    ref_context_cache_keys[i] = _meta_str(meta["ref_context_cache_key"])
                 if "finished" in meta:
                     finished_flags[i] = _meta_bool(meta["finished"])
                 if "request_text_tokens" in meta:
@@ -600,6 +603,8 @@ class Qwen3TTSCode2Wav(nn.Module):
                 if state_req_id.startswith(_DUMMY_REQUEST_ID):
                     state["_is_dummy_run"] = True
                 if ref_ctx_frames > 0:
+                    if is_new_state and ref_context_included[i] and ref_context_cache_keys[i]:
+                        state["npu_reference_cache_key"] = ref_context_cache_keys[i]
                     cached_prefix_frames = state.setdefault("prefix_frames", ref_ctx_frames)
                     if cached_prefix_frames == 0:
                         state["prefix_frames"] = ref_ctx_frames
@@ -965,6 +970,14 @@ class Qwen3TTSCode2Wav(nn.Module):
         if execution not in ("baseline", "npu_graph", "npu_graph_icl", "npu_incremental", "npu_incremental_icl_graph"):
             raise ValueError(f"Unsupported code2wav_execution: {execution}")
         self._code2wav_execution = execution
+        reference_cache_voices = settings.get("code2wav_reference_cache_voices", ())
+        if not isinstance(reference_cache_voices, (list, tuple)) or any(
+            not isinstance(voice, str) or not voice for voice in reference_cache_voices
+        ):
+            raise ValueError("code2wav_reference_cache_voices must be a list of voice names")
+        if reference_cache_voices and execution != "npu_incremental_icl_graph":
+            raise ValueError("Code2Wav reference state caching requires npu_incremental_icl_graph")
+        self._npu_reference_cache_capacity = len(set(reference_cache_voices))
         if execution != "baseline":
             if device.type != "npu" or not self._async_chunk:
                 raise ValueError("Code2Wav stateful NPU graphs require async_chunk on NPU")

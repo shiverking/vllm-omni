@@ -1273,10 +1273,8 @@ def test_npu_icl_replays_padded_prefix_and_commits_only_real_rows(monkeypatch):
             torch.testing.assert_close(actual_layer.values, expected_layer.values, atol=1e-5, rtol=1e-4)
 
 
-@pytest.mark.parametrize("initial_chunk_frames", [None, 4])
-@torch.inference_mode()
-def test_npu_incremental_codec_icl_replay_matches_continuous_decode(monkeypatch, initial_chunk_frames):
-    from vllm_omni.platforms.npu.layers.incremental_codec import NPUIncrementalCodec, _ShapeGraph
+def _make_cpu_incremental_codec_fixture(monkeypatch):
+    from vllm_omni.platforms.npu.layers.incremental_codec import _ShapeGraph
 
     generator = torch.Generator().manual_seed(9068)
     decoder = _make_small_decoder()
@@ -1311,6 +1309,15 @@ def test_npu_incremental_codec_icl_replay_matches_continuous_decode(monkeypatch,
         raising=False,
     )
     monkeypatch.setattr(_ShapeGraph, "capture", mock_capture)
+    return decoder, generator, replays
+
+
+@pytest.mark.parametrize("initial_chunk_frames", [None, 4])
+@torch.inference_mode()
+def test_npu_incremental_codec_icl_replay_matches_continuous_decode(monkeypatch, initial_chunk_frames):
+    from vllm_omni.platforms.npu.layers.incremental_codec import NPUIncrementalCodec, _ShapeGraph
+
+    decoder, generator, replays = _make_cpu_incremental_codec_fixture(monkeypatch)
     arena = NPUIncrementalCodec(decoder, 2, 2, 8, initial_chunk_frames=initial_chunk_frames)
 
     def unexpected_capture(*_args, **_kwargs):
@@ -1374,6 +1381,81 @@ def test_npu_incremental_codec_icl_replay_matches_continuous_decode(monkeypatch,
         torch.testing.assert_close(repeated, first_waveform, atol=1e-5, rtol=1e-4)
     finally:
         arena.close()
+
+
+@torch.inference_mode()
+def test_npu_incremental_codec_reuses_reference_state_without_sharing_request_slots(monkeypatch):
+    from vllm_omni.platforms.npu.layers.incremental_codec import NPUIncrementalCodec
+
+    decoder, generator, replays = _make_cpu_incremental_codec_fixture(monkeypatch)
+    cached = NPUIncrementalCodec(decoder, 3, 3, 8, initial_chunk_frames=4, reference_cache_capacity=2)
+    uncached = NPUIncrementalCodec(decoder, 3, 3, 8, initial_chunk_frames=4)
+    prefix_frames = 64
+    reference_a, reference_b, reference_c = torch.randint(0, 32, (3, 2, prefix_frames), generator=generator)
+    first = torch.randint(0, 32, (3, 2, 4), generator=generator)
+    suffix = torch.randint(0, 32, (3, 2, 8), generator=generator)
+    keys = ("reference-a", "reference-b", "reference-a")
+    references = torch.stack((reference_a, reference_b, reference_a))
+
+    def first_chunks(arena, refs, generated, cache_keys):
+        codes = torch.cat((refs, generated), dim=-1)
+        request_caches = [{"prefix_frames": prefix_frames, "npu_reference_cache_key": key} for key in cache_keys]
+        return arena.decode_requests(codes, [prefix_frames + 4] * len(cache_keys), request_caches), request_caches
+
+    def check_pcm(outputs, expected):
+        for waveform, reference in zip(outputs, expected, strict=True):
+            torch.testing.assert_close(waveform, reference, atol=1e-5, rtol=1e-4)
+
+    try:
+        cold, cold_caches = first_chunks(cached, references[[0, 2]], first[[0, 0]], (keys[0], keys[0]))
+        assert Counter(replays) == {(1, 8): 8, (2, 4): 1}
+        check_pcm(cold[:1], cold[1:2])
+        assert list(cached._reference_states) == [keys[0]]
+        saved = [tensor.clone() for tensor in cached._reference_states[keys[0]]]
+        for cache in cold_caches:
+            cached.release(cache["npu_slot"])
+
+        replays.clear()
+        mixed, live = first_chunks(cached, references, first, keys)
+        assert Counter(replays) == {(1, 8): 8, (3, 4): 1}
+        assert len({cache["npu_slot"] for cache in live}) == 3
+        check_pcm(mixed[:1], cold[:1])
+
+        replays.clear()
+        expected_first, expected_live = first_chunks(uncached, references, first, keys)
+        assert Counter(replays) == {(3, 8): 8, (3, 4): 1}
+        assert not uncached._reference_states
+        check_pcm(mixed, expected_first)
+
+        order = [2, 1, 0]
+        actual = cached.decode_requests(suffix[order], [8] * 3, [live[row] for row in order])
+        expected = uncached.decode_requests(suffix[order], [8] * 3, [expected_live[row] for row in order])
+        check_pcm(actual, expected)
+        for actual_cache, expected_cache in zip(live, expected_live, strict=True):
+            assert actual_cache["npu_produced"] == expected_cache["npu_produced"] == prefix_frames + 12
+            for buffer, expected_buffer in zip(cached.buffers, uncached.buffers, strict=True):
+                torch.testing.assert_close(
+                    buffer[actual_cache["npu_slot"]], expected_buffer[expected_cache["npu_slot"]], atol=1e-5, rtol=1e-4
+                )
+        for original, snapshot in zip(saved, cached._reference_states[keys[0]], strict=True):
+            assert torch.equal(original, snapshot)
+
+        for cache in live:
+            cached.release(cache["npu_slot"])
+        replays.clear()
+        _, refreshed = first_chunks(cached, references[:1], first[:1], keys[:1])
+        assert replays == [(1, 4)]
+        cached.release(refreshed[0]["npu_slot"])
+
+        replays.clear()
+        _, new_cache = first_chunks(cached, reference_c.unsqueeze(0), first[:1], ("reference-c",))
+        assert Counter(replays) == {(1, 8): 8, (1, 4): 1}
+        assert list(cached._reference_states) == [keys[0], "reference-c"]
+        cached.release(new_cache[0]["npu_slot"])
+    finally:
+        cached.close()
+        uncached.close()
+    assert not cached._reference_states
 
 
 def test_code2wav_finished_requests_release_incremental_slots():

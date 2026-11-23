@@ -1,0 +1,6 @@
+# Base ICL incremental graphs with reusable Code2Wav state for the two registered voices.
+base_config: qwen3_tts_optimizations_icl_graph.yaml
+connectors:
+  connector_of_shared_memory:
+    extra:
+      code2wav_reference_cache_voices: [uncle_fu_clone, vivian_clone]

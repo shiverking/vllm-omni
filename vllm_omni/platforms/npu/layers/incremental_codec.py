@@ -13,6 +13,7 @@ Backported from vLLM-Omni #9068.
 from __future__ import annotations
 
 import time
+from collections import Counter, OrderedDict
 from types import SimpleNamespace
 
 import torch
@@ -148,7 +149,14 @@ class NPUIncrementalCodec:
     """Slot arena over one decoder. One worker thread owns the buffers."""
 
     def __init__(
-        self, decoder, slots: int, max_batch: int, chunk_frames: int, *, initial_chunk_frames: int | None = None
+        self,
+        decoder,
+        slots: int,
+        max_batch: int,
+        chunk_frames: int,
+        *,
+        initial_chunk_frames: int | None = None,
+        reference_cache_capacity: int = 0,
     ) -> None:
         if slots < 1 or max_batch < 1 or chunk_frames < 1:
             raise ValueError("incremental codec slots, batch and chunk frames must be positive")
@@ -156,6 +164,8 @@ class NPUIncrementalCodec:
             raise ValueError("incremental codec batch cannot exceed the slot count")
         if initial_chunk_frames is not None and initial_chunk_frames < 1:
             raise ValueError("incremental codec first chunk must be positive")
+        if reference_cache_capacity < 0 or (reference_cache_capacity and initial_chunk_frames is None):
+            raise ValueError("reference state caching requires an ICL graph and a nonnegative capacity")
         window = int(getattr(decoder.config, "sliding_window", 0) or 0)
         if window < 2:
             raise ValueError("incremental codec requires a sliding attention window")
@@ -164,6 +174,9 @@ class NPUIncrementalCodec:
         self.max_batch = int(max_batch)
         self.chunk_frames = int(chunk_frames)
         self.initial_chunk_frames = initial_chunk_frames
+        self.reference_cache_capacity = reference_cache_capacity
+        self._reference_states: OrderedDict[str, tuple[torch.Tensor, ...]] = OrderedDict()
+        self._reference_cache_hits: Counter[str] = Counter()
         self.window = window
         self.history = window - 1
         self.upsample = int(decoder.total_upsample)
@@ -242,6 +255,37 @@ class NPUIncrementalCodec:
     def reset(self, slot: int) -> None:
         for buffer in self.buffers:
             buffer[slot].zero_()
+
+    def _prime_cached_reference(self, key: str, slots: list[int], codes: torch.Tensor) -> None:
+        state = self._reference_states.get(key)
+        voice = key.partition(":")[0]
+        if state is None:
+            # A single row fixes the priming shape and avoids duplicate work
+            # when multiple requests for this reference arrive together cold.
+            slot, *slots = slots
+            self.reset(slot)
+            self._decode_same_length([slot], codes.to(device=self.device, dtype=torch.long), emit=False)
+            state = tuple(buffer[slot].clone() for buffer in self.buffers)
+            self._reference_states[key] = state
+            if len(self._reference_states) > self.reference_cache_capacity:
+                self._reference_states.popitem(last=False)
+            logger.info(
+                "Qwen3-TTS Code2Wav reference state cached: voice=%s frames=%d bytes=%d",
+                voice,
+                codes.shape[-1],
+                sum(t.numel() * t.element_size() for t in state),
+            )
+        else:
+            self._reference_states.move_to_end(key)
+        if slots:
+            indices = torch.tensor(slots, dtype=torch.long, device=self.device)
+            for buffer, saved in zip(self.buffers, state, strict=True):
+                # Give Ascend's scatter each row in a regular physical layout.
+                rows = saved.expand(len(slots), *saved.shape).contiguous()
+                buffer.index_copy_(0, indices, rows)
+            if not self._reference_cache_hits[voice]:
+                logger.info("Qwen3-TTS Code2Wav reference state reused: voice=%s slots=%d", voice, len(slots))
+            self._reference_cache_hits[voice] += len(slots)
 
     def _run_module(self, module, hidden, state):
         kind = type(module).__name__
@@ -336,6 +380,7 @@ class NPUIncrementalCodec:
 
         outputs: list[torch.Tensor | None] = [None] * len(caches)
         priming_groups: dict[int, list[int]] = {}
+        cached_priming_groups: dict[str, list[int]] = {}
         groups: dict[int, list[int]] = {}
         for index, cache in enumerate(caches):
             length = int(lengths[index])
@@ -345,15 +390,20 @@ class NPUIncrementalCodec:
             if cache.get("_is_dummy_run"):
                 outputs[index] = self.decoder._forward_exact(codes[index : index + 1, :, :length])[0, 0]
                 continue
+            prefix = prefixes[index]
+            key = cache.get("npu_reference_cache_key") if prefix and self.reference_cache_capacity else None
             slot = cache.get("npu_slot")
             if slot is None:
                 slot = self.alloc()
                 cache["npu_slot"] = slot
-                self.reset(slot)
+                if not key:
+                    self.reset(slot)
                 cache["npu_produced"] = 0
-            prefix = prefixes[index]
             if prefix:
-                priming_groups.setdefault(prefix, []).append(index)
+                if key:
+                    cached_priming_groups.setdefault(key, []).append(index)
+                else:
+                    priming_groups.setdefault(prefix, []).append(index)
             generated = length - prefix
             if generated:
                 groups.setdefault(generated, []).append(index)
@@ -362,6 +412,13 @@ class NPUIncrementalCodec:
 
         # Prime equal-length references independently, then batch generated frames
         # together even when their requests had different reference lengths.
+        for key, indices in cached_priming_groups.items():
+            first = indices[0]
+            prefix = prefixes[first]
+            slots = [int(caches[index]["npu_slot"]) for index in indices]
+            self._prime_cached_reference(key, slots, codes[first : first + 1, :, :prefix])
+            for index in indices:
+                caches[index]["npu_produced"] = prefix
         for prefix, indices in priming_groups.items():
             for start in range(0, len(indices), self.max_batch):
                 chosen = indices[start : start + self.max_batch]
@@ -407,3 +464,5 @@ class NPUIncrementalCodec:
                 if graph.graph is not None:
                     graph.graph.reset()
             self.graphs.clear()
+        self._reference_states.clear()
+        self._reference_cache_hits.clear()

@@ -448,6 +448,8 @@ class Qwen3TTSAdapter(ARTTSAdapter):
                 ref_code_length = profile.get("ref_code_length")
                 if mode == "icl" and ref_code_length:
                     params["ref_code_length"] = [int(ref_code_length)]
+                    if request.speaker_embedding is None and request.x_vector_only_mode is not True:
+                        params["precomputed_icl_voice"] = [voice_lower]
                 logger.info("Using precomputed Qwen3-TTS custom voice profile: %s (mode=%s)", voice_lower, mode)
 
         elif params["task_type"][0] == "CustomVoice":

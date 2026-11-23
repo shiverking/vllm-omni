@@ -93,6 +93,7 @@ def _patched_load_weights(self, weights):
                 slots=slots,
                 max_batch=max_batch,
                 chunk_frames=self.decoder._incremental_chunk_frames,
+                reference_cache_capacity=getattr(self, "_npu_reference_cache_capacity", 0),
                 initial_chunk_frames=(
                     self.decoder._initial_codec_chunk_frames if execution == "npu_incremental_icl_graph" else None
                 ),

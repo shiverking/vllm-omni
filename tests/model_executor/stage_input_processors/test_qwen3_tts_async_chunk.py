@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from vllm_omni.data_entry_keys import to_dict
 from vllm_omni.model_executor.stage_input_processors import (
     qwen3_tts as qwen3_tts_processors,
 )
@@ -80,6 +81,7 @@ def _req(
     non_streaming_mode=None,
     full_utterance_decode=None,
     output_token_ids=None,
+    precomputed_icl_voice=None,
 ):
     entries = {}
     if initial_codec_chunk_frames is not None:
@@ -88,6 +90,8 @@ def _req(
         entries["non_streaming_mode"] = SimpleNamespace(list_data=[non_streaming_mode])
     if full_utterance_decode is not None:
         entries["full_utterance_decode"] = SimpleNamespace(list_data=[full_utterance_decode])
+    if precomputed_icl_voice is not None:
+        entries["precomputed_icl_voice"] = SimpleNamespace(list_data=[precomputed_icl_voice])
     return SimpleNamespace(
         external_req_id=rid,
         is_finished=lambda: finished,
@@ -592,6 +596,70 @@ def test_streaming_ref_code_context_is_bounded_for_batchable_shapes():
     assert len(payload.codes.audio) == _Q * (3 + 4)
     frames = payload.codes.audio.reshape(_Q, -1).transpose(0, 1)
     torch.testing.assert_close(frames[:3], ref_code[-3:])
+
+
+def test_streaming_reference_cache_key_identifies_only_the_voice_and_emitted_reference():
+    tm = _tm(chunk_frames=2, left_context=3, initial_chunk_frames=1)
+    tm.connector.config["extra"]["code2wav_reference_cache_voices"] = ["uncle_fu_clone", "vivian_clone"]
+    reference = torch.arange(1, 5 * _Q + 1).reshape(5, _Q)
+
+    def first(rid, ref, *, voice="uncle_fu_clone", frame=_FRAME):
+        payload = talker2code2wav_async_chunk(
+            transfer_manager=tm,
+            multimodal_output={"codes": {"audio": torch.tensor([frame]), "ref": ref}},
+            request=_req(rid, finished=False, precomputed_icl_voice=voice),
+        )
+        assert payload is not None
+        return payload
+
+    first_payload = first("first", reference)
+    key = first_payload.meta.ref_context_cache_key
+    assert isinstance(key, str) and key
+    assert to_dict(first_payload)["meta"]["ref_context_cache_key"] == key
+    assert first_payload.meta.ref_context_size == 3
+    torch.testing.assert_close(first_payload.codes.audio.reshape(_Q, -1).T[:3], reference[-3:])
+
+    outside_context = reference.clone()
+    outside_context[0, 0] += 1
+    assert first("other-text", outside_context.to(torch.int32), frame=_FRAME[::-1]).meta.ref_context_cache_key == key
+
+    inside_context = reference.clone()
+    inside_context[-1, 0] += 1
+    assert first("other-reference", inside_context).meta.ref_context_cache_key not in (None, key)
+    assert first("other-voice", reference, voice="vivian_clone").meta.ref_context_cache_key not in (None, key)
+
+    tm.put_req_chunk["first"] += 1
+    tm.code_prompt_token_ids["first"].extend([_FRAME[:], _FRAME[:]])
+    followup = talker2code2wav_async_chunk(
+        transfer_manager=tm,
+        multimodal_output={},
+        request=_req("first", finished=False, precomputed_icl_voice="uncle_fu_clone"),
+    )
+    assert followup is not None
+    assert "ref_context_cache_key" not in to_dict(followup)["meta"]
+    assert len(followup.codes.audio) == 2 * _Q
+
+
+@pytest.mark.parametrize(
+    ("marker", "allowed_voices"),
+    [
+        (None, ["uncle_fu_clone", "vivian_clone"]),
+        ("unlisted_clone", ["uncle_fu_clone", "vivian_clone"]),
+        ("uncle_fu_clone", []),
+    ],
+)
+def test_streaming_reference_cache_key_requires_an_allowlisted_precomputed_voice(marker, allowed_voices):
+    tm = _tm(initial_chunk_frames=1)
+    tm.connector.config["extra"]["code2wav_reference_cache_voices"] = allowed_voices
+    payload = talker2code2wav_async_chunk(
+        transfer_manager=tm,
+        multimodal_output={"codes": {"audio": torch.tensor([_FRAME]), "ref": torch.ones((2, _Q), dtype=torch.long)}},
+        request=_req("r", finished=False, precomputed_icl_voice=marker),
+    )
+    assert payload is not None
+    assert payload.meta.ref_context_cache_key is None
+    assert payload.meta.ref_context_included is True
+    assert payload.meta.ref_context_size == 2
 
 
 @pytest.mark.parametrize("tensor_frames", [False, True])

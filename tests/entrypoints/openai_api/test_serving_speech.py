@@ -2555,7 +2555,10 @@ class TestTTSMethods:
         assert params["x_vector_only_mode"] == [False]
         assert params["ref_text"] == ["reference transcript"]
         assert params["ref_code_length"] == [3]
+        assert params["precomputed_icl_voice"] == ["alice"]
         assert "ref_audio" not in params
+        xvec_request = req.model_copy(update={"x_vector_only_mode": True})
+        assert "precomputed_icl_voice" not in speech_server._adapter._build_tts_params(xvec_request)
 
     def test_uploaded_qwen3_voice_wins_over_same_named_precomputed_voice(self, speech_server, tmp_path):
         """Qwen3 uploaded voices should take precedence over same-name precomputed voices."""
@@ -2596,6 +2599,7 @@ class TestTTSMethods:
         assert params["task_type"] == ["Base"]
         assert "voice_clone_prompt" in params
         assert "ref_code_length" not in params
+        assert "precomputed_icl_voice" not in params
         assert params.get("ref_text") != ["precomputed transcript"]
 
     def test_precomputed_qwen3_missing_safetensors_is_not_registered(self, speech_server, tmp_path):
