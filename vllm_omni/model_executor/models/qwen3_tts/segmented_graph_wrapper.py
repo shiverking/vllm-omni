@@ -198,9 +198,10 @@ class CUDAGraphDecoderWrapper:
         Walks the stored ``cache`` payload instead of assuming which capture
         path populates it: ``_decode_icl_first_chunk`` fills its dict on the
         decoder side, so the only reliable count is the one taken from the
-        objects themselves after warmup.
+        objects themselves after warmup. Several suffix phases may share the
+        same static reference cache.
         """
-        found: list[tuple[int, DynamicCache]] = []
+        found: dict[int, tuple[int, DynamicCache]] = {}
         for state in states.values():
             payload = state.get("cache")
             if not isinstance(payload, dict):
@@ -212,8 +213,8 @@ class CUDAGraphDecoderWrapper:
                 keys = getattr(layers[0], "keys", None) if layers else None
                 if keys is None:
                     continue
-                found.append((int(keys.shape[0]), value))
-        return found
+                found[id(value)] = (int(keys.shape[0]), value)
+        return list(found.values())
 
     def model_local_kv_specs(self) -> list[ModelLocalKVSpec]:
         """Declare only the graph-resident copies this wrapper retains.
@@ -605,10 +606,6 @@ class CUDAGraphDecoderWrapper:
         size = self.prefix_length + self.initial_chunk_frames
         caches: dict = {}
         static_input = torch.zeros(batch_size, self.num_quantizers, size, dtype=dtype, device=device)
-        with torch.no_grad():
-            _ = self.decoder._decode_icl_first_chunk(static_input, caches, self.prefix_length)
-        self._synchronize(device)
-
         config = self.decoder.config
         model_dtype = next(self.decoder.parameters()).dtype
         head_dim = getattr(
@@ -627,6 +624,18 @@ class CUDAGraphDecoderWrapper:
         prefix_hidden_mask = torch.ones(batch_size, 1, size, dtype=model_dtype, device=device)
         prefix_attention_mask = torch.ones(batch_size, self.prefix_length, dtype=torch.bool, device=device)
         suffix_attention_mask = torch.ones(batch_size, size, dtype=torch.bool, device=device)
+
+        # Exercise the same mask shapes before capture, including on Ascend.
+        with torch.no_grad():
+            self.decoder._decode_icl_first_chunk(
+                static_input,
+                {},
+                self.prefix_length,
+                prefix_hidden_mask=prefix_hidden_mask,
+                prefix_attention_mask=prefix_attention_mask,
+                suffix_attention_mask=suffix_attention_mask,
+            )
+        self._synchronize(device)
 
         graph = self._new_graph()
         with torch.no_grad():

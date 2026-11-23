@@ -3,6 +3,7 @@
 
 import copy
 from collections import Counter
+from contextlib import nullcontext
 from types import SimpleNamespace
 from typing import Any
 
@@ -1137,6 +1138,138 @@ def test_npu_graph_router_batches_icl_first_and_suffix_chunks(monkeypatch):
         ("xvec suffix graph 12", [5]),
         ("individual eager", [8]),
     ]
+
+
+def test_npu_icl_warmup_captures_one_mode_for_every_configured_phase(monkeypatch):
+    decoder = _decoder_stub(
+        config=SimpleNamespace(num_quantizers=2, sliding_window=72),
+        _initial_codec_chunk_frames=4,
+        _incremental_chunk_frames=8,
+        eval=lambda: None,
+        parameters=lambda: iter([torch.zeros(())]),
+    )
+    wrapper = NPUGraphDecoderWrapper(decoder, capture_batch_sizes=[1, 4], capture_modes=("icl",))
+    captures = []
+    staging = {}
+
+    def make_cache(batch, _device, _dtype):
+        assert batch not in staging
+        staging[batch] = object()
+        return staging[batch]
+
+    def capture_suffix(mode, batch, target, cache, _device, _dtype):
+        assert cache is staging[batch]
+        captures.append((mode, batch, target))
+
+    monkeypatch.setattr(torch, "npu", SimpleNamespace(graph_pool_handle=object), raising=False)
+    monkeypatch.setattr(
+        wrapper, "_capture_icl_prefix", lambda batch, _device, _dtype: captures.append(("icl", batch, None))
+    )
+    monkeypatch.setattr(wrapper, "_make_dummy_icl_cache", make_cache)
+    monkeypatch.setattr(wrapper, "_capture_combined_suffix", capture_suffix)
+    monkeypatch.setattr(wrapper, "_capture_xvec_prefix", lambda *_args: pytest.fail("unexpected xvec capture"))
+
+    device = SimpleNamespace(type="npu")
+    wrapper.warmup(device)
+    wrapper.warmup(device)
+
+    targets = (None, 12, 20, 28, 36, 44, 52, 60, 68, 76, 80)
+    assert captures == [("icl", batch, target) for batch in (1, 4) for target in targets]
+
+
+@torch.inference_mode()
+def test_npu_icl_replays_padded_prefix_and_commits_only_real_rows(monkeypatch):
+    decoder = _make_small_decoder()
+    decoder._initial_codec_chunk_frames = 4
+    decoder._incremental_chunk_frames = 8
+    wrapper = NPUGraphDecoderWrapper(decoder, capture_batch_sizes=[1, 4], capture_modes=("icl",))
+    monkeypatch.setattr(wrapper, "_is_capturing", lambda: False)
+    monkeypatch.setattr(wrapper, "_new_graph", SimpleNamespace)
+    monkeypatch.setattr(wrapper, "_graph_context", lambda _graph: nullcontext())
+    monkeypatch.setattr(wrapper, "_synchronize", lambda _device: None)
+
+    cpu = torch.device("cpu")
+    wrapper._capture_icl_prefix(4, cpu, torch.long)
+    prefix = wrapper.icl_prefix_states[4]
+    staged = prefix["input"]
+
+    def replay_prefix():
+        output = decoder._decode_icl_first_chunk(
+            staged["codes"],
+            prefix["cache"],
+            wrapper.prefix_length,
+            prefix_hidden_mask=staged["hidden_mask"],
+            prefix_attention_mask=staged["prefix_attention_mask"],
+            suffix_attention_mask=staged["suffix_attention_mask"],
+        )
+        prefix["output"].copy_(output)
+
+    prefix["graph"].replay = replay_prefix
+
+    for batch in (1, 4):
+        dummy_cache = wrapper._make_dummy_icl_cache(batch, cpu, decoder.dtype)
+        wrapper._capture_combined_suffix("icl", batch, 12, dummy_cache, cpu, torch.long)
+        state = wrapper.combined_states["icl", batch, 12]
+
+        def replay_suffix(state=state):
+            inputs = state["input"]
+            outputs = wrapper._run_combined_suffix(
+                "icl",
+                inputs["codes"],
+                inputs["quantized"],
+                inputs["conv"],
+                state["cache"],
+                12,
+                inputs["mask"],
+            )
+            for output, updated in zip(state["output"], outputs, strict=True):
+                output.copy_(updated)
+
+        state["graph"].replay = replay_suffix
+
+    generator = torch.Generator().manual_seed(71)
+
+    def make_codes(frames):
+        return torch.randint(0, decoder.config.codebook_size, (1, 2, frames), generator=generator)
+
+    def check_outputs(outputs, references):
+        assert len(outputs) == len(references)
+        for output, reference in zip(outputs, references, strict=True):
+            torch.testing.assert_close(output, reference, atol=1e-5, rtol=1e-4)
+
+    prefixes = (13, 72, 49)
+    codes = [make_codes(length + 4) for length in prefixes]
+    caches = [{"prefix_frames": length} for length in prefixes]
+    eager = copy.deepcopy(caches)
+    first_outputs = wrapper._batched_request_decode(codes, caches)
+    expected_first = decoder._decode_icl_prefix_eager_batch(codes, eager, prefix_length=72, initial_chunk_frames=4)
+    check_outputs(first_outputs, expected_first)
+    assert [cache["prefix_pad_frames"] for cache in caches] == [59, 0, 23]
+    for row, length in enumerate(prefixes):
+        assert staged["prefix_attention_mask"][row].tolist() == [False] * (72 - length) + [True] * length
+    assert staged["prefix_attention_mask"][3].all()
+
+    # Reuse the same captured output and cache buffers for three new requests.
+    wrapper._batched_request_decode(codes[::-1], [{"prefix_frames": length} for length in prefixes[::-1]])
+    check_outputs(first_outputs, expected_first)
+
+    # Two full rows replay together. The middle short row still commits its exact-length eager state.
+    order = (2, 0, 1)
+    suffix_codes = [make_codes(length) for length in (8, 3, 8)]
+    replayed = wrapper._batched_request_decode(suffix_codes, [caches[row] for row in order])
+    eager_outputs = [decoder(code, eager[row]) for row, code in zip(order, suffix_codes, strict=True)]
+    check_outputs(replayed, eager_outputs)
+    assert [cache["suffix_frames"] for cache in caches] == [7, 12, 12]
+    assert caches[1]["_suffix_buffer_index"] == caches[2]["_suffix_buffer_index"] == 1
+    assert "_suffix_buffer_index" not in caches[0]
+    for actual, expected in zip(caches, eager, strict=True):
+        for name in ("ref_hidden", "ref_conv", "prefix_hidden", "suffix_quantized", "suffix_conv"):
+            torch.testing.assert_close(actual[name], expected[name], atol=1e-5, rtol=1e-4)
+        for actual_layer, expected_layer in zip(
+            actual["past_key_values"].layers, expected["past_key_values"].layers, strict=True
+        ):
+            torch.testing.assert_close(actual_layer.keys, expected_layer.keys, atol=1e-5, rtol=1e-4)
+            torch.testing.assert_close(actual_layer.values, expected_layer.values, atol=1e-5, rtol=1e-4)
 
 
 def test_missing_graph_phase_falls_back_instead_of_returning_empty(monkeypatch):

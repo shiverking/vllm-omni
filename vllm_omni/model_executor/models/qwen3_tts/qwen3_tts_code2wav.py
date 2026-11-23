@@ -956,9 +956,9 @@ class Qwen3TTSCode2Wav(nn.Module):
 
         settings = extra_cfg if isinstance(extra_cfg, dict) else {}
         execution = settings.get("code2wav_execution", "baseline")
-        if execution not in ("baseline", "npu_graph"):
+        if execution not in ("baseline", "npu_graph", "npu_graph_icl"):
             raise ValueError(f"Unsupported code2wav_execution: {execution}")
-        if execution == "npu_graph":
+        if execution != "baseline":
             if device.type != "npu" or not self._async_chunk:
                 raise ValueError("Code2Wav stateful NPU graphs require async_chunk on NPU")
             if not getattr(model_cfg, "enforce_eager", False):
@@ -969,7 +969,10 @@ class Qwen3TTSCode2Wav(nn.Module):
             if self._decode_batch_max_size != max(buckets):
                 raise ValueError("decode_batch_max_size must match the largest Code2Wav graph bucket")
             # The NPU loader captures after final dtype and weight-format conversion.
-            self.decoder._npugraph_wrapper = NPUGraphDecoderWrapper(self.decoder, buckets)
+            capture_mode = "icl" if execution == "npu_graph_icl" else "xvec"
+            self.decoder._npugraph_wrapper = NPUGraphDecoderWrapper(
+                self.decoder, buckets, capture_modes=(capture_mode,)
+            )
 
         if hasattr(self.decoder, "enable_cudagraph") and device.type == "cuda":
             try:

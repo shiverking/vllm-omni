@@ -1,13 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Code2Wav NPU graphs for prefixless requests and batched eager for ICL."""
+"""Stateful Code2Wav NPU graphs for prefixless or ICL requests."""
 
 from __future__ import annotations
 
 import threading
 import time
 from contextlib import contextmanager
-from functools import partial
 from unittest.mock import patch
 
 import torch
@@ -32,13 +31,19 @@ def capture_mask_context():
 
 
 class NPUGraphDecoderWrapper(CUDAGraphDecoderWrapper):
-    def __init__(self, decoder, capture_batch_sizes=(1, *range(2, 33, 2))):
+    def __init__(
+        self,
+        decoder: torch.nn.Module,
+        capture_batch_sizes: list[int] | tuple[int, ...] = (1, *range(2, 33, 2)),
+        *,
+        capture_modes: tuple[str, ...] = ("xvec",),
+    ):
         sizes = sorted(set(capture_batch_sizes))
         if not sizes or sizes[0] != 1 or any(not isinstance(n, int) or n < 1 for n in sizes):
             raise ValueError("Code2Wav graph buckets must be positive integers including 1")
         super().__init__(
             decoder,
-            capture_modes=("xvec",),
+            capture_modes=capture_modes,
             num_quantizers=decoder.config.num_quantizers,
             capture_batch_sizes=sizes,
             initial_chunk_frames=getattr(decoder, "_initial_codec_chunk_frames", 1),
@@ -72,47 +77,80 @@ class NPUGraphDecoderWrapper(CUDAGraphDecoderWrapper):
         self._device = device
         self._pool = torch.npu.graph_pool_handle()
         started = time.perf_counter()
-        total = len(self.capture_batch_sizes) * (1 + len(self._xvec_previous_frames_by_target))
+        total = len(self.capture_batch_sizes) * sum(
+            1 + len(self._transitions_for_mode(mode)) for mode in self.capture_modes
+        )
         count = 0
+        model_dtype = next(self.decoder.parameters()).dtype
         # Positions in these captures are contiguous and non-packed. Restrict
         # this workaround to initialization; never patch live request execution.
         with capture_mask_context():
             for batch in self.capture_batch_sizes:
-                phases = [("first", None), *[("suffix", n) for n in self._xvec_previous_frames_by_target]]
-                for phase, target in phases:
-                    tick = time.perf_counter()
-                    logger.info(
-                        "Code2Wav NPU capture %d/%d: batch=%d phase=%s target=%s",
-                        count + 1,
-                        total,
-                        batch,
-                        phase,
-                        target,
-                    )
-                    try:
-                        if phase == "first":
-                            self._capture_xvec_prefix(batch, device, dtype)
-                        else:
-                            cache = self._make_dummy_xvec_cache(batch, device, next(self.decoder.parameters()).dtype)
-                            self._capture_combined_suffix("xvec", batch, target, cache, device, dtype)
-                    except Exception as exc:
-                        self.capture_seconds = time.perf_counter() - started
-                        raise RuntimeError(
-                            f"Code2Wav NPU capture failed: batch={batch}, phase={phase}, target={target}"
-                        ) from exc
-                    count += 1
-                    logger.info("Code2Wav NPU captured %d/%d in %.3fs", count, total, time.perf_counter() - tick)
+                for mode in self.capture_modes:
+                    capture_prefix = self._capture_icl_prefix if mode == "icl" else self._capture_xvec_prefix
+                    make_cache = self._make_dummy_icl_cache if mode == "icl" else self._make_dummy_xvec_cache
+                    suffix_cache = None
+                    for target in (None, *self._transitions_for_mode(mode)):
+                        tick = time.perf_counter()
+                        phase = "first" if target is None else "suffix"
+                        logger.info(
+                            "Code2Wav NPU capture %d/%d: mode=%s batch=%d phase=%s target=%s",
+                            count + 1,
+                            total,
+                            mode,
+                            batch,
+                            phase,
+                            target,
+                        )
+                        try:
+                            if target is None:
+                                capture_prefix(batch, device, dtype)
+                            else:
+                                if suffix_cache is None or mode == "xvec":
+                                    # Suffix graphs only read reference state. Reuse its batched
+                                    # staging tensors across phases on the ordered replay stream.
+                                    suffix_cache = make_cache(batch, device, model_dtype)
+                                self._capture_combined_suffix(mode, batch, target, suffix_cache, device, dtype)
+                        except Exception as exc:
+                            self.capture_seconds = time.perf_counter() - started
+                            raise RuntimeError(
+                                f"Code2Wav NPU capture failed: mode={mode}, batch={batch}, "
+                                f"phase={phase}, target={target}"
+                            ) from exc
+                        count += 1
+                        logger.info("Code2Wav NPU captured %d/%d in %.3fs", count, total, time.perf_counter() - tick)
         self.capture_seconds = time.perf_counter() - started
         self._warmed_up = True
         logger.info(
-            "Code2Wav NPU ready: buckets=%s graphs=%d capture_seconds=%.3f",
+            "Code2Wav NPU ready: modes=%s buckets=%s graphs=%d capture_seconds=%.3f",
+            self.capture_modes,
             self.capture_batch_sizes,
             count,
             self.capture_seconds,
         )
 
+    def _decode_icl_prefix_batch(self, codes_list, request_caches):
+        if "icl" in self.capture_modes:
+            outputs = super()._decode_icl_prefix_batch(codes_list, request_caches)
+            if outputs is not None:
+                return outputs
+        return self.decoder._decode_icl_prefix_eager_batch(
+            codes_list,
+            request_caches,
+            prefix_length=self.prefix_length,
+            initial_chunk_frames=self.initial_chunk_frames,
+        )
+
+    def _decode_xvec_prefix_batch(self, codes_list, request_caches):
+        if "xvec" in self.capture_modes:
+            return super()._decode_xvec_prefix_batch(codes_list, request_caches)
+        return self.decoder._decode_xvec_prefix_eager_batch(
+            codes_list, request_caches, initial_chunk_frames=self.initial_chunk_frames
+        )
+
     def _decode_suffix_batch(self, mode, target_frames, codes_list, request_caches, new_frames_list):
-        if mode == "icl":
+        transitions = self._transitions_for_mode(mode)
+        if mode not in self.capture_modes:
             return self.decoder._decode_suffix_eager_batch(
                 mode,
                 target_frames,
@@ -121,14 +159,15 @@ class NPUGraphDecoderWrapper(CUDAGraphDecoderWrapper):
                 new_frames_list,
                 prefix_length=self.prefix_length,
                 codec_chunk_frames=self.codec_chunk_frames,
-                transitions_by_mode={"icl": self._icl_previous_frames_by_target},
+                transitions_by_mode={mode: transitions},
             )
-        expected = target_frames - self._transitions_for_mode(mode)[target_frames]
+        expected = target_frames - transitions[target_frames]
         exact = [i for i, n in enumerate(new_frames_list) if n == expected]
         if len(exact) != len(codes_list):
             # Short rows must not force unrelated full rows in the same phase
             # to eager. Restore original request order after the two routes.
             outputs = [None] * len(codes_list)
+            self._record_graph_fallback(f"{mode}_suffix_{target_frames}:short", len(codes_list) - len(exact))
             for i, n in enumerate(new_frames_list):
                 if n != expected:
                     outputs[i] = self._decode_request_fallback(codes_list[i], request_caches[i])
@@ -174,11 +213,7 @@ class NPUGraphDecoderWrapper(CUDAGraphDecoderWrapper):
                 "icl": self._icl_previous_frames_by_target,
                 "xvec": self._xvec_previous_frames_by_target,
             },
-            decode_icl_prefix_batch=partial(
-                self.decoder._decode_icl_prefix_eager_batch,
-                prefix_length=self.prefix_length,
-                initial_chunk_frames=self.initial_chunk_frames,
-            ),
+            decode_icl_prefix_batch=self._decode_icl_prefix_batch,
             decode_xvec_prefix_batch=self._decode_xvec_prefix_batch,
             decode_suffix_batch=self._decode_suffix_batch,
             decode_fallback=self._decode_request_fallback,
