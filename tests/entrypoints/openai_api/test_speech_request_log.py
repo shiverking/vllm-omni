@@ -4,6 +4,7 @@
 import asyncio
 import json
 import socket
+from datetime import datetime
 
 import pytest
 
@@ -16,8 +17,13 @@ def test_speech_request_log_preserves_concurrent_inputs(tmp_path):
     directory = tmp_path / "logs"
     with socket.socket() as listener:
         listener.bind(("127.0.0.1", 0))
-        path = directory / f"request_raw_text_{listener.getsockname()[1]}.log"
-        assert initialize_speech_request_log(listener, directory) == path
+        prefix = f"request_raw_text_{listener.getsockname()[1]}_"
+        path = initialize_speech_request_log(listener, directory)
+        assert path is not None and path.parent == directory
+        assert path.name.startswith(prefix) and path.suffix == ".log"
+        started_at, _, unique_suffix = path.stem.removeprefix(prefix).partition("_")
+        datetime.strptime(started_at, "%Y%m%dT%H%M%S.%fZ")
+        assert unique_suffix
     texts = [f"中文 {index}\n第二行  " for index in range(64)]
     batch = ["另一条", " 多行\n批量文本 "]
 
@@ -32,7 +38,7 @@ def test_speech_request_log_preserves_concurrent_inputs(tmp_path):
     assert [row["text"] for row in records if isinstance(row["text"], list)] == [batch]
 
 
-def test_restart_clears_only_the_log_for_that_port(tmp_path):
+def test_restart_creates_a_new_log_and_preserves_previous_logs(tmp_path):
     with socket.socket() as first, socket.socket() as second:
         first.bind(("127.0.0.1", 0))
         second.bind(("127.0.0.1", 0))
@@ -42,8 +48,11 @@ def test_restart_clears_only_the_log_for_that_port(tmp_path):
         asyncio.run(log_speech_input(first_log, "服务一", 1700000000))
         asyncio.run(log_speech_input(second_log, "服务二", 1700000000))
 
-        assert initialize_speech_request_log(first, tmp_path) == first_log
-        assert first_log.read_bytes() == b""
-        asyncio.run(log_speech_input(first_log, "服务一重启后", 1700000000))
-        assert json.loads(first_log.read_text(encoding="utf-8"))["text"] == "服务一重启后"
+        restarted_log = initialize_speech_request_log(first, tmp_path)
+        assert restarted_log is not None and restarted_log not in (first_log, second_log)
+        assert restarted_log.name.startswith(f"request_raw_text_{first.getsockname()[1]}_")
+        assert restarted_log.read_bytes() == b""
+        asyncio.run(log_speech_input(restarted_log, "服务一重启后", 1700000000))
+        assert json.loads(restarted_log.read_text(encoding="utf-8"))["text"] == "服务一重启后"
+        assert json.loads(first_log.read_text(encoding="utf-8"))["text"] == "服务一"
         assert json.loads(second_log.read_text(encoding="utf-8"))["text"] == "服务二"

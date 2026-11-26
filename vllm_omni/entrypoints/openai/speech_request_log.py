@@ -10,27 +10,29 @@ import os
 from datetime import datetime, timezone
 from pathlib import Path
 from socket import AF_INET, AF_INET6, socket
+from tempfile import mkstemp
 from threading import Lock
 
 logger = logging.getLogger(__name__)
 
-_LOG_DIRECTORY = Path("/cache/y00899301")
+_LOG_DIRECTORY = Path("/cache/y00899301/server_log")
 _WRITE_LOCK = Lock()
 
 
 def initialize_speech_request_log(listener: socket, directory: Path = _LOG_DIRECTORY) -> Path | None:
-    """Reset this TCP listener's log once in the server launcher."""
+    """Create one log for this TCP listener and server start."""
     if listener.family not in (AF_INET, AF_INET6):
         return None
     port = listener.getsockname()[1]
-    path = directory / f"request_raw_text_{port}.log"
+    started_at = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
     try:
         directory.mkdir(parents=True, exist_ok=True)
-        os.close(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600))
+        fd, filename = mkstemp(prefix=f"request_raw_text_{port}_{started_at}_", suffix=".log", dir=directory)
+        os.close(fd)
     except OSError:
-        logger.exception("Could not initialize speech request log at %s", path)
+        logger.exception("Could not initialize speech request log for port %d in %s", port, directory)
         return None
-    return path
+    return Path(filename)
 
 
 def _append_record(path: Path, record: bytes) -> None:
