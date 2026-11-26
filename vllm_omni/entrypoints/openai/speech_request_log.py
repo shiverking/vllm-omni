@@ -7,10 +7,9 @@ import asyncio
 import json
 import logging
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from socket import AF_INET, AF_INET6, socket
-from tempfile import mkstemp
 from threading import Lock
 
 logger = logging.getLogger(__name__)
@@ -24,15 +23,21 @@ def initialize_speech_request_log(listener: socket, directory: Path = _LOG_DIREC
     if listener.family not in (AF_INET, AF_INET6):
         return None
     port = listener.getsockname()[1]
-    started_at = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
+    started_at = datetime.now(timezone.utc)
     try:
         directory.mkdir(parents=True, exist_ok=True)
-        fd, filename = mkstemp(prefix=f"request_raw_text_{port}_{started_at}_", suffix=".log", dir=directory)
-        os.close(fd)
+        while True:
+            path = directory / f"request_raw_text_{port}_{started_at:%Y%m%dT%H%M%S.%fZ}.log"
+            try:
+                fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            except FileExistsError:
+                started_at += timedelta(microseconds=1)
+                continue
+            os.close(fd)
+            return path
     except OSError:
         logger.exception("Could not initialize speech request log for port %d in %s", port, directory)
         return None
-    return Path(filename)
 
 
 def _append_record(path: Path, record: bytes) -> None:
