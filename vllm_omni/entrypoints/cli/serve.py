@@ -35,6 +35,7 @@ from vllm_omni.entrypoints.openai.api_server import (
     omni_run_server,
     run_omni_api_server_worker_proc,
 )
+from vllm_omni.entrypoints.openai.speech_request_log import initialize_speech_request_log
 from vllm_omni.entrypoints.utils import parse_stage_overrides, prepare_stage_config_inputs
 from vllm_omni.utils.tracking_parser import TrackingArgumentParser, TrackingNamespace
 
@@ -1337,6 +1338,7 @@ def run_multi_api_server_omni(args: TrackingNamespace) -> None:
     api_server_manager = None
     engine_launch = None
     try:
+        args._omni_speech_request_log_path = initialize_speech_request_log(sock)
         stage_runtime = _build_multi_api_stage_runtime(args, num_api_servers)
         with stage_runtime.launch_stage_engines(num_api_servers) as engine_launch:
             args._omni_stage_client_configs = engine_launch.client_configs

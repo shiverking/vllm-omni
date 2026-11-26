@@ -528,11 +528,15 @@ def test_run_multi_api_server_omni_starts_workers_after_shared_engine_launch(moc
     mocker.patch("signal.signal")
     mocker.patch("vllm.entrypoints.openai.api_server.setup_server", return_value=("127.0.0.1:8000", socket))
     mocker.patch("vllm.v1.metrics.prometheus.setup_multiprocess_prometheus")
+    log_path = mocker.sentinel.speech_request_log_path
+    initialize_log = mocker.patch.object(serve_module, "initialize_speech_request_log", return_value=log_path)
     start_manager = mocker.patch.object(serve_module, "_start_api_server_process_manager", return_value=manager)
 
     serve_module.run_multi_api_server_omni(args)
 
     assert args._omni_stage_client_configs is engine_launch.client_configs
+    initialize_log.assert_called_once_with(socket)
+    assert args._omni_speech_request_log_path is log_path
     start_manager.assert_called_once()
     manager_kwargs = start_manager.call_args.kwargs
     assert manager_kwargs["num_servers"] == 2

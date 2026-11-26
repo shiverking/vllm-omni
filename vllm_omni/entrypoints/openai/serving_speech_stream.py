@@ -64,6 +64,7 @@ import time
 from collections.abc import Awaitable, Callable
 from contextlib import aclosing
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import cast
 
 from fastapi import WebSocket, WebSocketDisconnect
@@ -76,6 +77,7 @@ from vllm_omni.entrypoints.openai.protocol.audio import (
     StreamingSpeechSessionConfig,
 )
 from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
+from vllm_omni.entrypoints.openai.speech_request_log import log_speech_input
 from vllm_omni.entrypoints.openai.speech_text_splitter import SpeechTextSplitter
 from vllm_omni.model_executor.stage_input_processors.streaming_text_frontend import (
     StreamingTextFrontend,
@@ -174,10 +176,13 @@ class OmniStreamingSpeechHandler:
         speech_service: OmniOpenAIServingSpeech,
         idle_timeout: float = _DEFAULT_IDLE_TIMEOUT,
         config_timeout: float = _DEFAULT_CONFIG_TIMEOUT,
+        *,
+        request_log_path: Path | None = None,
     ) -> None:
         self._speech_service = speech_service
         self._idle_timeout = idle_timeout
         self._config_timeout = config_timeout
+        self._request_log_path = request_log_path
 
     async def handle_session(self, websocket: WebSocket) -> None:
         """Main loop for a single WebSocket connection.
@@ -264,6 +269,7 @@ class OmniStreamingSpeechHandler:
                     if not isinstance(text, str):
                         await self._send_error(websocket, "input.text requires a string value")
                         continue
+                    await log_speech_input(self._request_log_path, text, time.time())
                     if config.text_input_mode == "commitment":
                         if commitment is not None and commitment.eof:
                             await self._send_error(

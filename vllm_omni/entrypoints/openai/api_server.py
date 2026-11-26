@@ -189,6 +189,7 @@ from vllm_omni.entrypoints.openai.serving_video import (
 )
 from vllm_omni.entrypoints.openai.serving_video_output_stream import OmniStreamingVideoOutputHandler
 from vllm_omni.entrypoints.openai.serving_video_stream import create_streaming_video_handler
+from vllm_omni.entrypoints.openai.speech_request_log import initialize_speech_request_log, log_speech_input
 from vllm_omni.entrypoints.openai.storage import STORAGE_MANAGER, FileStorageHandle
 from vllm_omni.entrypoints.openai.stores import VIDEO_STORE, VIDEO_TASKS
 from vllm_omni.entrypoints.openai.utils import get_stage_type
@@ -251,6 +252,7 @@ async def omni_run_server(args, **uvicorn_kwargs) -> None:
     decorate_logs("APIServer", skip_if_decorated=True)
 
     listen_address, sock = setup_openai_server(args, reuse_port=False)
+    args._omni_speech_request_log_path = initialize_speech_request_log(sock)
 
     # Unified use of omni_run_server_worker, AsyncOmni automatically handles LLM and Diffusion models
     await omni_run_server_worker(listen_address, sock, args, **uvicorn_kwargs)
@@ -397,6 +399,7 @@ async def omni_run_server_worker(
         # OMNI: Pass supported_tasks to build_app (required by upstream vLLM)
         app = build_openai_app(args, supported_tasks)
         app.state.api_server_count = api_server_count
+        app.state.speech_request_log_path = getattr(args, "_omni_speech_request_log_path", None)
 
         # OMNI: Remove upstream routes that we override with omni-specific handlers
         remove_route_from_app(app, "/v1/chat/completions", {"POST"})
@@ -1254,6 +1257,7 @@ async def omni_init_app_state(
 
     state.openai_streaming_speech = OmniStreamingSpeechHandler(
         speech_service=state.openai_serving_speech,
+        request_log_path=getattr(state, "speech_request_log_path", None),
     )
     state.openai_streaming_video = (
         create_streaming_video_handler(
@@ -1427,6 +1431,14 @@ def _unsupported_api_response(raw_request: Request, api_name: str) -> JSONRespon
     return _error_response_to_json_response(err, status_code=HTTPStatus.NOT_FOUND)
 
 
+async def _log_http_speech_input(raw_request: Request, text: str | list[str]) -> None:
+    await log_speech_input(
+        getattr(raw_request.app.state, "speech_request_log_path", None),
+        text,
+        getattr(raw_request.state, "request_timestamp", time.time()),
+    )
+
+
 @router.post(
     "/v1/audio/speech",
     dependencies=[Depends(validate_json_request)],
@@ -1454,6 +1466,7 @@ async def create_speech(request: OpenAICreateSpeechRequest, raw_request: Request
         HTTPException: If the server does not support speech generation or the
         synthesis request fails unexpectedly.
     """
+    await _log_http_speech_input(raw_request, request.input)
     handler = Omnispeech(raw_request)
     if handler is None:
         return _unsupported_api_response(raw_request, "Speech API")
@@ -1481,6 +1494,7 @@ async def create_speech(request: OpenAICreateSpeechRequest, raw_request: Request
 @with_cancellation
 @load_aware_call
 async def create_speech_batch(request: BatchSpeechRequest, raw_request: Request):
+    await _log_http_speech_input(raw_request, [item.input for item in request.items])
     handler = Omnispeech(raw_request)
     if handler is None:
         return _unsupported_api_response(raw_request, "Speech API")
